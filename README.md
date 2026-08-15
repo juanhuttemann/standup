@@ -2,12 +2,12 @@
 
 <div align="center">
 
-[![Go version](https://img.shields.io/github/go-mod/go-version/juanhuttemann/standup)](https://github.com/juanhuttemann/standup/blob/main/go.mod)
-[![CI](https://github.com/juanhuttemann/standup/actions/workflows/ci.yml/badge.svg)](https://github.com/juanhuttemann/standup/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/juanhuttemann/standup)](https://github.com/juanhuttemann/standup/releases)
-[![Go report](https://goreportcard.com/badge/github.com/juanhuttemann/standup)](https://goreportcard.com/report/github.com/juanhuttemann/standup)
-[![MIT license](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/juanhuttemann/standup/blob/main/LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
+[![Go version](https://img.shields.io/github/go-mod/go-version/juanhuttemann/standup?style=for-the-badge&logo=go&logoColor=white)](https://github.com/juanhuttemann/standup/blob/main/go.mod)
+[![CI](https://img.shields.io/github/actions/workflow/status/juanhuttemann/standup/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white)](https://github.com/juanhuttemann/standup/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/juanhuttemann/standup?style=for-the-badge&logo=github)](https://github.com/juanhuttemann/standup/releases)
+[![golangci-lint](https://img.shields.io/badge/golangci--lint-enabled-3FB950?style=for-the-badge&logo=go&logoColor=white&labelColor=1B2127)](https://github.com/juanhuttemann/standup/actions/workflows/ci.yml)
+[![MIT license](https://img.shields.io/badge/License-MIT-3FB950?style=for-the-badge&labelColor=1B2127)](https://github.com/juanhuttemann/standup/blob/main/LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-E8EDF2?style=for-the-badge&labelColor=1B2127)
 
 </div>
 

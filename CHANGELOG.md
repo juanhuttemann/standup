@@ -5,6 +5,18 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+- Terminal color palette: task statuses render in their own hue in `list`
+  output (todo amber, in-progress blue, blocked red, done green; ids and
+  timestamps quiet gray). Truecolor on TTY output only — piped/redirected
+  output stays plain and `NO_COLOR` disables it.
+- README badges now use the project palette (Ink Slate labels, green/frost
+  values).
+
+### Changed
+- README badges restyled (`for-the-badge`); the retired Go Report Card badge
+  was replaced with a golangci-lint badge linking to the CI job that runs it.
+
 ## [0.3.0] - 2026-08-15
 
 ### Fixed

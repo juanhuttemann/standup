@@ -118,6 +118,22 @@ func TestAddError(t *testing.T) {
 	assert.Error(t, root.Execute())
 }
 
+func TestPainterStatusColors(t *testing.T) {
+	p := painter{on: true}
+	assert.Equal(t, ansiTodo+"todo"+ansiReset, p.status("todo"))
+	assert.Equal(t, ansiInProgress+"in-progress"+ansiReset, p.status("in-progress"))
+	assert.Equal(t, ansiBlocked+"blocked"+ansiReset, p.status("blocked"))
+	assert.Equal(t, ansiDone+"done"+ansiReset, p.status("done"))
+	assert.Equal(t, "bogus", p.status("bogus"))
+	assert.Equal(t, ansiQuiet+"12:00"+ansiReset, p.quiet("12:00"))
+}
+
+func TestPainterOffForNonTerminal(t *testing.T) {
+	p := newPainter(&bytes.Buffer{})
+	assert.Equal(t, "todo", p.status("todo"))
+	assert.Equal(t, "12:00", p.quiet("12:00"))
+}
+
 func TestTaskEntriesRefresh(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
@@ -125,7 +141,7 @@ func TestTaskEntriesRefresh(t *testing.T) {
 	added, err := st.Add("review pull request")
 	require.NoError(t, err)
 
-	entries, err := taskEntries(st, "")
+	entries, err := taskEntries(st, "", painter{})
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Contains(t, entries[0].label, "[todo]")
@@ -134,13 +150,13 @@ func TestTaskEntriesRefresh(t *testing.T) {
 	_, err = st.SetStatus(added.ID, "done")
 	require.NoError(t, err)
 
-	entries, err = taskEntries(st, "")
+	entries, err = taskEntries(st, "", painter{on: true})
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
-	assert.Contains(t, entries[0].label, "[done]")
+	assert.Contains(t, entries[0].label, "["+ansiDone+"done"+ansiReset+"]")
 
 	require.NoError(t, st.Delete(added.ID))
-	entries, err = taskEntries(st, "")
+	entries, err = taskEntries(st, "", painter{})
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 }

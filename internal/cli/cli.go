@@ -381,7 +381,7 @@ func runList(cmd *cobra.Command, st *store.Store) error {
 			return err
 		}
 		if interactive() {
-			return selectLoop(st, tag)
+			return selectLoop(st, tag, newPainter(cmd.OutOrStdout()))
 		}
 	}
 	tasks = filterTag(tasks, tag)
@@ -389,8 +389,9 @@ func runList(cmd *cobra.Command, st *store.Store) error {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "no tasks")
 		return err
 	}
+	p := newPainter(cmd.OutOrStdout())
 	for _, t := range tasks {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", t.ID, t.Status, t.Timestamp.Format("15:04"), t.Text); err != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(t.ID), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), t.Text); err != nil {
 			return err
 		}
 	}
@@ -424,14 +425,14 @@ type taskEntry struct {
 	label string
 }
 
-func taskEntries(st *store.Store, tag string) ([]taskEntry, error) {
+func taskEntries(st *store.Store, tag string, p painter) ([]taskEntry, error) {
 	tasks, err := st.ListDay(st.Now())
 	if err != nil {
 		return nil, err
 	}
 	entries := make([]taskEntry, 0, len(tasks))
 	for _, t := range filterTag(tasks, tag) {
-		entries = append(entries, taskEntry{task: t, label: fmt.Sprintf("%s [%s] %s %s", t.Timestamp.Format("15:04"), t.Status, shortID(t.ID), t.Text)})
+		entries = append(entries, taskEntry{task: t, label: fmt.Sprintf("%s [%s] %s %s", p.quiet(t.Timestamp.Format("15:04")), p.status(t.Status), p.quiet(shortID(t.ID)), t.Text)})
 	}
 	return entries, nil
 }
@@ -445,10 +446,10 @@ func aborted(err error) bool {
 	return err == promptui.ErrInterrupt || err == io.EOF || err.Error() == "^D"
 }
 
-func selectLoop(st *store.Store, tag string) error {
+func selectLoop(st *store.Store, tag string, p painter) error {
 	actions := []string{"in-progress", "done", "blocked", "delete", "back"}
 	for {
-		entries, err := taskEntries(st, tag)
+		entries, err := taskEntries(st, tag, p)
 		if err != nil {
 			return err
 		}
