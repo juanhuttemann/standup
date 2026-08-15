@@ -5,6 +5,17 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Demo GIF in the README (recorded with vhs; `demo.tape` is reproducible
+  against a live endpoint, seeded with a previous working day).
+
+### Changed
+
+- `add` now echoes the saved rows with their status (`- [todo] ...`) and
+  `generate` colors the report's `[status]` tokens on a terminal — same
+  palette as `list`; plain when piped or `NO_COLOR` is set.
+
 ## [0.5.0] - 2026-08-15
 
 ### Fixed

@@ -13,6 +13,8 @@
 
 AI-assisted standup CLI. Requires Go 1.26+.
 
+![demo](demo.gif)
+
 ## Quick install
 
 Linux, macOS, WSL2, Termux (installs to `~/.local/bin`):

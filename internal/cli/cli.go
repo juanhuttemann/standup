@@ -338,6 +338,21 @@ func echoTask(cmd *cobra.Command, t store.Task) error {
 	return err
 }
 
+// colorReport paints the [status] tokens of a rendered report; verbatim when
+// colors are off (piped output, NO_COLOR).
+func colorReport(s string, p painter) string {
+	if !p.on {
+		return s
+	}
+	r := strings.NewReplacer(
+		"[todo]", "["+p.status("todo")+"]",
+		"[in-progress]", "["+p.status("in-progress")+"]",
+		"[blocked]", "["+p.status("blocked")+"]",
+		"[done]", "["+p.status("done")+"]",
+	)
+	return r.Replace(s)
+}
+
 func idArg(cmd *cobra.Command, args []string) error {
 	if len(args) != 1 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("usage: %s %s <id> (find ids with: %s list)", cmd.Root().Name(), cmd.Name(), cmd.Root().Name())
@@ -467,7 +482,7 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 		return addErr
 	}
 	for _, t := range tasks {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "- %s\n", t.Text); err != nil {
+		if err := echoTask(cmd, t); err != nil {
 			return err
 		}
 	}
@@ -831,7 +846,7 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	if path := flagString(cmd, "output"); path != "" {
 		return os.WriteFile(filepath.Clean(path), []byte(out+"\n"), 0o644)
 	}
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), out)
+	_, err = fmt.Fprintln(cmd.OutOrStdout(), colorReport(out, newPainter(cmd.OutOrStdout())))
 	return err
 }
 

@@ -27,7 +27,7 @@ import (
 	"standup/internal/store"
 )
 
-type fakeAss struct {
+type fakeAssistant struct {
 	added     []string
 	addResult []store.Task
 	addErr    error
@@ -37,7 +37,7 @@ type fakeAss struct {
 	genErr    error
 }
 
-func (f *fakeAss) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {
+func (f *fakeAssistant) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {
 	f.added = append(f.added, rawText)
 	if f.addErr != nil {
 		return nil, f.addErr
@@ -45,22 +45,22 @@ func (f *fakeAss) AddTasks(ctx context.Context, rawText string) ([]store.Task, e
 	return f.addResult, nil
 }
 
-func (f *fakeAss) Generate(ctx context.Context, sec report.Section) (string, error) {
+func (f *fakeAssistant) Generate(ctx context.Context, sec report.Section) (string, error) {
 	f.genCalls++
 	*f.genSec = sec
 	return f.genOut, f.genErr
 }
 
-var _ agent.Assistant = (*fakeAss)(nil)
+var _ agent.Assistant = (*fakeAssistant)(nil)
 
-func newHarness(t *testing.T, ass *fakeAss) (*store.Store, *cobra.Command, *bytes.Buffer) {
+func newHarness(t *testing.T, assistant *fakeAssistant) (*store.Store, *cobra.Command, *bytes.Buffer) {
 	t.Helper()
-	ass.genSec = &report.Section{}
+	assistant.genSec = &report.Section{}
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
 	buf := &bytes.Buffer{}
 	root := New(func() (Deps, error) {
-		return Deps{Assistant: func() (agent.Assistant, error) { return ass, nil }, Raw: ass, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
+		return Deps{Assistant: func() (agent.Assistant, error) { return assistant, nil }, Raw: assistant, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
 	})
 	root.SetOut(buf)
 	root.SetErr(buf)
@@ -90,36 +90,36 @@ var today = func(h, m int) func() time.Time {
 }
 
 func TestAddArgs(t *testing.T) {
-	ass := &fakeAss{}
-	_, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
 	root.SetArgs([]string{"add", "hello", "world"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.added, 1)
-	assert.Equal(t, "hello world", ass.added[0])
+	require.Len(t, assistant.added, 1)
+	assert.Equal(t, "hello world", assistant.added[0])
 }
 
 func TestAddFlagShorthand(t *testing.T) {
-	ass := &fakeAss{}
-	_, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
 	root.SetArgs([]string{"-a", "quick task"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.added, 1)
-	assert.Equal(t, "quick task", ass.added[0])
+	require.Len(t, assistant.added, 1)
+	assert.Equal(t, "quick task", assistant.added[0])
 }
 
 func TestAddStdin(t *testing.T) {
-	ass := &fakeAss{}
+	assistant := &fakeAssistant{}
 	pipeStdin(t, "line1\nline2")
-	_, root, _ := newHarness(t, ass)
+	_, root, _ := newHarness(t, assistant)
 	root.SetArgs([]string{"add"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.added, 1)
-	assert.Equal(t, "line1\nline2", ass.added[0])
+	require.Len(t, assistant.added, 1)
+	assert.Equal(t, "line1\nline2", assistant.added[0])
 }
 
 func TestAddError(t *testing.T) {
-	ass := &fakeAss{addErr: errors.New("boom")}
-	_, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{addErr: errors.New("boom")}
+	_, root, _ := newHarness(t, assistant)
 	root.SetArgs([]string{"add", "task"})
 	assert.Error(t, root.Execute())
 }
@@ -168,9 +168,9 @@ func TestTaskEntriesRefresh(t *testing.T) {
 }
 
 func TestListPlain(t *testing.T) {
-	ass := &fakeAss{}
+	assistant := &fakeAssistant{}
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, ass)
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	added, err := st.Add("write tests")
 	require.NoError(t, err)
@@ -185,9 +185,9 @@ func TestListPlain(t *testing.T) {
 }
 
 func TestListEmpty(t *testing.T) {
-	ass := &fakeAss{}
+	assistant := &fakeAssistant{}
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, ass)
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	root.SetArgs([]string{"list"})
 	require.NoError(t, root.Execute())
@@ -195,8 +195,8 @@ func TestListEmpty(t *testing.T) {
 }
 
 func TestGenerate(t *testing.T) {
-	ass := &fakeAss{genOut: "## Yesterday\n- did stuff"}
-	st, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "## Yesterday\n- did stuff"}
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(7, 0)
 	added, err := st.Add("fix bug")
 	require.NoError(t, err)
@@ -205,23 +205,23 @@ func TestGenerate(t *testing.T) {
 	st.Now = today(8, 0)
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
-	assert.Equal(t, 1, ass.genCalls)
+	assert.Equal(t, 1, assistant.genCalls)
 	assert.Contains(t, buf.String(), "did stuff")
 }
 
 func TestGenerateEmpty(t *testing.T) {
-	ass := &fakeAss{genOut: "should not appear"}
-	st, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "should not appear"}
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
-	assert.Equal(t, 0, ass.genCalls)
+	assert.Equal(t, 0, assistant.genCalls)
 	assert.Contains(t, buf.String(), "nothing to report")
 }
 
 func TestGenerateFlagShorthand(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	root.SetArgs([]string{"-g"})
 	require.NoError(t, root.Execute())
@@ -229,9 +229,9 @@ func TestGenerateFlagShorthand(t *testing.T) {
 }
 
 func TestListFlagShorthand(t *testing.T) {
-	ass := &fakeAss{}
+	assistant := &fakeAssistant{}
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, ass)
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	root.SetArgs([]string{"-l"})
 	require.NoError(t, root.Execute())
@@ -241,7 +241,7 @@ func TestListFlagShorthand(t *testing.T) {
 func TestDoneRmMissingIDUsage(t *testing.T) {
 	for _, cmd := range []string{"done", "rm"} {
 		t.Run(cmd, func(t *testing.T) {
-			_, root, _ := newHarness(t, &fakeAss{})
+			_, root, _ := newHarness(t, &fakeAssistant{})
 			root.SetArgs([]string{cmd})
 			err := root.Execute()
 			require.Error(t, err)
@@ -259,23 +259,23 @@ func TestAddEmptyTextUsage(t *testing.T) {
 		"flag whitespace": {"-a", "   "},
 	} {
 		t.Run(name, func(t *testing.T) {
-			ass := &fakeAss{}
-			_, root, _ := newHarness(t, ass)
+			assistant := &fakeAssistant{}
+			_, root, _ := newHarness(t, assistant)
 			root.SetArgs(args)
 			err := root.Execute()
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), `usage: standup add "task text"`)
-			assert.Empty(t, ass.added)
+			assert.Empty(t, assistant.added)
 		})
 	}
 }
 
 func TestAddPrintsSavedTasks(t *testing.T) {
-	ass := &fakeAss{addResult: []store.Task{
+	assistant := &fakeAssistant{addResult: []store.Task{
 		{ID: "1", Text: "Fixed login bug", Status: "todo"},
 		{ID: "2", Text: "Deployed the API", Status: "todo"},
 	}}
-	_, root, buf := newHarness(t, ass)
+	_, root, buf := newHarness(t, assistant)
 	root.SetArgs([]string{"add", "fixd bug and deployd"})
 	require.NoError(t, root.Execute())
 	out := buf.String()
@@ -284,8 +284,8 @@ func TestAddPrintsSavedTasks(t *testing.T) {
 }
 
 func TestAddErrorReportsNoTasks(t *testing.T) {
-	ass := &fakeAss{addErr: assert.AnError}
-	_, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{addErr: assert.AnError}
+	_, root, buf := newHarness(t, assistant)
 	root.SetArgs([]string{"add", "x"})
 	assert.Error(t, root.Execute())
 	assert.Contains(t, buf.String(), "Error")
@@ -323,8 +323,8 @@ func TestSpinPropagatesFnError(t *testing.T) {
 }
 
 func TestGenerateAlias(t *testing.T) {
-	ass := &fakeAss{genOut: "## Today\n- x"}
-	st, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "## Today\n- x"}
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	_, err := st.Add("x")
 	require.NoError(t, err)
@@ -347,8 +347,8 @@ func mustIDs(t *testing.T, st *store.Store) []string {
 }
 
 func TestDone(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
 	root.SetArgs([]string{"done", added.ID})
@@ -360,8 +360,8 @@ func TestDone(t *testing.T) {
 }
 
 func TestDoneIDPrefix(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
 	root.SetArgs([]string{"done", added.ID[:8]})
@@ -373,8 +373,8 @@ func TestDoneIDPrefix(t *testing.T) {
 }
 
 func TestDoneAmbiguousPrefix(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	_, err := st.Add("one")
 	require.NoError(t, err)
 	root.SetArgs([]string{"done", "x"})
@@ -383,7 +383,7 @@ func TestDoneAmbiguousPrefix(t *testing.T) {
 }
 
 func TestDoneEmptyIDArg(t *testing.T) {
-	st, root, _ := newHarness(t, &fakeAss{})
+	st, root, _ := newHarness(t, &fakeAssistant{})
 	added, err := st.Add("only task")
 	require.NoError(t, err)
 	for _, arg := range []string{""} {
@@ -400,15 +400,15 @@ func TestDoneEmptyIDArg(t *testing.T) {
 }
 
 func TestDoneNoArgs(t *testing.T) {
-	ass := &fakeAss{}
-	_, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
 	root.SetArgs([]string{"done"})
 	assert.Error(t, root.Execute())
 }
 
 func TestRm(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
 	root.SetArgs([]string{"rm", added.ID})
@@ -433,7 +433,7 @@ func seedDays(t *testing.T, st *store.Store) {
 
 func TestListDate(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	seedDays(t, st)
 	root.SetArgs([]string{"list", "--date", "2026-08-14"})
 	require.NoError(t, root.Execute())
@@ -445,7 +445,7 @@ func TestListDate(t *testing.T) {
 
 func TestListDateEmptySameMessage(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	st.Now = today(8, 0)
 	root.SetArgs([]string{"list", "--date", "2026-07-01"})
 	require.NoError(t, root.Execute())
@@ -454,7 +454,7 @@ func TestListDateEmptySameMessage(t *testing.T) {
 
 func TestListDateUnparsable(t *testing.T) {
 	pipeStdin(t, "")
-	_, root, _ := newHarness(t, &fakeAss{})
+	_, root, _ := newHarness(t, &fakeAssistant{})
 	root.SetArgs([]string{"list", "--date", "tomorrow"})
 	err := root.Execute()
 	require.Error(t, err)
@@ -463,7 +463,7 @@ func TestListDateUnparsable(t *testing.T) {
 
 func TestListDays(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	seedDays(t, st)
 	root.SetArgs([]string{"list", "--days", "3"})
 	require.NoError(t, root.Execute())
@@ -478,7 +478,7 @@ func TestListDays(t *testing.T) {
 
 func TestListDateAndDaysMutuallyExclusive(t *testing.T) {
 	pipeStdin(t, "")
-	_, root, _ := newHarness(t, &fakeAss{})
+	_, root, _ := newHarness(t, &fakeAssistant{})
 	root.SetArgs([]string{"list", "--date", "2026-08-14", "--days", "3"})
 	err := root.Execute()
 	require.Error(t, err)
@@ -487,7 +487,7 @@ func TestListDateAndDaysMutuallyExclusive(t *testing.T) {
 
 func TestListTagFilter(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	seedDays(t, st)
 	root.SetArgs([]string{"list", "--days", "3", "--tag", "#API"})
 	require.NoError(t, root.Execute())
@@ -499,7 +499,7 @@ func TestListTagFilter(t *testing.T) {
 
 func TestListTagNoMatch(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	st.Now = today(8, 0)
 	_, err := st.Add("plain task")
 	require.NoError(t, err)
@@ -510,7 +510,7 @@ func TestListTagNoMatch(t *testing.T) {
 
 func TestListTagMatchesLiteralTokenOnly(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	st.Now = today(8, 0)
 	_, err := st.Add("Fixed login bug #auth")
 	require.NoError(t, err)
@@ -529,7 +529,7 @@ func TestListTagMatchesLiteralTokenOnly(t *testing.T) {
 
 func TestListFlattensMultilineTasks(t *testing.T) {
 	pipeStdin(t, "")
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	st.Now = today(8, 0)
 	_, err := st.AddWithStatus("fix login bug\n\nThe token was expired.", "done")
 	require.NoError(t, err)
@@ -549,31 +549,31 @@ func TestFallbackEditor(t *testing.T) {
 }
 
 func TestGenerateDaysArg(t *testing.T) {
-	ass := &fakeAss{genOut: "## Today"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "## Today"}
+	st, root, _ := newHarness(t, assistant)
 	seedDays(t, st)
 	st.Now = today(9, 0)
 	root.SetArgs([]string{"generate", "3"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.genSec.Days, 3)
+	require.Len(t, assistant.genSec.Days, 3)
 	assert.Equal(t, []string{"Thu 2026-08-13", "Yesterday", "Today"},
-		[]string{ass.genSec.Days[0].Heading, ass.genSec.Days[1].Heading, ass.genSec.Days[2].Heading})
+		[]string{assistant.genSec.Days[0].Heading, assistant.genSec.Days[1].Heading, assistant.genSec.Days[2].Heading})
 }
 
 func TestGenerateDaysDefaultTwo(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	seedDays(t, st)
 	st.Now = today(9, 0)
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.genSec.Days, 2)
-	assert.NotNil(t, ass.genSec.Yesterday, "compat fields set for the default window")
+	require.Len(t, assistant.genSec.Days, 2)
+	assert.NotNil(t, assistant.genSec.Yesterday, "compat fields set for the default window")
 }
 
 func TestGenerateBadDaysArg(t *testing.T) {
 	for _, arg := range []string{"0", "abc"} {
-		_, root, _ := newHarness(t, &fakeAss{})
+		_, root, _ := newHarness(t, &fakeAssistant{})
 		root.SetArgs([]string{"generate", arg})
 		err := root.Execute()
 		require.Error(t, err, "arg %q must fail", arg)
@@ -582,8 +582,8 @@ func TestGenerateBadDaysArg(t *testing.T) {
 }
 
 func TestGenerateCarryOverInPrompt(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = func() time.Time { return time.Date(2026, 8, 14, 16, 0, 0, 0, time.Local) }
 	unfinished, err := st.Add("finish auth")
 	require.NoError(t, err)
@@ -591,7 +591,7 @@ func TestGenerateCarryOverInPrompt(t *testing.T) {
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
 	found := false
-	for _, tk := range ass.genSec.Today {
+	for _, tk := range assistant.genSec.Today {
 		if tk.ID == unfinished.ID {
 			found = true
 		}
@@ -600,8 +600,8 @@ func TestGenerateCarryOverInPrompt(t *testing.T) {
 }
 
 func TestGenerateOutputFile(t *testing.T) {
-	ass := &fakeAss{genOut: "## Today\n- did stuff"}
-	st, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "## Today\n- did stuff"}
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	_, err := st.Add("fix bug")
 	require.NoError(t, err)
@@ -615,8 +615,8 @@ func TestGenerateOutputFile(t *testing.T) {
 }
 
 func TestGenerateOutputFileTruncates(t *testing.T) {
-	ass := &fakeAss{genOut: "short"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "short"}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	_, err := st.Add("fix bug")
 	require.NoError(t, err)
@@ -630,17 +630,17 @@ func TestGenerateOutputFileTruncates(t *testing.T) {
 }
 
 func TestGenerateFromToWindow(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	seedDays(t, st)
 	st.Now = today(9, 0)
 	root.SetArgs([]string{"generate", "--from", "2026-08-13", "--to", "2026-08-14"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.genSec.Days, 2)
+	require.Len(t, assistant.genSec.Days, 2)
 	assert.Equal(t, []string{"Thu 2026-08-13", "Fri 2026-08-14"},
-		[]string{ass.genSec.Days[0].Heading, ass.genSec.Days[1].Heading},
+		[]string{assistant.genSec.Days[0].Heading, assistant.genSec.Days[1].Heading},
 		"explicit historical windows get dated headings, no cutoff")
-	assert.Nil(t, ass.genSec.Yesterday)
+	assert.Nil(t, assistant.genSec.Yesterday)
 }
 
 func TestGenerateFromToUsage(t *testing.T) {
@@ -651,7 +651,7 @@ func TestGenerateFromToUsage(t *testing.T) {
 		{"generate", "--from", "2026-08-14", "--to", "2026-08-13"},
 		{"generate", "3", "--from", "2026-08-13", "--to", "2026-08-14"},
 	} {
-		_, root, _ := newHarness(t, &fakeAss{})
+		_, root, _ := newHarness(t, &fakeAssistant{})
 		root.SetArgs(args)
 		err := root.Execute()
 		require.Error(t, err, "args %v must fail", args)
@@ -660,8 +660,8 @@ func TestGenerateFromToUsage(t *testing.T) {
 }
 
 func TestGenerateWeekendAwareDefault(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	// Saturday 2026-08-15: the default window is Friday + Saturday.
 	st.Now = func() time.Time { return time.Date(2026, 8, 15, 9, 0, 0, 0, time.Local) }
 	_, err := st.AddWithStatus("friday work", "done")
@@ -672,8 +672,8 @@ func TestGenerateWeekendAwareDefault(t *testing.T) {
 	require.NoError(t, err)
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.genSec.Days, 2, "Friday + today")
-	assert.Equal(t, []string{"friday task"}, taskTextsOf(ass.genSec.Yesterday))
+	require.Len(t, assistant.genSec.Days, 2, "Friday + today")
+	assert.Equal(t, []string{"friday task"}, taskTextsOf(assistant.genSec.Yesterday))
 }
 
 func taskTextsOf(ts []store.Task) []string {
@@ -685,8 +685,8 @@ func taskTextsOf(ts []store.Task) []string {
 }
 
 func TestGenerateClip(t *testing.T) {
-	ass := &fakeAss{genOut: "## Today\n- did stuff"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "## Today\n- did stuff"}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	_, err := st.Add("fix bug")
 	require.NoError(t, err)
@@ -700,8 +700,8 @@ func TestGenerateClip(t *testing.T) {
 }
 
 func TestGenerateClipError(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	_, err := st.Add("fix bug")
 	require.NoError(t, err)
@@ -737,12 +737,12 @@ func TestDoctorOfflineSkipsEndpoint(t *testing.T) {
 	t.Setenv("OPENAI_BASE_URL", "")
 	t.Setenv("OPENAI_MODEL", "")
 
-	ass := &fakeAss{}
+	assistant := &fakeAssistant{}
 	buf := &bytes.Buffer{}
 	root := New(func() (Deps, error) {
 		return Deps{
-			Assistant: func() (agent.Assistant, error) { return ass, nil },
-			Raw:       ass,
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
 			Store:     st,
 			Config:    config.Config{MeetingTime: "09:30", Offline: true, DataFile: st.Path},
 		}, nil
@@ -758,7 +758,7 @@ func TestDoctorOfflineSkipsEndpoint(t *testing.T) {
 
 func TestDoctorFailsOnMissingEnv(t *testing.T) {
 	pipeStdin(t, "")
-	st, _, _ := newHarness(t, &fakeAss{})
+	st, _, _ := newHarness(t, &fakeAssistant{})
 	st.Now = today(8, 0)
 	oldIdent := gitIdentity
 	gitIdentity = func(dir string) (string, error) { return "me@example.com", nil }
@@ -768,8 +768,8 @@ func TestDoctorFailsOnMissingEnv(t *testing.T) {
 	buf := &bytes.Buffer{}
 	root := New(func() (Deps, error) {
 		return Deps{
-			Assistant: func() (agent.Assistant, error) { return &fakeAss{}, nil },
-			Raw:       &fakeAss{},
+			Assistant: func() (agent.Assistant, error) { return &fakeAssistant{}, nil },
+			Raw:       &fakeAssistant{},
 			Store:     st,
 			Config:    config.Config{MeetingTime: "09:30", DataFile: filepath.Join(t.TempDir(), "tasks.jsonl")},
 		}, nil
@@ -783,8 +783,8 @@ func TestDoctorFailsOnMissingEnv(t *testing.T) {
 }
 
 func TestGenerateOutputFileUnwritable(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	_, err := st.Add("fix bug")
 	require.NoError(t, err)
@@ -793,21 +793,21 @@ func TestGenerateOutputFileUnwritable(t *testing.T) {
 }
 
 func TestGenerateBlockedSection(t *testing.T) {
-	ass := &fakeAss{genOut: "x"}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = func() time.Time { return time.Date(2026, 8, 14, 16, 0, 0, 0, time.Local) }
 	blocked, err := st.AddWithStatus("waiting on infra", "blocked")
 	require.NoError(t, err)
 	st.Now = today(9, 0)
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.genSec.Blockers, 1)
-	assert.Equal(t, blocked.ID, ass.genSec.Blockers[0].ID)
+	require.Len(t, assistant.genSec.Blockers, 1)
+	assert.Equal(t, blocked.ID, assistant.genSec.Blockers[0].ID)
 }
 
 func TestCommitsStampsCommitTime(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, buf := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, buf := newHarness(t, assistant)
 	st.Now = today(9, 0)
 	fri := time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)
 	old := gitLog
@@ -830,11 +830,11 @@ func TestCommitsStampsCommitTime(t *testing.T) {
 	assert.Equal(t, "done", tasks[0].Status, "shipped commits land as done")
 	assert.Equal(t, "fix login bug", tasks[0].Text)
 	assert.Contains(t, buf.String(), "- [done] fix login bug")
-	assert.Empty(t, ass.added, "commit ingestion is deterministic — no model involved")
+	assert.Empty(t, assistant.added, "commit ingestion is deterministic — no model involved")
 }
 
 func TestCommitsMultiRepoDedupesAndSorts(t *testing.T) {
-	st, root, _ := newHarness(t, &fakeAss{})
+	st, root, _ := newHarness(t, &fakeAssistant{})
 	dirs := []string{t.TempDir(), t.TempDir()}
 	for _, d := range dirs {
 		require.NoError(t, os.MkdirAll(d, 0o755))
@@ -858,7 +858,7 @@ func TestCommitsMultiRepoDedupesAndSorts(t *testing.T) {
 }
 
 func TestCommitsSkipsAlreadyImported(t *testing.T) {
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	st.Now = today(9, 0)
 	when := time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)
 	_, err := st.AddAt("fix login bug", "done", when)
@@ -877,7 +877,7 @@ func TestCommitsSkipsAlreadyImported(t *testing.T) {
 }
 
 func TestCommitsDaysArg(t *testing.T) {
-	_, root, _ := newHarness(t, &fakeAss{})
+	_, root, _ := newHarness(t, &fakeAssistant{})
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
 		assert.True(t, since.Equal(time.Date(2026, 8, 13, 0, 0, 0, 0, time.Local)), "3 days: since start of two days ago")
@@ -889,7 +889,7 @@ func TestCommitsDaysArg(t *testing.T) {
 }
 
 func TestCommitsBadArg(t *testing.T) {
-	_, root, _ := newHarness(t, &fakeAss{})
+	_, root, _ := newHarness(t, &fakeAssistant{})
 	root.SetArgs([]string{"commits", "zero"})
 	err := root.Execute()
 	require.Error(t, err)
@@ -897,7 +897,7 @@ func TestCommitsBadArg(t *testing.T) {
 }
 
 func TestCommitsEmptyHintsAtIdentity(t *testing.T) {
-	_, root, buf := newHarness(t, &fakeAss{})
+	_, root, buf := newHarness(t, &fakeAssistant{})
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) { return nil, nil }
 	t.Cleanup(func() { gitLog = old })
@@ -908,8 +908,8 @@ func TestCommitsEmptyHintsAtIdentity(t *testing.T) {
 }
 
 func TestEditArg(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	at := time.Date(2026, 8, 15, 8, 0, 0, 0, time.Local)
 	st.Now = func() time.Time { return at }
 	added, err := st.Add("fixd typo")
@@ -929,8 +929,8 @@ func TestEditArg(t *testing.T) {
 }
 
 func TestEditEmptyReplacementRejected(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	added, err := st.Add("keep me")
 	require.NoError(t, err)
@@ -941,7 +941,7 @@ func TestEditEmptyReplacementRejected(t *testing.T) {
 }
 
 func TestEditMissingIDUsage(t *testing.T) {
-	_, root, _ := newHarness(t, &fakeAss{})
+	_, root, _ := newHarness(t, &fakeAssistant{})
 	root.SetArgs([]string{"edit"})
 	err := root.Execute()
 	require.Error(t, err)
@@ -949,8 +949,8 @@ func TestEditMissingIDUsage(t *testing.T) {
 }
 
 func TestEditViaEditor(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	added, err := st.Add("fixd typo")
 	require.NoError(t, err)
@@ -969,8 +969,8 @@ func TestEditViaEditor(t *testing.T) {
 }
 
 func TestEditEditorFailure(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
 	added, err := st.Add("keep me")
 	require.NoError(t, err)
@@ -991,7 +991,7 @@ func TestEditEditorFailure(t *testing.T) {
 }
 
 func TestDoneEchoesRow(t *testing.T) {
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
 	root.SetArgs([]string{"done", added.ID})
@@ -1000,7 +1000,7 @@ func TestDoneEchoesRow(t *testing.T) {
 }
 
 func TestRmEchoesRow(t *testing.T) {
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
 	root.SetArgs([]string{"rm", added.ID})
@@ -1009,7 +1009,7 @@ func TestRmEchoesRow(t *testing.T) {
 }
 
 func TestEditEchoesRow(t *testing.T) {
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	st.Now = today(8, 0)
 	added, err := st.Add("fixd typo")
 	require.NoError(t, err)
@@ -1019,7 +1019,7 @@ func TestEditEchoesRow(t *testing.T) {
 }
 
 func TestStatusSetsStatus(t *testing.T) {
-	st, root, buf := newHarness(t, &fakeAss{})
+	st, root, buf := newHarness(t, &fakeAssistant{})
 	added, err := st.Add("waiting on infra")
 	require.NoError(t, err)
 	root.SetArgs([]string{"status", added.ID, "blocked"})
@@ -1038,7 +1038,7 @@ func TestStatusSetsStatus(t *testing.T) {
 }
 
 func TestStatusInvalidRejected(t *testing.T) {
-	st, root, _ := newHarness(t, &fakeAss{})
+	st, root, _ := newHarness(t, &fakeAssistant{})
 	added, err := st.Add("keep")
 	require.NoError(t, err)
 	root.SetArgs([]string{"status", added.ID, "bogus"})
@@ -1049,7 +1049,7 @@ func TestStatusInvalidRejected(t *testing.T) {
 
 func TestStatusUsage(t *testing.T) {
 	for _, args := range [][]string{{}, {"one"}} {
-		_, root, _ := newHarness(t, &fakeAss{})
+		_, root, _ := newHarness(t, &fakeAssistant{})
 		root.SetArgs(append([]string{"status"}, args...))
 		err := root.Execute()
 		require.Error(t, err)
@@ -1071,6 +1071,24 @@ func (r *rawAss) Generate(ctx context.Context, sec report.Section) (string, erro
 }
 
 var _ agent.Assistant = (*rawAss)(nil)
+
+func TestColorReport(t *testing.T) {
+	in := "## Today\n- [todo] a (09:00)\n- [done] b (10:00)\n- [in-progress] c (11:00)\n- [blocked] d (12:00)\n"
+	on := colorReport(in, painter{on: true})
+	assert.Contains(t, on, "["+painter{on: true}.status("todo")+"]")
+	assert.Contains(t, on, "["+painter{on: true}.status("done")+"]")
+	assert.Contains(t, on, "["+painter{on: true}.status("in-progress")+"]")
+	assert.Contains(t, on, "["+painter{on: true}.status("blocked")+"]")
+	assert.Equal(t, in, colorReport(in, painter{on: false}), "colors off: verbatim")
+}
+
+func TestAddEchoesStatus(t *testing.T) {
+	assistant := &fakeAssistant{addResult: []store.Task{{ID: "x", Text: "hello world", Status: "todo"}}}
+	_, root, buf := newHarness(t, assistant)
+	root.SetArgs([]string{"add", "hello world"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "- [todo] hello world")
+}
 
 func TestAddRawBypassesModel(t *testing.T) {
 	called := false
@@ -1127,7 +1145,7 @@ func TestReadOnlyCommandsSkipAssistant(t *testing.T) {
 						called = true
 						return nil, errors.New("credentials must not be required here")
 					},
-					Raw:    &fakeAss{},
+					Raw:    &fakeAssistant{},
 					Store:  st,
 					Config: config.Config{MeetingTime: "09:30"},
 				}, nil
@@ -1147,7 +1165,7 @@ func TestReadOnlyCommandsSkipAssistant(t *testing.T) {
 
 func TestAddUsesAssistant(t *testing.T) {
 	pipeStdin(t, "")
-	_, root, _ := newHarness(t, &fakeAss{addResult: []store.Task{{ID: "1", Text: "cleaned"}}})
+	_, root, _ := newHarness(t, &fakeAssistant{addResult: []store.Task{{ID: "1", Text: "cleaned"}}})
 	root.SetArgs([]string{"add", "raw text"})
 	require.NoError(t, root.Execute())
 }
@@ -1168,7 +1186,7 @@ func TestInitCmdWritesDefaults(t *testing.T) {
 	xdg := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", xdg)
 	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
-	_, root, buf := newHarness(t, &fakeAss{})
+	_, root, buf := newHarness(t, &fakeAssistant{})
 	root.SetArgs([]string{"init"})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, buf.String(), filepath.Join(xdg, "standup"))
