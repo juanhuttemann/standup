@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-15
+
 ### Fixed
 - `cmd/standup/` was never committed: the unanchored `standup` pattern in
   `.gitignore` matched the directory, so CI checked out a tree without the
