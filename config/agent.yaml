@@ -21,19 +21,19 @@ reporter_instructions: |
   remarks.
 
 generate_input_template: |
-  ## Yesterday
+  {{if .Yesterday}}## Yesterday
   {{range .Yesterday}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
   {{end}}
-  ## Today
+  {{end}}{{if .Today}}## Today
   {{range .Today}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
   {{end}}
-  {{if .Blockers}}## Blockers
+  {{end}}{{if .Blockers}}## Blockers
   {{range .Blockers}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
   {{end}}{{end}}
 
 generate_input_template_days: |
-  {{range .Days}}## {{.Heading}}
+  {{range .Days}}{{if .Tasks}}## {{.Heading}}
   {{range .Tasks}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
-  {{end}}{{end}}{{if .Blockers}}## Blockers
+  {{end}}{{end}}{{end}}{{if .Blockers}}## Blockers
   {{range .Blockers}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
   {{end}}{{end}}

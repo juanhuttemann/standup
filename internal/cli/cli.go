@@ -25,9 +25,20 @@ import (
 // gitLog is swappable so CLI tests never depend on a real repository.
 var gitLog = git.Log
 
-func New(ass agent.Assistant, st *store.Store, cfg config.Config) *cobra.Command {
+// Deps carries everything a command needs; it is built lazily so help,
+// version, and init never touch config, store, or provider settings.
+type Deps struct {
+	Assist agent.Assistant
+	// Raw is the deterministic assistant used by `add --raw`.
+	Raw    agent.Assistant
+	Store  *store.Store
+	Config config.Config
+}
+
+func New(load func() (Deps, error)) *cobra.Command {
 	root := &cobra.Command{
 		Use:          "standup",
+		Short:        "AI-assisted standup CLI",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			text, err := cmd.Flags().GetString("add")
@@ -44,11 +55,23 @@ func New(ass agent.Assistant, st *store.Store, cfg config.Config) *cobra.Command
 			}
 			switch {
 			case cmd.Flags().Changed("add"):
-				return runAdd(cmd, ass, []string{text})
+				d, err := load()
+				if err != nil {
+					return err
+				}
+				return runAdd(cmd, d, []string{text})
 			case list:
-				return runList(cmd, st)
+				d, err := load()
+				if err != nil {
+					return err
+				}
+				return runList(cmd, d)
 			case gen:
-				return runGenerate(cmd, ass, st, cfg, nil)
+				d, err := load()
+				if err != nil {
+					return err
+				}
+				return runGenerate(cmd, d, args)
 			}
 			return cmd.Help()
 		},
@@ -57,88 +80,174 @@ func New(ass agent.Assistant, st *store.Store, cfg config.Config) *cobra.Command
 	root.Flags().BoolP("list", "l", false, "list today's tasks")
 	root.Flags().BoolP("generate", "g", false, "generate the standup report")
 
+	addCmd := &cobra.Command{
+		Use:   "add",
+		Short: "add a task (model-cleaned; --raw stores verbatim)",
+		Args:  cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runAdd(c, d, args) })
+		},
+		SilenceUsage: true,
+	}
+	addCmd.Flags().Bool("raw", false, "store text verbatim, no model")
+
 	listCmd := &cobra.Command{
 		Use:   "list",
 		Short: "list tasks (today by default)",
-		RunE:  func(cmd *cobra.Command, args []string) error { return runList(cmd, st) },
+		RunE:  func(cmd *cobra.Command, args []string) error { return lazy(cmd, load, runList) },
 	}
 	listCmd.Flags().String("date", "", "show tasks from this date (YYYY-MM-DD)")
 	listCmd.Flags().Int("days", 0, "show tasks from the trailing N days")
 	listCmd.Flags().String("tag", "", "show only tasks containing this tag token")
 
 	genCmd := &cobra.Command{
-		Use:          "generate [days]",
-		Aliases:      []string{"g"},
-		Args:         cobra.MaximumNArgs(1),
-		Short:        "generate the standup report (yesterday + today by default)",
-		RunE:         func(cmd *cobra.Command, args []string) error { return runGenerate(cmd, ass, st, cfg, args) },
+		Use:     "generate [days]",
+		Aliases: []string{"g"},
+		Args:    cobra.MaximumNArgs(1),
+		Short:   "generate the standup report (yesterday + today by default)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runGenerate(c, d, args) })
+		},
 		SilenceUsage: true,
 	}
 	genCmd.Flags().StringP("output", "o", "", "write the report to this file")
 
-	root.AddCommand(
-		&cobra.Command{
-			Use:          "add",
-			Args:         cobra.ArbitraryArgs,
-			RunE:         func(cmd *cobra.Command, args []string) error { return runAdd(cmd, ass, args) },
-			SilenceUsage: true,
+	commitsCmd := &cobra.Command{
+		Use:   "commits [days]",
+		Args:  cobra.MaximumNArgs(1),
+		Short: "turn git commits from the last working day (or N days) into tasks",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runCommits(c, d, args) })
 		},
-		listCmd,
-		genCmd,
-		&cobra.Command{
-			Use:          "commits [days]",
-			Args:         cobra.MaximumNArgs(1),
-			Short:        "turn git commits from the last working day (or N days) into tasks",
-			RunE:         func(cmd *cobra.Command, args []string) error { return runCommits(cmd, ass, st, args) },
-			SilenceUsage: true,
+		SilenceUsage: true,
+	}
+
+	doneCmd := &cobra.Command{
+		Use:   "done <id>",
+		Short: "mark a task done",
+		Args:  idArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runDone(c, d, args) })
 		},
-		&cobra.Command{
-			Use:  "done <id>",
-			Args: idArg,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				task, err := st.FindByPrefix(args[0])
-				if err != nil {
-					return err
-				}
-				_, err = st.SetStatus(task.ID, "done")
+		SilenceUsage: true,
+	}
+
+	editCmd := &cobra.Command{
+		Use:   "edit <id> [text]",
+		Short: "edit a task's text (no argument opens $EDITOR)",
+		Args:  editArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runEdit(c, d, args) })
+		},
+		SilenceUsage: true,
+	}
+
+	rmCmd := &cobra.Command{
+		Use:   "rm <id>",
+		Short: "delete a task",
+		Args:  idArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runRm(c, d, args) })
+		},
+		SilenceUsage: true,
+	}
+
+	statusCmd := &cobra.Command{
+		Use:   "status <id> <status>",
+		Short: "set a task's status (todo, in-progress, blocked, done)",
+		Args:  statusArg,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runStatus(c, d, args) })
+		},
+		SilenceUsage: true,
+	}
+
+	initCmd := &cobra.Command{
+		Use:   "init",
+		Short: "write default config files to the user config dir",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			dir, err := config.Init()
+			if err != nil {
 				return err
-			},
-			SilenceUsage: true,
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "config dir: %s (existing files kept)\n", dir)
+			return err
 		},
-		&cobra.Command{
-			Use:  "edit <id> [text]",
-			Args: editArg,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				task, err := st.FindByPrefix(args[0])
-				if err != nil {
-					return err
-				}
-				text := strings.Join(args[1:], " ")
-				if len(args) == 1 {
-					text, err = editInEditor(task.Text)
-					if err != nil {
-						return err
-					}
-				}
-				_, err = st.UpdateText(task.ID, text)
-				return err
-			},
-			SilenceUsage: true,
-		},
-		&cobra.Command{
-			Use:  "rm <id>",
-			Args: idArg,
-			RunE: func(cmd *cobra.Command, args []string) error {
-				task, err := st.FindByPrefix(args[0])
-				if err != nil {
-					return err
-				}
-				return st.Delete(task.ID)
-			},
-			SilenceUsage: true,
-		},
-	)
+	}
+
+	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd)
 	return root
+}
+
+// lazy loads deps, then runs the command body.
+func lazy(cmd *cobra.Command, load func() (Deps, error), run func(*cobra.Command, Deps) error) error {
+	d, err := load()
+	if err != nil {
+		return err
+	}
+	return run(cmd, d)
+}
+
+func runDone(cmd *cobra.Command, d Deps, args []string) error {
+	task, err := d.Store.FindByPrefix(args[0])
+	if err != nil {
+		return err
+	}
+	task, err = d.Store.SetStatus(task.ID, "done")
+	if err != nil {
+		return err
+	}
+	return echoTask(cmd, task)
+}
+
+func runEdit(cmd *cobra.Command, d Deps, args []string) error {
+	task, err := d.Store.FindByPrefix(args[0])
+	if err != nil {
+		return err
+	}
+	text := strings.Join(args[1:], " ")
+	if len(args) == 1 {
+		text, err = editInEditor(task.Text)
+		if err != nil {
+			return err
+		}
+	}
+	task, err = d.Store.UpdateText(task.ID, text)
+	if err != nil {
+		return err
+	}
+	return echoTask(cmd, task)
+}
+
+func runRm(cmd *cobra.Command, d Deps, args []string) error {
+	task, err := d.Store.FindByPrefix(args[0])
+	if err != nil {
+		return err
+	}
+	if err := d.Store.Delete(task.ID); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "- removed: %s\n", task.Text)
+	return err
+}
+
+func runStatus(cmd *cobra.Command, d Deps, args []string) error {
+	task, err := d.Store.FindByPrefix(args[0])
+	if err != nil {
+		return err
+	}
+	task, err = d.Store.SetStatus(task.ID, args[1])
+	if err != nil {
+		return err
+	}
+	return echoTask(cmd, task)
+}
+
+// echoTask prints the mutated row so silent mutations never happen.
+func echoTask(cmd *cobra.Command, t store.Task) error {
+	p := newPainter(cmd.OutOrStdout())
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), t.Text)
+	return err
 }
 
 func idArg(cmd *cobra.Command, args []string) error {
@@ -151,6 +260,13 @@ func idArg(cmd *cobra.Command, args []string) error {
 func editArg(cmd *cobra.Command, args []string) error {
 	if len(args) < 1 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("usage: %s edit <id> [text] (find ids with: %s list)", cmd.Root().Name(), cmd.Root().Name())
+	}
+	return nil
+}
+
+func statusArg(cmd *cobra.Command, args []string) error {
+	if len(args) != 2 || strings.TrimSpace(args[0]) == "" || strings.TrimSpace(args[1]) == "" {
+		return fmt.Errorf("usage: %s status <id> <status> (todo, in-progress, blocked, done; find ids with: %s list)", cmd.Root().Name(), cmd.Root().Name())
 	}
 	return nil
 }
@@ -209,6 +325,14 @@ func flagInt(cmd *cobra.Command, name string) int {
 	return 0
 }
 
+// flagBool reads a bool flag that may not exist on this command.
+func flagBool(cmd *cobra.Command, name string) bool {
+	if f := cmd.Flags().Lookup(name); f != nil {
+		return f.Value.String() == "true"
+	}
+	return false
+}
+
 // spin runs fn with an active-TTY spinner and always stops it.
 func spin(msg string, fn func() error) error {
 	sp := newSpinner(os.Stderr, term.IsTerminal(int(os.Stderr.Fd())), msg)
@@ -222,7 +346,7 @@ func spin(msg string, fn func() error) error {
 	return err
 }
 
-func runAdd(cmd *cobra.Command, ass agent.Assistant, args []string) error {
+func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 	text := strings.Join(args, " ")
 	if strings.TrimSpace(text) == "" && !interactive() {
 		b, err := io.ReadAll(os.Stdin)
@@ -234,10 +358,14 @@ func runAdd(cmd *cobra.Command, ass agent.Assistant, args []string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("usage: %s add \"task text\" (or pipe text to %s add)", cmd.Root().Name(), cmd.Root().Name())
 	}
+	a := d.Assist
+	if flagBool(cmd, "raw") {
+		a = d.Raw
+	}
 	var tasks []store.Task
 	var addErr error
 	if err := spin("adding tasks", func() error {
-		tasks, addErr = ass.AddTasks(cmd.Context(), text)
+		tasks, addErr = a.AddTasks(cmd.Context(), text)
 		return nil
 	}); err != nil {
 		return err
@@ -253,7 +381,7 @@ func runAdd(cmd *cobra.Command, ass agent.Assistant, args []string) error {
 	return nil
 }
 
-func runCommits(cmd *cobra.Command, ass agent.Assistant, st *store.Store, args []string) error {
+func runCommits(cmd *cobra.Command, d Deps, args []string) error {
 	days := 0
 	if len(args) == 1 {
 		n, err := strconv.Atoi(args[0])
@@ -262,7 +390,7 @@ func runCommits(cmd *cobra.Command, ass agent.Assistant, st *store.Store, args [
 		}
 		days = n
 	}
-	now := st.Now()
+	now := d.Store.Now()
 	since := report.StartOfDay(report.LastWorkingDay(now))
 	if days > 0 {
 		since = report.StartOfDay(now.AddDate(0, 0, -(days - 1)))
@@ -279,7 +407,7 @@ func runCommits(cmd *cobra.Command, ass agent.Assistant, st *store.Store, args [
 	for i, c := range commits {
 		subjects[i] = c.Subject
 	}
-	return runAdd(cmd, ass, []string{strings.Join(subjects, "\n\n")})
+	return runAdd(cmd, d, []string{strings.Join(subjects, "\n\n")})
 }
 
 var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -340,7 +468,8 @@ func interactive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
-func runList(cmd *cobra.Command, st *store.Store) error {
+func runList(cmd *cobra.Command, d Deps) error {
+	st := d.Store
 	now := st.Now()
 	date := flagString(cmd, "date")
 	days := flagInt(cmd, "days")
@@ -391,7 +520,7 @@ func runList(cmd *cobra.Command, st *store.Store) error {
 	}
 	p := newPainter(cmd.OutOrStdout())
 	for _, t := range tasks {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(t.ID), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), t.Text); err != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(shortID(t.ID)), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), t.Text); err != nil {
 			return err
 		}
 	}
@@ -489,7 +618,7 @@ func selectLoop(st *store.Store, tag string, p painter) error {
 	}
 }
 
-func runGenerate(cmd *cobra.Command, ass agent.Assistant, st *store.Store, cfg config.Config, args []string) error {
+func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	days := 2
 	if len(args) == 1 {
 		n, err := strconv.Atoi(args[0])
@@ -498,17 +627,17 @@ func runGenerate(cmd *cobra.Command, ass agent.Assistant, st *store.Store, cfg c
 		}
 		days = n
 	}
-	tasks, err := st.List()
+	tasks, err := d.Store.List()
 	if err != nil {
 		return err
 	}
-	sec, err := report.Build(tasks, st.Now(), cfg.MeetingTime, days)
+	sec, err := report.Build(tasks, d.Store.Now(), d.Config.MeetingTime, days)
 	if err != nil {
 		return err
 	}
 	total := len(sec.Blockers)
-	for _, d := range sec.Days {
-		total += len(d.Tasks)
+	for _, day := range sec.Days {
+		total += len(day.Tasks)
 	}
 	if total == 0 {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "nothing to report")
@@ -517,7 +646,7 @@ func runGenerate(cmd *cobra.Command, ass agent.Assistant, st *store.Store, cfg c
 	var out string
 	var genErr error
 	if err := spin("generating standup", func() error {
-		out, genErr = ass.Generate(cmd.Context(), sec)
+		out, genErr = d.Assist.Generate(cmd.Context(), sec)
 		return nil
 	}); err != nil {
 		return err

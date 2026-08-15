@@ -6,16 +6,43 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 ## [Unreleased]
 
 ### Added
+- Zero-config startup: config defaults are embedded in the binary; every
+  command works right after install. Config resolution per file:
+  `$STANDUP_CONFIG_DIR` → `./config` → user config dir (`~/.config/standup`,
+  `%APPDATA%\standup`) → embedded defaults.
+- `standup init`: writes the default `config.yaml` + `agent.yaml` into the
+  user config dir for editing (never overwrites existing files).
+- `standup status <id> <status>`: sets `todo`/`in-progress`/`blocked`/`done`
+  directly — blocked tasks are no longer a dead end (`done` was the only way
+  out via CLI).
+- `add --raw` (also on the `-a` flag path): stores text verbatim through the
+  offline splitter, no model call — verbatim capture while online.
+- `.env` files are now also read from the config dirs (cwd `.env` still wins),
+  so provider settings no longer need to live in every repo.
 - Terminal color palette: task statuses render in their own hue in `list`
   output (todo amber, in-progress blue, blocked red, done green; ids and
   timestamps quiet gray). Truecolor on TTY output only — piped/redirected
-  output stays plain and `NO_COLOR` disables it.
-- README badges now use the project palette (Ink Slate labels, green/frost
-  values).
+  output stays plain and `NO_COLOR` disables it. README badges restyled with
+  the project palette; the retired Go Report Card badge was replaced with a
+  golangci-lint badge linking to the CI job that runs it.
 
 ### Changed
-- README badges restyled (`for-the-badge`); the retired Go Report Card badge
-  was replaced with a golangci-lint badge linking to the CI job that runs it.
+- `--help`, `--version`, and bare `standup` no longer load config or require
+  provider env — command wiring is lazy.
+- Generate input templates skip empty sections: no empty `## Yesterday`
+  heading when there are no yesterday tasks.
+- Plain `list` output shows 8-char short ids (UUIDs stay internal; prefix
+  matching was already accepted and is now documented in the README).
+- Release archives ship the binary only (no README/LICENSE dumped into the
+  extraction directory).
+- Invalid store statuses now name the valid set in the error.
+
+### Fixed
+- Fresh installs no longer die with `read config.yaml: ... cannot find the
+  path` — embedded defaults cover it and `init` materializes editable files.
+- `commits` in a repo without a configured git `user.email` now prints the
+  exact fix (`git config --global user.email …`) instead of a raw
+  `exit status 1`.
 
 ## [0.3.0] - 2026-08-15
 

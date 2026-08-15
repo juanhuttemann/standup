@@ -55,7 +55,9 @@ func newHarness(t *testing.T, ass *fakeAss) (*store.Store, *cobra.Command, *byte
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
 	buf := &bytes.Buffer{}
-	root := New(ass, st, config.Config{MeetingTime: "09:30"})
+	root := New(func() (Deps, error) {
+		return Deps{Assist: ass, Raw: ass, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
+	})
 	root.SetOut(buf)
 	root.SetErr(buf)
 	return st, root, buf
@@ -171,7 +173,8 @@ func TestListPlain(t *testing.T) {
 	root.SetArgs([]string{"list"})
 	require.NoError(t, root.Execute())
 	out := buf.String()
-	assert.Contains(t, out, added.ID)
+	assert.Contains(t, out, added.ID[:8], "plain output shows the short id")
+	assert.NotContains(t, out, added.ID, "full UUID ids stay out of plain output")
 	assert.Contains(t, out, "todo")
 	assert.Contains(t, out, "08:00")
 	assert.Contains(t, out, "write tests")
@@ -742,4 +745,154 @@ func TestEditEditorFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 	assert.Equal(t, "keep me", tasks[0].Text, "failed editor leaves text untouched")
+}
+
+func TestDoneEchoesRow(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAss{})
+	added, err := st.Add("ship it")
+	require.NoError(t, err)
+	root.SetArgs([]string{"done", added.ID})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "- [done] ship it")
+}
+
+func TestRmEchoesRow(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAss{})
+	added, err := st.Add("ship it")
+	require.NoError(t, err)
+	root.SetArgs([]string{"rm", added.ID})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "- removed: ship it")
+}
+
+func TestEditEchoesRow(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAss{})
+	st.Now = today(8, 0)
+	added, err := st.Add("fixd typo")
+	require.NoError(t, err)
+	root.SetArgs([]string{"edit", added.ID, "fixed typo"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "- [todo] fixed typo")
+}
+
+func TestStatusSetsStatus(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAss{})
+	added, err := st.Add("waiting on infra")
+	require.NoError(t, err)
+	root.SetArgs([]string{"status", added.ID, "blocked"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "blocked", tasks[0].Status)
+	assert.Contains(t, buf.String(), "- [blocked] waiting on infra")
+
+	root.SetArgs([]string{"status", added.ID, "in-progress"})
+	require.NoError(t, root.Execute(), "blocked tasks can be unblocked")
+	tasks, err = st.List()
+	require.NoError(t, err)
+	assert.Equal(t, "in-progress", tasks[0].Status)
+}
+
+func TestStatusInvalidRejected(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAss{})
+	added, err := st.Add("keep")
+	require.NoError(t, err)
+	root.SetArgs([]string{"status", added.ID, "bogus"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid status")
+}
+
+func TestStatusUsage(t *testing.T) {
+	for _, args := range [][]string{{}, {"one"}} {
+		_, root, _ := newHarness(t, &fakeAss{})
+		root.SetArgs(append([]string{"status"}, args...))
+		err := root.Execute()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "usage: standup status <id> <status>")
+	}
+}
+
+// rawAss fails if the model path is taken; the deterministic assistant must
+// be used instead.
+type rawAss struct{ called *bool }
+
+func (r *rawAss) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {
+	*r.called = true
+	return nil, errors.New("model must not be called with --raw")
+}
+
+func (r *rawAss) Generate(ctx context.Context, sec report.Section) (string, error) {
+	return "", nil
+}
+
+var _ agent.Assistant = (*rawAss)(nil)
+
+func TestAddRawBypassesModel(t *testing.T) {
+	called := false
+	model := &rawAss{called: &called}
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	raw, err := agent.Local(config.Config{
+		GenerateInputTemplate: "x",
+		DaysTemplate:          "x",
+	}, st)
+	require.NoError(t, err)
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{Assist: model, Raw: raw, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+
+	root.SetArgs([]string{"add", "--raw", "verbatim one\n\nverbatim two"})
+	require.NoError(t, root.Execute())
+	assert.False(t, called, "--raw never contacts the model")
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	assert.Equal(t, "verbatim one", tasks[0].Text, "text stored verbatim, paragraph-split")
+	assert.Equal(t, "verbatim two", tasks[1].Text)
+}
+
+func TestHelpAndVersionNeverLoadConfig(t *testing.T) {
+	for _, args := range [][]string{{"--help"}, {"--version"}, {}, {"help"}} {
+		root := New(func() (Deps, error) { return Deps{}, errors.New("config must not load") })
+		root.Version = "test"
+		buf := &bytes.Buffer{}
+		root.SetOut(buf)
+		root.SetErr(buf)
+		root.SetArgs(args)
+		require.NoError(t, root.Execute(), "args %v must not touch config", args)
+	}
+}
+
+func TestInitCmdWritesDefaults(t *testing.T) {
+	xdg := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", xdg)
+	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
+	_, root, buf := newHarness(t, &fakeAss{})
+	root.SetArgs([]string{"init"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), filepath.Join(xdg, "standup"))
+	for _, name := range []string{"config.yaml", "agent.yaml"} {
+		_, err := os.Stat(filepath.Join(xdg, "standup", name))
+		require.NoError(t, err, "%s written", name)
+	}
+}
+
+func unsetCliEnv(t *testing.T, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		old, ok := os.LookupEnv(k)
+		require.NoError(t, os.Unsetenv(k))
+		if ok {
+			t.Cleanup(func() {
+				if err := os.Setenv(k, old); err != nil {
+					t.Errorf("restore %s: %v", k, err)
+				}
+			})
+		}
+	}
 }

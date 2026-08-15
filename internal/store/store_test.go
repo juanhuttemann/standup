@@ -211,6 +211,7 @@ func TestAddWithStatus(t *testing.T) {
 
 	_, err = s.AddWithStatus("x", "garbage")
 	assert.ErrorContains(t, err, "invalid status")
+	assert.ErrorContains(t, err, "todo, in-progress, blocked, done", "error lists the valid statuses")
 
 	_, err = s.AddWithStatus("   ", "blocked")
 	assert.ErrorContains(t, err, "empty task text")

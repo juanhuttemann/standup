@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"text/template"
 
@@ -45,21 +46,26 @@ type local struct {
 var _ Assistant = (*local)(nil)
 
 func New(cfg config.Config, st *store.Store) (Assistant, error) {
-	genTpl, err := template.New("generate").Parse(cfg.GenerateInputTemplate)
+	genTpl, daysTpl, err := parseTemplates(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("agent: generate template: %w", err)
-	}
-	daysTpl, err := template.New("generate-days").Parse(cfg.DaysTemplate)
-	if err != nil {
-		return nil, fmt.Errorf("agent: days template: %w", err)
+		return nil, err
 	}
 	if cfg.Offline {
 		return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
 	}
-	client := openai.NewClient(option.WithBaseURL(cfg.BaseURL))
+	var missing []string
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
+		if os.Getenv(key) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("missing required environment variables: %s (or set offline: true)", strings.Join(missing, ", "))
+	}
+	client := openai.NewClient(option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")))
 	newRun := func(name, instructions string) runFunc {
 		a := openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
-			Model:        cfg.Model,
+			Model:        os.Getenv("OPENAI_MODEL"),
 			Instructions: instructions,
 			Config:       agent.Config{Name: name},
 		})
@@ -78,6 +84,28 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		genTpl:   genTpl,
 		daysTpl:  daysTpl,
 	}, nil
+}
+
+// Local returns the deterministic assistant: no model endpoint, paragraph
+// splitting on add, direct template render on generate.
+func Local(cfg config.Config, st *store.Store) (Assistant, error) {
+	genTpl, daysTpl, err := parseTemplates(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
+}
+
+func parseTemplates(cfg config.Config) (genTpl, daysTpl *template.Template, err error) {
+	genTpl, err = template.New("generate").Parse(cfg.GenerateInputTemplate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent: generate template: %w", err)
+	}
+	daysTpl, err = template.New("generate-days").Parse(cfg.DaysTemplate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("agent: days template: %w", err)
+	}
+	return genTpl, daysTpl, nil
 }
 
 func (a *impl) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {

@@ -16,17 +16,20 @@ type Commit struct {
 	When    time.Time
 }
 
+// errNoEmail tells the user exactly how to fix the missing git identity.
+var errNoEmail = errors.New("git: user.email is not configured — set it with:\n  git config --global user.email you@example.com")
+
 // Log returns the configured git user's non-merge commits since the given
 // time from the repository at dir (oldest first). Teammates' commits are
 // excluded by matching the repository's user.email.
 func Log(dir string, since time.Time) ([]Commit, error) {
 	email, err := run(dir, "config", "user.email")
 	if err != nil {
-		return nil, err
+		return nil, errNoEmail
 	}
 	email = strings.TrimSpace(email)
 	if email == "" {
-		return nil, errors.New("git: user.email not configured in repository")
+		return nil, errNoEmail
 	}
 	out, err := run(dir, "log", "--no-merges",
 		"--since="+since.Format(time.RFC3339),

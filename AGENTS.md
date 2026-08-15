@@ -37,13 +37,17 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Each setting has exactly one home — never duplicate a setting across files:
   application settings (`meeting_time`, `data_file`) in `config/config.yaml`;
   provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`) in local `.env`/env only.
-- Precedence: `STANDUP_*` env > `.env` > yaml. Config dir: `$STANDUP_CONFIG_DIR` else `./config`.
-- Committed files contain zero provider references: no endpoints, no model names, anywhere.
-  Provider settings are deployment facts — required in local `.env`/env, never defaulted,
-  never committed. `config.Load` errors if missing.
+- Precedence: `STANDUP_*` env > `.env` > yaml. Config files resolve per file
+  through the dir chain `$STANDUP_CONFIG_DIR` → `./config` → user config dir →
+  embedded defaults (`config/embed.go` embeds the committed yaml; the yaml
+  files stay the single home of every setting).
+- Committed files contain zero provider references: no endpoints, no model
+  names, anywhere. Provider settings are deployment facts — required in local
+  `.env`/env for online mode (checked by `agent.New`, never defaulted), never
+  committed. `--help`/`--version`/`init` never load them.
 - `.env.example` is a template for one audience: the person installing the tool.
-  One short comment per setting. No policy essays, no cross-references to other files,
-  no conflicting instructions.
+  One short comment per setting. No policy essays, no cross-references to other
+  files, no conflicting instructions.
 
 ### TDD loop
 - Write the failing test first (testify). Tests use `t.TempDir()` and fake `Assistant` impls.

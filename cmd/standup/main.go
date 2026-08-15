@@ -1,8 +1,8 @@
 package main
 
 import (
-	"fmt"
 	"os"
+	"sync"
 
 	"standup/internal/agent"
 	"standup/internal/cli"
@@ -14,26 +14,28 @@ import (
 var version = "dev"
 
 func main() {
-	dir := os.Getenv("STANDUP_CONFIG_DIR")
-	if dir == "" {
-		dir = "config"
-	}
-	cfg, err := config.Load(dir)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	st, err := store.Open(cfg.DataFile)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	ass, err := agent.New(cfg, st)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	root := cli.New(ass, st, cfg)
+	// Built lazily so help, version, and init never touch config or
+	// provider settings; memoized so each process wires at most once.
+	load := sync.OnceValues(func() (cli.Deps, error) {
+		cfg, err := config.Load()
+		if err != nil {
+			return cli.Deps{}, err
+		}
+		st, err := store.Open(cfg.DataFile)
+		if err != nil {
+			return cli.Deps{}, err
+		}
+		ass, err := agent.New(cfg, st)
+		if err != nil {
+			return cli.Deps{}, err
+		}
+		raw, err := agent.Local(cfg, st)
+		if err != nil {
+			return cli.Deps{}, err
+		}
+		return cli.Deps{Assist: ass, Raw: raw, Store: st, Config: cfg}, nil
+	})
+	root := cli.New(load)
 	root.Version = version
 	if err := root.Execute(); err != nil {
 		os.Exit(1)

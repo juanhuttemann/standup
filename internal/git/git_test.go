@@ -112,3 +112,21 @@ func TestLogNotARepo(t *testing.T) {
 	_, err := Log(t.TempDir(), time.Now())
 	assert.Error(t, err)
 }
+
+func TestLogNoUserEmailSuggestsFix(t *testing.T) {
+	// Isolate from the developer's own global config so user.email is unset.
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	dir := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		out, err := cmd.CombinedOutput()
+		require.NoError(t, err, "git %v: %s", args, out)
+	}
+	run("init")
+
+	_, err := Log(dir, time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "git config --global user.email", "error names the exact fix")
+}

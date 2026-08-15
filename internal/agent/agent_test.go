@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"testing"
 	"text/template"
@@ -176,7 +177,6 @@ func TestLocalGenerateRangeRendersDaysTemplate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "## Thu 2026-08-13\n## Yesterday\n## Today\n- [todo] ship (08:00)\n", out)
 }
-
 func TestNewOfflineReturnsLocal(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
@@ -196,10 +196,31 @@ func TestNewOfflineReturnsLocal(t *testing.T) {
 	require.Len(t, got, 2)
 }
 
+func TestNewRequiresProviderEnv(t *testing.T) {
+	cfg := config.Config{
+		EditorInstructions:    "e",
+		ReporterInstructions:  "r",
+		GenerateInputTemplate: genTplText,
+		DaysTemplate:          daysTplText,
+	}
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_MODEL", "")
+
+	_, err := New(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OPENAI_BASE_URL")
+	assert.Contains(t, err.Error(), "offline: true")
+
+	t.Setenv("OPENAI_BASE_URL", "http://x/v1")
+	_, err = New(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OPENAI_MODEL")
+}
+
 func TestNewBadGenerateTemplate(t *testing.T) {
 	cfg := config.Config{
-		BaseURL: "http://x/v1", Model: "m",
-		EditorInstructions: "e", ReporterInstructions: "r",
+		EditorInstructions:    "e",
+		ReporterInstructions:  "r",
 		GenerateInputTemplate: "{{",
 		DaysTemplate:          daysTplText,
 	}
@@ -210,12 +231,65 @@ func TestNewBadGenerateTemplate(t *testing.T) {
 
 func TestNewBadDaysTemplate(t *testing.T) {
 	cfg := config.Config{
-		BaseURL: "http://x/v1", Model: "m",
-		EditorInstructions: "e", ReporterInstructions: "r",
+		EditorInstructions:    "e",
+		ReporterInstructions:  "r",
 		GenerateInputTemplate: genTplText,
 		DaysTemplate:          "{{",
 	}
 	_, err := New(cfg, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "days template")
+}
+
+// committedCfg loads config from the repo's real config/ dir so tests cover
+// the files users actually get (embedded defaults are byte-identical).
+func committedCfg(t *testing.T) config.Config {
+	t.Helper()
+	wd, err := os.Getwd()
+	require.NoError(t, err)
+	t.Setenv("STANDUP_CONFIG_DIR", filepath.Join(wd, "..", "..", "config"))
+	cfg, err := config.Load()
+	require.NoError(t, err)
+	return cfg
+}
+
+func TestCommittedTemplatesSkipEmptySections(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	ass, err := Local(committedCfg(t), st)
+	require.NoError(t, err)
+
+	sec := report.Section{
+		Days: []report.Day{{Heading: "Yesterday"}, {Heading: "Today"}},
+		Today: []store.Task{
+			{Text: "ship release", Status: "in-progress", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)},
+		},
+	}
+	out, err := ass.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "## Today")
+	assert.Contains(t, out, "ship release")
+	assert.NotContains(t, out, "## Yesterday", "empty sections are not rendered")
+}
+
+func TestCommittedDaysTemplateSkipsEmptyDays(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	ass, err := Local(committedCfg(t), st)
+	require.NoError(t, err)
+
+	sec := report.Section{Days: []report.Day{
+		{Heading: "Thu 2026-08-13"},
+		{Heading: "Yesterday", Tasks: []store.Task{
+			{Text: "fix bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)},
+		}},
+		{Heading: "Today", Tasks: []store.Task{
+			{Text: "ship", Status: "todo", Timestamp: time.Date(2026, 8, 15, 8, 0, 0, 0, time.UTC)},
+		}},
+	}}
+	out, err := ass.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "## Yesterday")
+	assert.Contains(t, out, "## Today")
+	assert.NotContains(t, out, "## Thu 2026-08-13", "empty days are not rendered")
 }

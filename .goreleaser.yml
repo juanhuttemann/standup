@@ -12,6 +12,10 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
+    # none* matches nothing: archives ship the binary only (no README/LICENSE
+    # dumped next to it on manual extraction) — documented GoReleaser hack.
+    files:
+      - none*
 release:
   draft: true
 changelog:

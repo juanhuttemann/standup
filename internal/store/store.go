@@ -89,7 +89,7 @@ func (s *Store) AddWithStatus(text, status string) (Task, error) {
 		status = "todo"
 	}
 	if !validStatus(status) {
-		return Task{}, fmt.Errorf("store: invalid status %q", status)
+		return Task{}, errInvalidStatus(status)
 	}
 	if strings.TrimSpace(text) == "" {
 		return Task{}, errors.New("store: empty task text")
@@ -174,7 +174,7 @@ func (s *Store) UpdateText(id, text string) (Task, error) {
 
 func (s *Store) SetStatus(id, status string) (Task, error) {
 	if !validStatus(status) {
-		return Task{}, fmt.Errorf("store: invalid status %q", status)
+		return Task{}, errInvalidStatus(status)
 	}
 	tasks, err := s.load()
 	if err != nil {
@@ -226,6 +226,10 @@ func (s *Store) FindByPrefix(p string) (Task, error) {
 
 func validStatus(s string) bool {
 	return s == "todo" || s == "in-progress" || s == "blocked" || s == "done"
+}
+
+func errInvalidStatus(s string) error {
+	return fmt.Errorf("store: invalid status %q (valid: todo, in-progress, blocked, done)", s)
 }
 
 func dayNum(t time.Time) int {
