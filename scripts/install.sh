@@ -30,7 +30,8 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading $url"
-curl -fsSL "$url" -o "$tmp/standup.tar.gz"
+# Keep the release filename: sha256sum -c resolves it relative to $tmp.
+curl -fsSL "$url" -o "$tmp/standup_${os}_${arch}.tar.gz"
 
 # Verify the archive checksum when this release publishes one (older
 # releases have only a versioned checksums file — skip with a note).
@@ -48,7 +49,7 @@ else
   echo "note: no checksums file on this release, skipping verification" >&2
 fi
 
-tar -xzf "$tmp/standup.tar.gz" -C "$tmp"
+tar -xzf "$tmp/standup_${os}_${arch}.tar.gz" -C "$tmp"
 
 mkdir -p "$bin_dir"
 mv "$tmp/standup" "$bin_dir/standup"

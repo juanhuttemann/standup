@@ -5,6 +5,12 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `install.sh` aborted with a spurious "checksum mismatch" on every install:
+  the archive was saved as `standup.tar.gz` while `sha256sum -c` resolves
+  the release filename — it is now saved under its release name.
+
 ## [0.6.0] - 2026-08-15
 
 ### Added
