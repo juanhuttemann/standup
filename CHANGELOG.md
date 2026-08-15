@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-15
+
 ### Fixed
 
 - `commits` no longer destroys day attribution: imported tasks are stamped
