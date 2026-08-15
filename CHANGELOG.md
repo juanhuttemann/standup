@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-15
+
 ### Added
 
 - `standup speak [days]`: rewrites the standup report as a spoken brief via
