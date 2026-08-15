@@ -1,3 +1,5 @@
 # Application settings. Precedence: STANDUP_* env > .env > this file.
 meeting_time: "09:30"
 data_file: "~/.standup/tasks.jsonl"
+# true: no model endpoint — add splits paragraphs, generate renders deterministically.
+offline: false

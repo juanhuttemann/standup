@@ -79,10 +79,22 @@ func (s *Store) save(tasks []Task) error {
 }
 
 func (s *Store) Add(text string) (Task, error) {
+	return s.AddWithStatus(text, "todo")
+}
+
+// AddWithStatus adds a task with an explicit status; an empty status defaults
+// to todo. Status is validated at this boundary.
+func (s *Store) AddWithStatus(text, status string) (Task, error) {
+	if status == "" {
+		status = "todo"
+	}
+	if !validStatus(status) {
+		return Task{}, fmt.Errorf("store: invalid status %q", status)
+	}
 	if strings.TrimSpace(text) == "" {
 		return Task{}, errors.New("store: empty task text")
 	}
-	t := Task{ID: uuid.NewString(), Text: text, Status: "todo", Timestamp: s.now()}
+	t := Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: s.now()}
 	tasks, err := s.load()
 	if err != nil {
 		return Task{}, err
@@ -117,6 +129,47 @@ func (s *Store) ListDay(day time.Time) ([]Task, error) {
 		out = []Task{}
 	}
 	return out, nil
+}
+
+// ListRange returns tasks whose timestamp falls within the calendar days of
+// from and to (inclusive), interpreted in the location of from.
+func (s *Store) ListRange(from, to time.Time) ([]Task, error) {
+	all, err := s.List()
+	if err != nil {
+		return nil, err
+	}
+	lo, hi := dayNum(from), dayNum(to)
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	var out []Task
+	for _, t := range all {
+		if n := dayNum(t.Timestamp.In(from.Location())); n >= lo && n <= hi {
+			out = append(out, t)
+		}
+	}
+	if out == nil {
+		out = []Task{}
+	}
+	return out, nil
+}
+
+// UpdateText replaces a task's text in place, preserving status and timestamp.
+func (s *Store) UpdateText(id, text string) (Task, error) {
+	if strings.TrimSpace(text) == "" {
+		return Task{}, errors.New("store: empty task text")
+	}
+	tasks, err := s.load()
+	if err != nil {
+		return Task{}, err
+	}
+	for i, t := range tasks {
+		if t.ID == id {
+			tasks[i].Text = text
+			return tasks[i], s.save(tasks)
+		}
+	}
+	return Task{}, fmt.Errorf("store: unknown id %q", id)
 }
 
 func (s *Store) SetStatus(id, status string) (Task, error) {
@@ -172,7 +225,12 @@ func (s *Store) FindByPrefix(p string) (Task, error) {
 }
 
 func validStatus(s string) bool {
-	return s == "todo" || s == "in-progress" || s == "done"
+	return s == "todo" || s == "in-progress" || s == "blocked" || s == "done"
+}
+
+func dayNum(t time.Time) int {
+	y, m, d := t.Date()
+	return y*10000 + int(m)*100 + d
 }
 
 func sameDay(a, b time.Time) bool {

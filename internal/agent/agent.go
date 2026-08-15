@@ -30,14 +30,31 @@ type impl struct {
 	reporter runFunc
 	st       *store.Store
 	genTpl   *template.Template
+	daysTpl  *template.Template
 }
 
 var _ Assistant = (*impl)(nil)
+
+// local is the offline assistant: no model endpoint, deterministic behavior.
+type local struct {
+	st      *store.Store
+	genTpl  *template.Template
+	daysTpl *template.Template
+}
+
+var _ Assistant = (*local)(nil)
 
 func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	genTpl, err := template.New("generate").Parse(cfg.GenerateInputTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("agent: generate template: %w", err)
+	}
+	daysTpl, err := template.New("generate-days").Parse(cfg.DaysTemplate)
+	if err != nil {
+		return nil, fmt.Errorf("agent: days template: %w", err)
+	}
+	if cfg.Offline {
+		return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
 	}
 	client := openai.NewClient(option.WithBaseURL(cfg.BaseURL))
 	newRun := func(name, instructions string) runFunc {
@@ -59,6 +76,7 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		reporter: newRun("reporter", cfg.ReporterInstructions),
 		st:       st,
 		genTpl:   genTpl,
+		daysTpl:  daysTpl,
 	}, nil
 }
 
@@ -67,40 +85,120 @@ func (a *impl) AddTasks(ctx context.Context, rawText string) ([]store.Task, erro
 	if err != nil {
 		return nil, err
 	}
-	texts, err := extractTasks(out)
+	parsed, err := extractTasks(out)
 	if err != nil {
 		return nil, err
 	}
+	return persist(a.st, parsed)
+}
+
+func (a *impl) Generate(ctx context.Context, sec report.Section) (string, error) {
+	var prompt strings.Builder
+	if err := tplFor(sec, a.genTpl, a.daysTpl).Execute(&prompt, sec); err != nil {
+		return "", fmt.Errorf("agent: generate template: %w", err)
+	}
+	return a.reporter(ctx, prompt.String())
+}
+
+func (l *local) AddTasks(_ context.Context, rawText string) ([]store.Task, error) {
+	var parsed []extracted
+	for _, p := range splitParagraphs(rawText) {
+		parsed = append(parsed, extracted{text: p})
+	}
+	return persist(l.st, parsed)
+}
+
+func (l *local) Generate(_ context.Context, sec report.Section) (string, error) {
+	var b strings.Builder
+	if err := tplFor(sec, l.genTpl, l.daysTpl).Execute(&b, sec); err != nil {
+		return "", fmt.Errorf("agent: generate template: %w", err)
+	}
+	return b.String(), nil
+}
+
+// tplFor picks the two-section template for the default window and the
+// range template for any other day count.
+func tplFor(sec report.Section, genTpl, daysTpl *template.Template) *template.Template {
+	if len(sec.Days) == 2 {
+		return genTpl
+	}
+	return daysTpl
+}
+
+func persist(st *store.Store, parsed []extracted) ([]store.Task, error) {
 	var added []store.Task
-	for _, text := range texts {
-		t, err := a.st.Add(text)
+	for _, p := range parsed {
+		t, err := st.AddWithStatus(p.text, p.status)
 		if err != nil {
-			return added, fmt.Errorf("agent: store task %q: %w", text, err)
+			return added, fmt.Errorf("agent: store task %q: %w", p.text, err)
 		}
 		added = append(added, t)
 	}
 	return added, nil
 }
 
-func (a *impl) Generate(ctx context.Context, sec report.Section) (string, error) {
-	var prompt strings.Builder
-	if err := a.genTpl.Execute(&prompt, sec); err != nil {
-		return "", fmt.Errorf("agent: generate template: %w", err)
-	}
-	return a.reporter(ctx, prompt.String())
+type extracted struct {
+	text   string
+	status string
 }
 
-func extractTasks(s string) ([]string, error) {
+// extractTasks finds the editor's JSON reply. Entries may be plain strings
+// or {"task": "...", "status": "..."} objects; missing status means todo.
+func extractTasks(s string) ([]extracted, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '{' {
 			continue
 		}
 		var v struct {
-			Tasks []string `json:"tasks"`
+			Tasks []json.RawMessage `json:"tasks"`
 		}
 		if err := json.NewDecoder(strings.NewReader(s[i:])).Decode(&v); err == nil && len(v.Tasks) > 0 {
-			return v.Tasks, nil
+			var out []extracted
+			ok := true
+			for _, raw := range v.Tasks {
+				var e extracted
+				if len(raw) > 0 && raw[0] == '"' {
+					if err := json.Unmarshal(raw, &e.text); err != nil {
+						ok = false
+						break
+					}
+				} else {
+					var o struct {
+						Task   string `json:"task"`
+						Status string `json:"status"`
+					}
+					if err := json.Unmarshal(raw, &o); err != nil || strings.TrimSpace(o.Task) == "" {
+						ok = false
+						break
+					}
+					e.text, e.status = o.Task, o.Status
+				}
+				out = append(out, e)
+			}
+			if ok {
+				return out, nil
+			}
 		}
 	}
 	return nil, errors.New("agent: no tasks found in editor output")
+}
+
+// splitParagraphs splits text on blank lines: one paragraph, one task.
+func splitParagraphs(text string) []string {
+	var out []string
+	var cur []string
+	for _, line := range strings.Split(text, "\n") {
+		if strings.TrimSpace(line) == "" {
+			if len(cur) > 0 {
+				out = append(out, strings.Join(cur, "\n"))
+				cur = nil
+			}
+			continue
+		}
+		cur = append(cur, line)
+	}
+	if len(cur) > 0 {
+		out = append(out, strings.Join(cur, "\n"))
+	}
+	return out
 }

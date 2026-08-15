@@ -13,26 +13,18 @@ import (
 type Config struct {
 	MeetingTime           string
 	DataFile              string
+	Offline               bool
 	BaseURL               string
 	Model                 string
 	EditorInstructions    string
 	ReporterInstructions  string
 	GenerateInputTemplate string
+	DaysTemplate          string
 }
 
 func Load(dir string) (Config, error) {
 	if err := godotenv.Load(); err != nil && !os.IsNotExist(err) {
 		return Config{}, fmt.Errorf("load .env: %w", err)
-	}
-
-	var missing []string
-	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
-		if os.Getenv(key) == "" {
-			missing = append(missing, key)
-		}
-	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
 	}
 
 	v := viper.New()
@@ -44,12 +36,12 @@ func Load(dir string) (Config, error) {
 	v.AutomaticEnv()
 	v.SetDefault("meeting_time", "09:30")
 	v.SetDefault("data_file", "~/.standup/tasks.jsonl")
+	v.SetDefault("offline", false)
 
 	cfg := Config{
 		MeetingTime: v.GetString("meeting_time"),
 		DataFile:    v.GetString("data_file"),
-		BaseURL:     os.Getenv("OPENAI_BASE_URL"),
-		Model:       os.Getenv("OPENAI_MODEL"),
+		Offline:     v.GetBool("offline"),
 	}
 
 	dataFile, err := expandHome(cfg.DataFile)
@@ -57,6 +49,20 @@ func Load(dir string) (Config, error) {
 		return Config{}, err
 	}
 	cfg.DataFile = dataFile
+
+	if !cfg.Offline {
+		var missing []string
+		for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
+			if os.Getenv(key) == "" {
+				missing = append(missing, key)
+			}
+		}
+		if len(missing) > 0 {
+			return Config{}, fmt.Errorf("missing required environment variables: %s (or set offline: true)", strings.Join(missing, ", "))
+		}
+		cfg.BaseURL = os.Getenv("OPENAI_BASE_URL")
+		cfg.Model = os.Getenv("OPENAI_MODEL")
+	}
 
 	a := viper.New()
 	a.SetConfigFile(filepath.Join(dir, "agent.yaml"))
@@ -70,6 +76,7 @@ func Load(dir string) (Config, error) {
 		{"editor_instructions", &cfg.EditorInstructions},
 		{"reporter_instructions", &cfg.ReporterInstructions},
 		{"generate_input_template", &cfg.GenerateInputTemplate},
+		{"generate_input_template_days", &cfg.DaysTemplate},
 	} {
 		s := strings.TrimRight(a.GetString(in.key), " \t\r\n")
 		if s == "" {

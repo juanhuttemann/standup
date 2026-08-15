@@ -54,6 +54,31 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Never discard errors (`_ =`, `_, _ =`). Handle, wrap, or return them — in tests, assert
   them. Lazy work is not allowed.
 
+### E2E testing (real binary, manual)
+- Build the real binary and run it in a scratch environment: `STANDUP_DATA_FILE` in a
+  temp dir, `</dev/null` to force non-interactive runs, `STANDUP_CONFIG_DIR` when running
+  outside the repo (config dir is cwd-relative). Assert exit codes: 0 ok, 1 error,
+  130 SIGINT, 143 SIGTERM.
+- Deterministic paths first: `STANDUP_OFFLINE=true` covers add (paragraph split) and
+  generate (template render) with no network. Only model-dependent behavior needs a
+  live endpoint — passed via env, never committed.
+- A mock OpenAI endpoint must set `"finish_reason": "stop"` or the framework discards
+  the completion. Use mocks for rogue-model tests: non-JSON output and invalid statuses
+  must fail closed with zero store writes (assert `wc -l` on the JSONL).
+- Injection is tested as data, not commands: injected task text and commit subjects may
+  only ever produce ordinary validated tasks — never extra sections, statuses, or writes.
+- Cancellation: use `timeout --preserve-status -s INT <secs> ./standup ...` for a real
+  foreground SIGINT (background `&` jobs ignore SIGINT in shells); after cancellation
+  the store must contain no partial writes. TTY-only paths (interactive list) run under
+  `script -qec` with keystroke bytes (`printf '\003'`, `'\004'`); assert the binary's
+  exit code, not the pipeline's.
+- Fixtures: edit the JSONL directly (python one-liner) to backdate timestamps or set
+  statuses for report tests. Scratch git repos must place out-of-window commits at the
+  base (`--since` traversal prunes their ancestors), set dates via
+  `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` env, and simulate teammates via
+  `GIT_AUTHOR_EMAIL`.
+- Every misbehavior found this way becomes a unit test in the same work unit as the fix.
+
 ### Changelog
 - Every user-visible change gets a CHANGELOG.md entry (Keep a Changelog format,
   one `## [x.y.z] - date` section per release, `### Added/Changed/Fixed` bullets)
@@ -65,8 +90,9 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - `internal/cli` — cobra commands, no business logic.
 - `internal/agent` — sub-agent wiring + orchestration (the only place that knows providers).
 - `internal/store` — Task model + JSONL persistence, injectable clock (`Now` field).
-- `internal/report` — standup split/ordering.
+- `internal/report` — standup split/ordering, day ranges, carry-over, lookback time math.
+- `internal/git` — commit collection (shells out to git, filtered to the repo's user).
 - `internal/config` — viper loading, env overrides.
 
 ### Statuses
-- `todo` | `in-progress` | `done` — validated at the store boundary.
+- `todo` | `in-progress` | `blocked` | `done` — validated at the store boundary.

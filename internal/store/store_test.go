@@ -195,3 +195,96 @@ func TestDelete(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, got)
 }
+
+func TestAddWithStatus(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC))
+
+	empty, err := s.AddWithStatus("blocked thing", "")
+	require.NoError(t, err)
+	assert.Equal(t, "todo", empty.Status, "empty status defaults to todo")
+
+	blocked, err := s.AddWithStatus("waiting on infra", "blocked")
+	require.NoError(t, err)
+	assert.Equal(t, "blocked", blocked.Status)
+
+	_, err = s.AddWithStatus("x", "garbage")
+	assert.ErrorContains(t, err, "invalid status")
+
+	_, err = s.AddWithStatus("   ", "blocked")
+	assert.ErrorContains(t, err, "empty task text")
+}
+
+func TestBlockedStatusRoundTrip(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC))
+
+	tk, err := s.AddWithStatus("waiting on infra", "blocked")
+	require.NoError(t, err)
+
+	got, err := s.SetStatus(tk.ID, "in-progress")
+	require.NoError(t, err)
+	assert.Equal(t, "in-progress", got.Status)
+
+	got, err = s.SetStatus(tk.ID, "blocked")
+	require.NoError(t, err)
+	assert.Equal(t, "blocked", got.Status)
+}
+
+func TestListRange(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+
+	// Midnight boundaries in local time: 23:30 on day1, 00:30 on day2.
+	s.Now = fixedClock(time.Date(2026, 8, 13, 23, 30, 0, 0, time.UTC))
+	a, err := s.Add("late day1")
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 14, 0, 30, 0, 0, time.UTC))
+	b, err := s.Add("early day2")
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 16, 10, 0, 0, 0, time.UTC))
+	c, err := s.Add("day3")
+	require.NoError(t, err)
+
+	got, err := s.ListRange(time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC), time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	assert.Equal(t, []Task{a, b}, got)
+
+	got, err = s.ListRange(time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC), time.Date(2026, 8, 16, 23, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	assert.Equal(t, []Task{b, c}, got)
+
+	got, err = s.ListRange(time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC), time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	assert.Equal(t, []Task{a, b}, got, "reversed bounds are normalized")
+}
+
+func TestUpdateText(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	at := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	s.Now = fixedClock(at)
+	tk, err := s.Add("fixd typo")
+	require.NoError(t, err)
+	_, err = s.SetStatus(tk.ID, "in-progress")
+	require.NoError(t, err)
+
+	got, err := s.UpdateText(tk.ID, "fixed typo")
+	require.NoError(t, err)
+	assert.Equal(t, "fixed typo", got.Text)
+	assert.Equal(t, "in-progress", got.Status, "status preserved")
+	assert.True(t, got.Timestamp.Equal(at), "timestamp preserved")
+
+	persisted, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, persisted, 1)
+	assert.Equal(t, "fixed typo", persisted[0].Text)
+	assert.Equal(t, "in-progress", persisted[0].Status)
+
+	_, err = s.UpdateText(tk.ID, "   ")
+	assert.ErrorContains(t, err, "empty task text")
+	_, err = s.UpdateText("no-such-id", "x")
+	assert.ErrorContains(t, err, "unknown id")
+}

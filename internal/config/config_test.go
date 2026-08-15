@@ -19,6 +19,10 @@ reporter_instructions: |
 generate_input_template: |
   {{range .Yesterday}}- {{.Text}}
   {{range .Today}}- {{.Text}}
+
+generate_input_template_days: |
+  {{range .Days}}## {{.Heading}}
+  {{end}}
 `
 
 func write(t *testing.T, path, content string) {
@@ -170,7 +174,7 @@ func TestMissingPromptKey(t *testing.T) {
 }
 
 func TestMissingTemplateKey(t *testing.T) {
-	base := "editor_instructions: |\n  Edit things.\nreporter_instructions: |\n  Report things.\n"
+	base := "editor_instructions: |\n  Edit things.\nreporter_instructions: |\n  Report things.\ngenerate_input_template: |\n  {{range .Yesterday}}- {{.Text}}\n"
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "config.yaml"), "")
 	write(t, filepath.Join(dir, "agent.yaml"), base)
@@ -179,5 +183,31 @@ func TestMissingTemplateKey(t *testing.T) {
 
 	_, err := Load(dir)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "generate_input_template")
+	assert.Contains(t, err.Error(), "generate_input_template_days")
+}
+
+func TestOfflineSkipsProviderEnv(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "offline: true\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	unsetenv(t, "OPENAI_BASE_URL", "OPENAI_MODEL")
+
+	cfg, err := Load(dir)
+	require.NoError(t, err)
+	assert.True(t, cfg.Offline)
+	assert.Empty(t, cfg.BaseURL)
+	assert.Empty(t, cfg.Model)
+	assert.Contains(t, cfg.DaysTemplate, "{{range .Days}}")
+}
+
+func TestOfflineEnvOverridesYAML(t *testing.T) {
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "offline: false\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	unsetenv(t, "OPENAI_BASE_URL", "OPENAI_MODEL")
+	t.Setenv("STANDUP_OFFLINE", "true")
+
+	cfg, err := Load(dir)
+	require.NoError(t, err)
+	assert.True(t, cfg.Offline)
 }

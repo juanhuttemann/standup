@@ -39,7 +39,7 @@ jobs:
           go build -o standup ./cmd/standup
           OPENAI_BASE_URL=http://localhost:1 OPENAI_MODEL=smoke \
             STANDUP_DATA_FILE="$RUNNER_TEMP/tasks.jsonl" \
-            ./standup list | grep "no tasks today"
+            ./standup list | grep "no tasks"
 
   lint:
     name: Lint
