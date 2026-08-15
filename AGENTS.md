@@ -49,7 +49,9 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   the cwd (like git); config files resolve per file through the dir chain
   `$STANDUP_CONFIG_DIR` → `./config` → user config dir →
   embedded defaults (`config/embed.go` embeds the committed yaml; the yaml
-  files stay the single home of every setting).
+  files stay the single home of every setting). The agent skill follows the
+  same rule: `config/skill/SKILL.md` is the single home (embedded for
+  `skill install`); the repo's `.agents`/`.claude` entries are symlinks to it.
 - Committed files contain zero provider references: no endpoints, no model
   names, anywhere. Provider settings are deployment facts — required in local
   `.env`/env for online mode (checked by `agent.New`, never defaulted), never

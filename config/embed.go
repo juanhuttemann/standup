@@ -10,3 +10,9 @@ var ConfigYAML string
 
 //go:embed agent.yaml
 var AgentYAML string
+
+// SkillMD is the committed agent skill; `skill install` writes it into the
+// user's repo. Same single-home rule as the yaml files above.
+//
+//go:embed skill/SKILL.md
+var SkillMD string

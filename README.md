@@ -64,6 +64,8 @@ standup done <id>                   # mark done, no model involved
 standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
 standup rm <id>                     # delete, no model involved
 standup doctor                      # check the setup: data file, git identity, endpoint
+standup skill install               # teach your AI agent the standup workflow (this repo)
+standup skill install --global      # same, for every repo (~/.agents, ~/.claude)
 standup init                        # write default config files for editing
 ```
 
@@ -81,6 +83,22 @@ including commits you only co-authored. Re-running `commits` skips commits
 already imported. Multi-repo: pass extra paths (`standup commits 1 ../api
 ../web`).
 
+## Use with AI agents
+
+`standup skill install` teaches your coding agent the standup workflow —
+it writes the skill once and every skills-compatible agent in that scope
+can log tasks and run standups for you:
+
+| Scope | Command | Skill lands in |
+|---|---|---|
+| this repo | `standup skill install` | `.agents/` + `.claude/` in the repo (commit them) |
+| all your repos | `standup skill install --global` | `~/.agents/skills/` + `~/.claude/skills/` |
+
+Works with Claude Code, Codex, Cursor, OpenCode, Amp, Copilot, Gemini CLI,
+Goose. Then ask your agent:
+
+> Run `standup commits` to log your work, then `standup generate`.
+
 ## Report language
 
 Set `language:` in `config.yaml` (or `STANDUP_LANGUAGE`) — the model
@@ -92,12 +110,6 @@ The report layout (sections, `[status]`, times) is always rendered by the
 binary; a model only rephrases the task texts. If the model is unreachable
 or answers off-contract, `generate` falls back to the verbatim texts — same
 layout, zero network dependency for the format.
-
-## Agent skills
-
-The repo ships a portable skill at `.agents/skills/standup/SKILL.md`
-(Claude Code reads it through the `.claude/skills/standup` symlink) so
-coding agents can log and report work.
 
 ## Offline mode
 

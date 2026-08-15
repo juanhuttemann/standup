@@ -59,8 +59,12 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
   model's rephrasing; empty preserves the input language.
 - `standup doctor`: checks data-file writability, git identity, provider
   env presence, and endpoint reachability (skipped in offline mode).
-- Agent skill at `.agents/skills/standup/SKILL.md` (`.claude/skills/standup`
-  symlink) so coding agents can drive the CLI.
+- `standup skill install`: writes the agent skill (real files, no symlinks)
+  to `.agents/skills/standup/` and `.claude/skills/standup/` in the current
+  repo, or to `~/.agents` + `~/.claude` with `--global`, so skills-compatible
+  coding agents can log and report standups; idempotent, refreshes on
+  re-run. The skill's single home is `config/skill/SKILL.md`, embedded like
+  the config defaults.
 
 ## [0.4.0] - 2026-08-15
 

@@ -18,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 
+	defaults "standup/config"
 	"standup/internal/agent"
 	"standup/internal/config"
 	"standup/internal/git"
@@ -194,8 +195,61 @@ func New(load func() (Deps, error)) *cobra.Command {
 		},
 	}
 
-	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd)
+	skillCmd := &cobra.Command{
+		Use:   "skill install",
+		Short: "install the standup agent skill into the current repo (--global: your home dir)",
+		Args: func(cmd *cobra.Command, args []string) error {
+			if len(args) != 1 || args[0] != "install" {
+				return fmt.Errorf("usage: %s skill install [--global]", cmd.Root().Name())
+			}
+			return nil
+		},
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSkillInstall(cmd, flagBool(cmd, "global"))
+		},
+		SilenceUsage: true,
+	}
+	skillCmd.Flags().BoolP("global", "g", false, "install to ~/.agents and ~/.claude instead of the repo")
+
+	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd, skillCmd)
 	return root
+}
+
+// runSkillInstall writes the embedded agent skill as real files (symlinks
+// break on Windows checkouts): into the current repo by default, or the
+// home roots with --global. Two roots cover the skills-compatible harnesses
+// (.agents for most, .claude for Claude Code — both read at repo and home
+// level); proprietary mechanisms (Windsurf rules, Hermes) are out of scope —
+// a file drop cannot reach them. Like init it never loads deps: the skill
+// is embedded content, nothing to configure.
+func runSkillInstall(cmd *cobra.Command, global bool) error {
+	base := ""
+	if global {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("skill install --global: %w", err)
+		}
+		base = home
+	}
+	roots := []struct {
+		dir string
+		who string
+	}{
+		{filepath.Join(base, ".agents", "skills", "standup"), "Codex, Cursor, OpenCode, Amp, Copilot, Gemini CLI, Goose"},
+		{filepath.Join(base, ".claude", "skills", "standup"), "Claude Code"},
+	}
+	for _, r := range roots {
+		if err := os.MkdirAll(r.dir, 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(filepath.Join(r.dir, "SKILL.md"), []byte(defaults.SkillMD), 0o644); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "skill: %s (%s)\n", filepath.Join(r.dir, "SKILL.md"), r.who); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // lazy loads deps, then runs the command body.

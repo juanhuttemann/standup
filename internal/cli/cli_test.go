@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	defaults "standup/config"
 	"standup/internal/agent"
 	"standup/internal/config"
 	"standup/internal/git"
@@ -1175,6 +1176,67 @@ func TestInitCmdWritesDefaults(t *testing.T) {
 		_, err := os.Stat(filepath.Join(xdg, "standup", name))
 		require.NoError(t, err, "%s written", name)
 	}
+}
+
+func TestSkillInstallWritesBothRoots(t *testing.T) {
+	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
+	repo := t.TempDir()
+	t.Chdir(repo)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("skill install never loads deps") })
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"skill", "install"})
+	require.NoError(t, root.Execute())
+
+	for _, p := range []string{
+		filepath.Join(".agents", "skills", "standup", "SKILL.md"),
+		filepath.Join(".claude", "skills", "standup", "SKILL.md"),
+	} {
+		b, err := os.ReadFile(filepath.Join(repo, p))
+		require.NoError(t, err, "%s written as a real file (symlinks break on Windows)", p)
+		assert.Equal(t, defaults.SkillMD, string(b), "%s carries the embedded skill verbatim", p)
+	}
+	assert.Contains(t, buf.String(), filepath.Join(".agents", "skills", "standup", "SKILL.md"))
+
+	require.NoError(t, root.Execute(), "second install refreshes in place (idempotent)")
+}
+
+func TestSkillInstallGlobalUsesHome(t *testing.T) {
+	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	repo := t.TempDir()
+	t.Chdir(repo)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("skill install never loads deps") })
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"skill", "install", "--global"})
+	require.NoError(t, root.Execute())
+
+	for _, p := range []string{
+		filepath.Join(home, ".agents", "skills", "standup", "SKILL.md"),
+		filepath.Join(home, ".claude", "skills", "standup", "SKILL.md"),
+	} {
+		b, err := os.ReadFile(p)
+		require.NoError(t, err, "global skill written to %s", p)
+		assert.Equal(t, defaults.SkillMD, string(b))
+	}
+	entries, err := os.ReadDir(repo)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "--global never touches the repo")
+	assert.Contains(t, buf.String(), filepath.Join(home, ".agents", "skills", "standup", "SKILL.md"))
+}
+
+func TestSkillInstallUsage(t *testing.T) {
+	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
+	t.Chdir(t.TempDir())
+	root := New(func() (Deps, error) { return Deps{}, nil })
+	root.SetArgs([]string{"skill"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "usage: standup skill install")
 }
 
 func unsetCliEnv(t *testing.T, keys ...string) {
