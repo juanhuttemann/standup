@@ -65,7 +65,7 @@ func unsetenv(t *testing.T, keys ...string) {
 func cleanStandupEnv(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		for _, k := range []string{"STANDUP_MEETING_TIME", "STANDUP_DATA_FILE", "STANDUP_OFFLINE", "STANDUP_LANGUAGE"} {
+		for _, k := range []string{"STANDUP_MEETING_TIME", "STANDUP_DATA_FILE", "STANDUP_OFFLINE", "STANDUP_LANGUAGE", "STANDUP_SMTP_PASSWORD"} {
 			if err := os.Unsetenv(k); err != nil {
 				t.Errorf("unset %s: %v", k, err)
 			}
@@ -91,6 +91,39 @@ func TestLoadYAMLAndPlaceholders(t *testing.T) {
 	assert.Contains(t, cfg.GenerateInputTemplate, "{{range .Yesterday}}")
 }
 
+func TestLoadSMTPSettings(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "smtp_host: \"smtp.example.com\"\nsmtp_port: 465\nsmtp_user: \"me@example.com\"\nmail_from: \"standup@example.com\"\ntimezone: \"Asia/Tokyo\"\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	t.Setenv("STANDUP_SMTP_PASSWORD", "s3cret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "smtp.example.com", cfg.SMTPHost)
+	assert.Equal(t, 465, cfg.SMTPPort)
+	assert.Equal(t, "me@example.com", cfg.SMTPUser)
+	assert.Equal(t, "s3cret", cfg.SMTPPassword, "the password comes from env, never the yaml")
+	assert.Equal(t, "standup@example.com", cfg.MailFrom)
+	assert.Equal(t, "Asia/Tokyo", cfg.Timezone)
+}
+
+func TestLoadReposLists(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "repos:\n  include: [\"src\", \"api-*\"]\n  exclude: [\"*/vendor\"]\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, []string{"src", "api-*"}, cfg.ReposInclude)
+	assert.Equal(t, []string{"*/vendor"}, cfg.ReposExclude)
+}
+
 func TestLoadDefaults(t *testing.T) {
 	isolateDirs(t)
 	dir := t.TempDir()
@@ -104,6 +137,9 @@ func TestLoadDefaults(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "09:30", cfg.MeetingTime)
 	assert.Equal(t, filepath.Join(home, ".standup", "tasks.jsonl"), cfg.DataFile)
+	assert.Equal(t, 587, cfg.SMTPPort, "submission port by default")
+	assert.Empty(t, cfg.SMTPHost, "mail is opt-in: no host, no --mail")
+	assert.Empty(t, cfg.Timezone, "empty timezone = local")
 }
 
 func TestEmbeddedFallbackWhenNoConfigAnywhere(t *testing.T) {

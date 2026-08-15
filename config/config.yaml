@@ -5,3 +5,16 @@ data_file: "~/.standup/tasks.jsonl"
 offline: false
 # report language for the model's rephrasing (empty: keep the input language).
 language: ""
+# IANA timezone for report windows and the meeting cutoff (empty: local).
+timezone: ""
+# SMTP settings for `generate --mail` (empty host: mail disabled).
+smtp_host: ""
+smtp_port: 587
+smtp_user: ""
+# password comes from STANDUP_SMTP_PASSWORD env, never this file.
+mail_from: ""
+# `commits` repo globs (matched against each path as passed, submodules
+# included): empty include = everything not excluded.
+repos:
+  include: []
+  exclude: []

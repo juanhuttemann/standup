@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,84 @@ func TestLogFullBodyWithoutTrailers(t *testing.T) {
 	assert.Equal(t, "fix login bug", commits[0].Subject)
 	assert.Equal(t, "fix login bug\n\nThe token was expired.", commits[0].Body,
 		"full message kept, trailer block stripped")
+}
+
+func TestLogAllIncludesTeammates(t *testing.T) {
+	dir := scratchRepo(t)
+	commitAt(t, dir, "my work", meEmail, "2026-08-14T10:00:00+02:00")
+	commitAt(t, dir, "teammate work", "teammate@example.com", "2026-08-14T11:00:00+02:00")
+	since := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+
+	mine, err := Log(dir, since)
+	require.NoError(t, err)
+	require.Len(t, mine, 1, "personal Log still filters teammates out")
+	assert.Equal(t, meEmail, mine[0].Author, "commits carry their author email")
+
+	all, err := LogAll(dir, since)
+	require.NoError(t, err)
+	require.Len(t, all, 2, "LogAll collects every author")
+	assert.Equal(t, "teammate@example.com", all[1].Author)
+}
+
+func TestLogResolvesBranchNames(t *testing.T) {
+	dir := scratchRepo(t)
+	commitAt(t, dir, "first", meEmail, "2026-08-14T10:00:00+02:00")
+	commitAt(t, dir, "second", meEmail, "2026-08-14T11:00:00+02:00")
+
+	commits, err := Log(dir, time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, commits, 2)
+	def, err := run(dir, "branch", "--show-current")
+	require.NoError(t, err)
+	def = strings.TrimSpace(def)
+	assert.Equal(t, def, commits[1].Branch, "tip commit names its branch")
+	assert.True(t, strings.HasPrefix(commits[0].Branch, def), "older commits name the nearest branch (name~N), got %q", commits[0].Branch)
+}
+
+func TestSubmodules(t *testing.T) {
+	parent := scratchRepo(t)
+	// A submodule source repo with one commit, added as lib/.
+	sub := scratchRepo(t)
+	commitAt(t, sub, "lib init", meEmail, "2026-08-14T09:00:00+02:00")
+	cmd := exec.Command("git", "-C", parent, "-c", "protocol.file.allow=always",
+		"submodule", "add", sub, "lib")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	subs, err := Submodules(parent)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"lib"}, subs)
+}
+
+func TestSubmodulesNoneWithoutGitmodules(t *testing.T) {
+	dir := scratchRepo(t)
+	subs, err := Submodules(dir)
+	require.NoError(t, err)
+	assert.Empty(t, subs, "no .gitmodules, no submodules, no error")
+}
+
+func TestLogConventionalCommitSubjectsKept(t *testing.T) {
+	dir := scratchRepo(t)
+	commitAt(t, dir, "chore: seed repo", meEmail, "2026-08-14T10:00:00+02:00")
+	commitAt(t, dir, "feat: add login", meEmail, "2026-08-14T11:00:00+02:00")
+
+	commits, err := Log(dir, time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, commits, 2)
+	assert.Equal(t, "chore: seed repo", commits[0].Subject, "single-line conventional subject kept verbatim")
+	assert.Equal(t, "chore: seed repo", commits[0].Body)
+	assert.Equal(t, "feat: add login", commits[1].Subject)
+}
+
+func TestLogConventionalSubjectWithTrailerBlock(t *testing.T) {
+	dir := scratchRepo(t)
+	msg := "fix: login\n\nSigned-off-by: Me <me@example.com>"
+	commitAt(t, dir, msg, meEmail, "2026-08-14T10:00:00+02:00")
+
+	commits, err := Log(dir, time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	assert.Equal(t, msg, commits[0].Body, "stripping to nothing keeps the whole message verbatim")
 }
 
 func TestLogCoAuthored(t *testing.T) {

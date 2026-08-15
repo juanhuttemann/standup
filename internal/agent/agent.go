@@ -5,9 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/provider/openaiprovider"
@@ -47,6 +49,10 @@ type local struct {
 
 var _ Assistant = (*local)(nil)
 
+// modelTimeout bounds every model call; without it a silent endpoint rides
+// the SDK default (~10 min). Var, not config: nobody asked to tune it.
+var modelTimeout = 60 * time.Second
+
 func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	genTpl, daysTpl, err := parseTemplates(cfg)
 	if err != nil {
@@ -64,7 +70,10 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s (or set offline: true)", strings.Join(missing, ", "))
 	}
-	client := openai.NewClient(option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")))
+	client := openai.NewClient(
+		option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
+		option.WithHTTPClient(&http.Client{Timeout: modelTimeout}),
+	)
 	newRun := func(name, instructions string) runFunc {
 		a := openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
 			Model:        os.Getenv("OPENAI_MODEL"),
@@ -100,12 +109,21 @@ func Local(cfg config.Config, st *store.Store) (Assistant, error) {
 	return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
 }
 
+// tplFuncs are the funcs available to the generate templates. fold collapses
+// a task text to one row: multi-line entries (commit bodies) must not break
+// the bullet layout.
+var tplFuncs = template.FuncMap{"fold": foldText}
+
+func foldText(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 func parseTemplates(cfg config.Config) (genTpl, daysTpl *template.Template, err error) {
-	genTpl, err = template.New("generate").Parse(cfg.GenerateInputTemplate)
+	genTpl, err = template.New("generate").Funcs(tplFuncs).Parse(cfg.GenerateInputTemplate)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent: generate template: %w", err)
 	}
-	daysTpl, err = template.New("generate-days").Parse(cfg.DaysTemplate)
+	daysTpl, err = template.New("generate-days").Funcs(tplFuncs).Parse(cfg.DaysTemplate)
 	if err != nil {
 		return nil, nil, fmt.Errorf("agent: days template: %w", err)
 	}

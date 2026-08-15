@@ -3,10 +3,12 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/smtp"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +35,7 @@ type fakeAssistant struct {
 	addErr    error
 	genCalls  int
 	genSec    *report.Section
+	genSecs   []report.Section
 	genOut    string
 	genErr    error
 }
@@ -48,6 +51,7 @@ func (f *fakeAssistant) AddTasks(ctx context.Context, rawText string) ([]store.T
 func (f *fakeAssistant) Generate(ctx context.Context, sec report.Section) (string, error) {
 	f.genCalls++
 	*f.genSec = sec
+	f.genSecs = append(f.genSecs, sec)
 	return f.genOut, f.genErr
 }
 
@@ -117,6 +121,15 @@ func TestAddStdin(t *testing.T) {
 	assert.Equal(t, "line1\nline2", assistant.added[0])
 }
 
+func TestAddStdinNormalizesCRLF(t *testing.T) {
+	assistant := &fakeAssistant{addResult: []store.Task{{Text: "crlf task"}}}
+	pipeStdin(t, "crlf task\r\n")
+	_, root, _ := newHarness(t, assistant)
+	root.SetArgs([]string{"add", "--raw"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "crlf task\n", assistant.added[0], "Windows CRLF is normalized at stdin ingest")
+}
+
 func TestAddError(t *testing.T) {
 	assistant := &fakeAssistant{addErr: errors.New("boom")}
 	_, root, _ := newHarness(t, assistant)
@@ -147,7 +160,7 @@ func TestTaskEntriesRefresh(t *testing.T) {
 	added, err := st.Add("review pull request")
 	require.NoError(t, err)
 
-	entries, err := taskEntries(st, "", painter{})
+	entries, err := taskEntries(st, "", st.Now(), painter{})
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Contains(t, entries[0].label, "[todo]")
@@ -156,13 +169,13 @@ func TestTaskEntriesRefresh(t *testing.T) {
 	_, err = st.SetStatus(added.ID, "done")
 	require.NoError(t, err)
 
-	entries, err = taskEntries(st, "", painter{on: true})
+	entries, err = taskEntries(st, "", st.Now(), painter{on: true})
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Contains(t, entries[0].label, "["+ansiDone+"done"+ansiReset+"]")
 
 	require.NoError(t, st.Delete(added.ID))
-	entries, err = taskEntries(st, "", painter{})
+	entries, err = taskEntries(st, "", st.Now(), painter{})
 	require.NoError(t, err)
 	assert.Empty(t, entries)
 }
@@ -408,7 +421,7 @@ func TestDoneNoArgs(t *testing.T) {
 
 func TestRm(t *testing.T) {
 	assistant := &fakeAssistant{}
-	st, root, _ := newHarness(t, assistant)
+	st, root, buf := newHarness(t, assistant)
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
 	root.SetArgs([]string{"rm", added.ID})
@@ -416,6 +429,17 @@ func TestRm(t *testing.T) {
 	tasks, err := st.List()
 	require.NoError(t, err)
 	assert.Empty(t, tasks)
+	assert.Contains(t, buf.String(), "- removed: ship it")
+}
+
+func TestRmEchoFoldsMultilineTaskText(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAssistant{})
+	added, err := st.AddAt("feat: big thing\n\nbody line", "done", time.Date(2026, 8, 15, 12, 0, 0, 0, time.Local))
+	require.NoError(t, err)
+	root.SetArgs([]string{"rm", added.ID})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "- removed: feat: big thing body line",
+		"rm echoes one row like every other command, so multi-line text can be verified before deletion")
 }
 
 func seedDays(t *testing.T, st *store.Store) {
@@ -712,6 +736,130 @@ func TestGenerateClipError(t *testing.T) {
 	assert.Error(t, root.Execute(), "clipboard failure surfaces")
 }
 
+func TestGenerateWebhookPostsReport(t *testing.T) {
+	var gotBody struct{ Text string }
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		assert.Equal(t, "application/json", r.Header.Get("Content-Type"))
+		b, err := io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		assert.NoError(t, json.Unmarshal(b, &gotBody))
+	}))
+	t.Cleanup(srv.Close)
+
+	assistant := &fakeAssistant{genOut: "## Today\n- [done] ship (08:00)"}
+	st, root, _ := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--webhook", srv.URL})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "## Today\n- [done] ship (08:00)", gotBody.Text,
+		"the report is posted as Slack-compatible JSON text")
+}
+
+func TestGenerateWebhookFailureSurfaces(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--webhook", srv.URL})
+	err = root.Execute()
+	require.Error(t, err, "webhook failure surfaces")
+	assert.Contains(t, err.Error(), "webhook")
+}
+
+// mailHarness is newHarness plus SMTP config — mail needs smtp_* settings.
+func mailHarness(t *testing.T, assistant *fakeAssistant) (*store.Store, *cobra.Command) {
+	t.Helper()
+	assistant.genSec = &report.Section{}
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
+			Store:     st,
+			Config: config.Config{
+				MeetingTime: "09:30",
+				SMTPHost:    "smtp.example.com",
+				SMTPPort:    587,
+				SMTPUser:    "me@example.com",
+				MailFrom:    "standup@example.com",
+			},
+		}, nil
+	})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	return st, root
+}
+
+func TestGenerateMailSendsReport(t *testing.T) {
+	var gotAddr, gotFrom, gotMsg string
+	var gotTo []string
+	old := smtpSend
+	smtpSend = func(addr string, _ smtp.Auth, from string, to []string, msg []byte) error {
+		gotAddr, gotFrom, gotTo, gotMsg = addr, from, to, string(msg)
+		return nil
+	}
+	t.Cleanup(func() { smtpSend = old })
+
+	assistant := &fakeAssistant{genOut: "## Today\n- [done] ship (08:00)"}
+	st, root := mailHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--mail", "team@example.com"})
+	require.NoError(t, root.Execute())
+
+	assert.Equal(t, "smtp.example.com:587", gotAddr)
+	assert.Equal(t, "standup@example.com", gotFrom, "mail_from wins over smtp_user")
+	assert.Equal(t, []string{"team@example.com"}, gotTo)
+	assert.Contains(t, gotMsg, "Subject: standup")
+	assert.Contains(t, gotMsg, "\r\n\r\n## Today\r\n- [done] ship (08:00)", "LF normalized to CRLF for mail")
+}
+
+func TestGenerateMailFailureSurfaces(t *testing.T) {
+	old := smtpSend
+	smtpSend = func(string, smtp.Auth, string, []string, []byte) error { return errors.New("boom") }
+	t.Cleanup(func() { smtpSend = old })
+
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root := mailHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--mail", "team@example.com"})
+	err = root.Execute()
+	require.Error(t, err, "SMTP failure surfaces")
+	assert.Contains(t, err.Error(), "mail")
+}
+
+func TestGenerateMailRequiresSMTPHost(t *testing.T) {
+	old := smtpSend
+	smtpSend = func(string, smtp.Auth, string, []string, []byte) error {
+		t.Fatal("smtpSend must not run without a configured host")
+		return nil
+	}
+	t.Cleanup(func() { smtpSend = old })
+
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant) // no smtp_* config
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--mail", "team@example.com"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "smtp_host")
+}
+
 func TestDoctorChecks(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(srv.Close)
@@ -719,7 +867,8 @@ func TestDoctorChecks(t *testing.T) {
 
 	good := t.TempDir()
 	assert.NoError(t, checkWritable(filepath.Join(good, "tasks.jsonl")))
-	assert.Error(t, checkWritable(filepath.Join(good, "no-such-dir", "tasks.jsonl")))
+	assert.NoError(t, checkWritable(filepath.Join(good, "fresh", "nested", "tasks.jsonl")),
+		"doctor is the first command after installing — the data dir does not exist yet")
 
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(live.Close)
@@ -792,6 +941,52 @@ func TestGenerateOutputFileUnwritable(t *testing.T) {
 	assert.Error(t, root.Execute(), "unwritable path surfaces as command failure")
 }
 
+func TestGenerateHonorsConfiguredTimezone(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "x"}
+	assistant.genSec = &report.Section{}
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	// Fri 23:30 UTC = Sat 08:30 in Tokyo — before the 09:30 meeting cutoff,
+	// so in Tokyo Friday is still in the window; in UTC it is not.
+	st.Now = func() time.Time { return time.Date(2026, 8, 14, 23, 30, 0, 0, time.UTC) }
+	_, err = st.Add("ship")
+	require.NoError(t, err)
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", Timezone: "Asia/Tokyo"},
+		}, nil
+	})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"generate"})
+	require.NoError(t, root.Execute())
+	assert.Len(t, assistant.genSec.Days, 2, "window computed in the configured timezone, not the machine's")
+}
+
+func TestGenerateBadTimezoneFails(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "x"}
+	assistant.genSec = &report.Section{}
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", Timezone: "Mars/Olympus"},
+		}, nil
+	})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"generate"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "timezone")
+}
+
 func TestGenerateBlockedSection(t *testing.T) {
 	assistant := &fakeAssistant{genOut: "x"}
 	st, root, _ := newHarness(t, assistant)
@@ -831,6 +1026,209 @@ func TestCommitsStampsCommitTime(t *testing.T) {
 	assert.Equal(t, "fix login bug", tasks[0].Text)
 	assert.Contains(t, buf.String(), "- [done] fix login bug")
 	assert.Empty(t, assistant.added, "commit ingestion is deterministic — no model involved")
+}
+
+func TestFilterRepos(t *testing.T) {
+	cases := []struct {
+		name            string
+		paths, inc, exc []string
+		want            []string
+	}{
+		{"no globs keeps all", []string{".", "lib"}, nil, nil, []string{".", "lib"}},
+		{"include keeps only matches", []string{"api", "vendor"}, []string{"a*"}, nil, []string{"api"}},
+		{"exclude drops matches", []string{"api", "vendor"}, nil, []string{"v*"}, []string{"api"}},
+		{"exclude beats include", []string{"api", "alt"}, []string{"a*"}, []string{"alt"}, []string{"api"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := filterRepos(tc.paths, config.Config{ReposInclude: tc.inc, ReposExclude: tc.exc})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+	t.Run("bad pattern surfaces", func(t *testing.T) {
+		_, err := filterRepos([]string{"x"}, config.Config{ReposExclude: []string{"["}})
+		assert.ErrorContains(t, err, "repos glob")
+	})
+}
+
+func TestCommitsReposGlobsFilterCollection(t *testing.T) {
+	assistant := &fakeAssistant{}
+	assistant.genSec = &report.Section{}
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", ReposExclude: []string{"*/vendor", "vendor"}},
+		}, nil
+	})
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+
+	var queried []string
+	oldLog, oldSubs := gitLog, gitSubmodules
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		queried = append(queried, dir)
+		return nil, nil
+	}
+	gitSubmodules = func(dir string) ([]string, error) {
+		if dir == "." {
+			return []string{"vendor"}, nil
+		}
+		return nil, nil
+	}
+	t.Cleanup(func() { gitLog, gitSubmodules = oldLog, oldSubs })
+	root.SetArgs([]string{"commits"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, []string{"."}, queried, "excluded submodule never reaches the collector")
+}
+
+func TestCommitsBranchFlagRecords(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	old := gitLog
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		return []git.Commit{{Hash: "h1", Body: "feat: x", Branch: "main", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)}}, nil
+	}
+	t.Cleanup(func() { gitLog = old })
+	root.SetArgs([]string{"commits", "--branch"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "main", tasks[0].Branch, "--branch records the commit's branch")
+}
+
+func TestCommitsWithoutBranchFlagStaysBlank(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	old := gitLog
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		return []git.Commit{{Hash: "h1", Body: "feat: x", Branch: "main", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)}}, nil
+	}
+	t.Cleanup(func() { gitLog = old })
+	root.SetArgs([]string{"commits"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Empty(t, tasks[0].Branch, "no flag, no attribution — rows stay clean")
+}
+
+func TestListShowsBranchWhenRecorded(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAssistant{})
+	st.Now = today(8, 0)
+	added, err := st.Add("feat: x")
+	require.NoError(t, err)
+	_, err = st.SetBranch(added.ID, "main")
+	require.NoError(t, err)
+	root.SetArgs([]string{"list"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "[main]", "list rows attribute the branch when recorded")
+}
+
+func TestCommitsAllAuthorsRecordsAuthor(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	old := gitLogAll
+	gitLogAll = func(dir string, since time.Time) ([]git.Commit, error) {
+		return []git.Commit{
+			{Hash: "h1", Body: "alice work", Author: "alice@example.com", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)},
+			{Hash: "h2", Body: "bob work", Author: "bob@example.com", When: time.Date(2026, 8, 14, 11, 0, 0, 0, time.Local)},
+		}, nil
+	}
+	t.Cleanup(func() { gitLogAll = old })
+	root.SetArgs([]string{"commits", "--all-authors"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	assert.Equal(t, "alice@example.com", tasks[0].Author)
+	assert.Equal(t, "bob@example.com", tasks[1].Author)
+}
+
+func TestCommitsWithoutAllAuthorsUsesPersonalLog(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	old, oldAll := gitLog, gitLogAll
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		return []git.Commit{{Hash: "h1", Body: "my work", Author: "me@example.com", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)}}, nil
+	}
+	gitLogAll = func(dir string, since time.Time) ([]git.Commit, error) {
+		t.Fatal("without --all-authors the personal log is used")
+		return nil, nil
+	}
+	t.Cleanup(func() { gitLog, gitLogAll = old, oldAll })
+	root.SetArgs([]string{"commits"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Empty(t, tasks[0].Author, "personal imports stay unattributed")
+}
+
+func TestGenerateTeamGroupsByAuthor(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "- [done] work (10:00)"}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	for _, seed := range []struct{ text, author string }{
+		{"alice work", "alice@example.com"},
+		{"bob work", "bob@example.com"},
+		{"my manual task", ""},
+	} {
+		tk, err := st.Add(seed.text)
+		require.NoError(t, err)
+		if seed.author != "" {
+			_, err = st.SetAuthor(tk.ID, seed.author)
+			require.NoError(t, err)
+		}
+	}
+	root.SetArgs([]string{"generate", "--team"})
+	require.NoError(t, root.Execute())
+	require.Len(t, assistant.genSecs, 3, "one render per author group plus the unattributed group")
+	assert.Contains(t, buf.String(), "## alice@example.com")
+	assert.Contains(t, buf.String(), "## bob@example.com")
+	for _, sec := range assistant.genSecs {
+		for _, day := range sec.Days {
+			for i := 1; i < len(day.Tasks); i++ {
+				assert.Equal(t, day.Tasks[0].Author, day.Tasks[i].Author, "every section is single-author")
+			}
+		}
+	}
+}
+
+func TestGenerateTeamWithoutAuthorsRendersSolo(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "- [done] work (10:00)"}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("plain task")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--team"})
+	require.NoError(t, root.Execute())
+	require.Len(t, assistant.genSecs, 1, "no recorded authors: one section, no headings")
+	assert.NotContains(t, buf.String(), "@example.com")
+}
+
+func TestCommitsIncludesSubmodules(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	var queried []string
+	oldLog, oldSubs := gitLog, gitSubmodules
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		queried = append(queried, dir)
+		return []git.Commit{{Hash: "h-" + dir, Body: "work in " + dir, When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)}}, nil
+	}
+	gitSubmodules = func(dir string) ([]string, error) {
+		if dir == "." {
+			return []string{"lib"}, nil
+		}
+		return nil, nil
+	}
+	t.Cleanup(func() { gitLog, gitSubmodules = oldLog, oldSubs })
+	root.SetArgs([]string{"commits"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, []string{".", "lib"}, queried, "submodule paths feed the collector as extra repos")
+	tasks, err := st.List()
+	require.NoError(t, err)
+	assert.Len(t, tasks, 2, "commits from both the repo and its submodule are imported")
 }
 
 func TestCommitsMultiRepoDedupesAndSorts(t *testing.T) {
@@ -874,6 +1272,25 @@ func TestCommitsSkipsAlreadyImported(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tasks, 1, "re-running commits never duplicates tasks")
 	assert.Contains(t, buf.String(), "skipped 1 already imported")
+}
+
+func TestCommitsContinuesPastBadCommit(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAssistant{})
+	old := gitLog
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		return []git.Commit{
+			{Hash: "bad", Body: "", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)},
+			{Hash: "good", Body: "feat: add login", When: time.Date(2026, 8, 14, 11, 0, 0, 0, time.Local)},
+		}, nil
+	}
+	t.Cleanup(func() { gitLog = old })
+	root.SetArgs([]string{"commits"})
+	require.NoError(t, root.Execute(), "one bad commit must not abort the import")
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1, "the valid commit after the bad one is still imported")
+	assert.Equal(t, "feat: add login", tasks[0].Text)
+	assert.Contains(t, buf.String(), "skipped", "the bad commit is reported, not silently dropped")
 }
 
 func TestCommitsDaysArg(t *testing.T) {
@@ -1194,6 +1611,55 @@ func TestInitCmdWritesDefaults(t *testing.T) {
 		_, err := os.Stat(filepath.Join(xdg, "standup", name))
 		require.NoError(t, err, "%s written", name)
 	}
+}
+
+func TestUpdateAvailable(t *testing.T) {
+	old := latestTag
+	latestTag = func() (string, error) { return "v0.6.0", nil }
+	t.Cleanup(func() { latestTag = old })
+	_, root, buf := newHarness(t, &fakeAssistant{})
+	root.Version = "0.5.0"
+	root.SetArgs([]string{"update"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "update available: v0.6.0 (current: v0.5.0)")
+	assert.Contains(t, buf.String(), "install.sh", "the message says how to update")
+}
+
+func TestUpdateUpToDate(t *testing.T) {
+	old := latestTag
+	latestTag = func() (string, error) { return "v0.5.0", nil }
+	t.Cleanup(func() { latestTag = old })
+	_, root, buf := newHarness(t, &fakeAssistant{})
+	root.Version = "0.5.0"
+	root.SetArgs([]string{"update"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "up to date (v0.5.0)")
+}
+
+func TestUpdateNetworkErrorFails(t *testing.T) {
+	old := latestTag
+	latestTag = func() (string, error) { return "", errors.New("no network") }
+	t.Cleanup(func() { latestTag = old })
+	_, root, _ := newHarness(t, &fakeAssistant{})
+	root.Version = "0.5.0"
+	root.SetArgs([]string{"update"})
+	assert.Error(t, root.Execute())
+}
+
+func TestLatestTagFollowsRedirect(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", "https://github.com/x/standup/releases/tag/v0.6.0")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(srv.Close)
+	oldURL, oldTag := releasesLatestURL, latestTag
+	releasesLatestURL = srv.URL
+	latestTag = func() (string, error) { return latestReleaseTag() }
+	t.Cleanup(func() { releasesLatestURL, latestTag = oldURL, oldTag })
+
+	tag, err := latestTag()
+	require.NoError(t, err)
+	assert.Equal(t, "v0.6.0", tag)
 }
 
 func TestSkillInstallWritesBothRoots(t *testing.T) {

@@ -7,14 +7,72 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ### Added
 
+- `standup update`: compares the running version with the latest release
+  (via the GitHub `releases/latest` redirect — no API, no rate limit) and
+  prints the installer command to rerun; up to date says so.
+- `generate --webhook <url>`: POSTs the report as Slack-compatible JSON
+  (`{"text": ...}` — a sensible generic payload for any JSON webhook), so
+  it goes straight where the team reads it.
+- `generate --mail <address>`: sends the report as a plain-text email via
+  SMTP (`smtp_host`/`smtp_port`/`smtp_user`/`mail_from` in `config.yaml`;
+  the password is `STANDUP_SMTP_PASSWORD` env, never a file).
+- `commits` collects from git submodules too: each repo's `.gitmodules`
+  paths feed the multi-repo collector (deduped by hash like any repo).
+- `repos.include`/`repos.exclude` glob lists in `config.yaml` filter which
+  repos and submodules `commits` ingests (path.Match against each path as
+  passed; empty include = everything not excluded).
+- `timezone` config key (IANA name, empty = local): report windows, the
+  meeting cutoff and the day split follow the configured zone instead of
+  the machine's — for teams whose standup time is not the runner's zone.
+- `commits --branch` records the branch name with each imported commit
+  (best-effort `git name-rev` semantics — ancestors show as `name~N`);
+  `list` and report rows render it as `[branch]` when present.
+- Team standup: `commits --all-authors` imports every author's commits and
+  records the author email on each task; `generate --team` renders one
+  section per author (`## alice@example.com`, unattributed tasks first).
+  The store stays a single personal file — grouping happens at report time.
+- Installers verify the downloaded archive's SHA-256 when the release
+  publishes a checksums file (releases now ship a stable-named
+  `standup_checksums.txt`; older releases skip verification with a note).
 - Demo GIF in the README (recorded with vhs; `demo.tape` is reproducible
   against a live endpoint, seeded with a previous working day).
+- README ships a ready-made GitHub Actions cron workflow: checkout, install,
+  `commits` + `generate --webhook` in offline mode — a daily standup posted
+  to the team's webhook with zero LLM credentials.
 
 ### Changed
 
+- Documented `generate`'s contract: an unreachable model falls back to
+  verbatim texts, but missing provider env fails fast with a hint — offline
+  rendering stays an explicit `offline: true` opt-in.
 - `add` now echoes the saved rows with their status (`- [todo] ...`) and
   `generate` colors the report's `[status]` tokens on a terminal — same
   palette as `list`; plain when piped or `NO_COLOR` is set.
+
+### Fixed
+
+- `commits` no longer hard-fails on conventional-commit subjects (`chore: seed
+  repo` & co. were eaten as a "trailer block", leaving empty task text): a
+  message that would strip to nothing is kept verbatim, and one bad commit no
+  longer aborts the import — it is skipped with a warning and the rest are
+  still imported.
+- `doctor` no longer fails on a fresh install: the data-file check creates
+  the parent directory (like the first `add` does) instead of failing on a
+  missing `~/.standup`.
+- Piped CRLF input (Windows `Get-Content | standup add`) is normalized at
+  ingest — a literal `\r` no longer lands in the task store, reports, and
+  model prompts.
+- Multi-line task texts (imported commit bodies) render as one report bullet:
+  both generate templates fold newlines via the new `fold` template func
+  (user templates may call it too), so body lines keep their `- ` prefix and
+  the timestamp stays on the row.
+- `rm` folds the echoed task text like every other command — multi-line
+  entries print as one row.
+- Model calls are bounded by a 60 s HTTP timeout: a silent endpoint fails
+  with the usual endpoint hint instead of riding the SDK default (~10 min).
+- Windows installer no longer duplicates PATH entries: the persisted User
+  PATH is checked before appending, not just the current session's.
+- README documents uninstall (delete the binary / `%LOCALAPPDATA%\standup`).
 
 ## [0.5.0] - 2026-08-15
 

@@ -16,6 +16,10 @@ archives:
     # dumped next to it on manual extraction) — documented GoReleaser hack.
     files:
       - none*
+# Stable name so installers can verify against releases/latest without
+# knowing the version.
+checksum:
+  name_template: "{{ .ProjectName }}_checksums.txt"
 release:
   draft: true
 changelog:

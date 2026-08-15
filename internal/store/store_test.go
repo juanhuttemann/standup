@@ -175,6 +175,50 @@ func TestListDay(t *testing.T) {
 	assert.Equal(t, []Task{b}, got)
 }
 
+func TestSetBranch(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC))
+	tk, err := s.Add("task")
+	require.NoError(t, err)
+	assert.Empty(t, tk.Branch, "plain tasks carry no branch")
+
+	tk, err = s.SetBranch(tk.ID, "main")
+	require.NoError(t, err)
+	assert.Equal(t, "main", tk.Branch)
+
+	reloaded, err := Open(s.Path)
+	require.NoError(t, err)
+	tasks, err := reloaded.List()
+	require.NoError(t, err)
+	assert.Equal(t, "main", tasks[0].Branch, "branch survives a reload")
+
+	_, err = s.SetBranch("no-such-id", "main")
+	assert.Error(t, err, "unknown id must error")
+}
+
+func TestSetAuthor(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC))
+	tk, err := s.Add("task")
+	require.NoError(t, err)
+	assert.Empty(t, tk.Author, "plain tasks carry no author")
+
+	tk, err = s.SetAuthor(tk.ID, "alice@example.com")
+	require.NoError(t, err)
+	assert.Equal(t, "alice@example.com", tk.Author)
+
+	reloaded, err := Open(s.Path)
+	require.NoError(t, err)
+	tasks, err := reloaded.List()
+	require.NoError(t, err)
+	assert.Equal(t, "alice@example.com", tasks[0].Author, "author survives a reload")
+
+	_, err = s.SetAuthor("no-such-id", "alice@example.com")
+	assert.Error(t, err, "unknown id must error")
+}
+
 func TestSetStatus(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)

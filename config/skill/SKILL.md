@@ -14,12 +14,19 @@ trailing `#word` tokens in task text.
 - After finishing a work item: `standup add "what was done"` — splits
   multi-task input, preserves `#tags`; `--raw` stores text verbatim.
 - From a git repo: `standup commits` imports the last working day's commits
-  as done tasks (stamped with commit time, deduped on re-run);
-  `standup commits 3` for N days, extra args are repo paths.
+  as done tasks (stamped with commit time, deduped on re-run, submodules
+  included); `standup commits 3` for N days, extra args are repo paths,
+  `repos.include`/`repos.exclude` globs filter ingestion, `--branch`
+  records the branch for `[branch]` attribution in list/report rows,
+  `--all-authors` imports the whole team's commits with authors recorded.
+- Team standup: `standup generate --team` renders one section per recorded
+  author; tasks without an author render unattributed.
 - Each morning: `standup generate` — yesterday + today (weekend-aware,
   cutoff at the configured meeting time), blocked tasks under
   `## Blockers`. `standup generate 5` for more days, `--from`/`--to
-  YYYY-MM-DD` for an explicit window, `--clip` to copy the report.
+  YYYY-MM-DD` for an explicit window, `--clip` to copy the report,
+  `--webhook <url>` to POST it (Slack-compatible JSON), `--mail <address>`
+  to email it (needs `smtp_*` config).
 - Status changes: `standup done <id>`, `standup status <id> blocked` (or
   `todo`, `in-progress`).
 - Review: `standup list` (interactive), `standup list --days 5`, `--date
@@ -31,4 +38,5 @@ trailing `#word` tokens in task text.
 - No model endpoint: `STANDUP_OFFLINE=true` — add splits paragraphs,
   generate renders deterministically. Online mode needs provider env vars.
 - `standup doctor` sanity-checks the setup; `standup init` writes editable
-  config files.
+  config files (meeting time, timezone, SMTP, repo globs); `standup update`
+  checks for a newer release.

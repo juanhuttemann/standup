@@ -5,7 +5,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"time"
@@ -15,6 +18,8 @@ type Commit struct {
 	Hash    string
 	Subject string
 	Body    string // full commit message, trailer block stripped
+	Author  string // author email
+	Branch  string // nearest branch name (name~N for ancestors), best-effort
 	When    time.Time
 }
 
@@ -41,12 +46,26 @@ func Identity(dir string) (string, error) {
 // the configured git user or carries their address in a Co-authored-by
 // trailer; teammates' commits are excluded.
 func Log(dir string, since time.Time) ([]Commit, error) {
+	return logCommits(dir, since, false)
+}
+
+// LogAll is Log without the identity filter: every author's non-merge
+// commits, so one person can run the standup for the whole team.
+func LogAll(dir string, since time.Time) ([]Commit, error) {
+	return logCommits(dir, since, true)
+}
+
+func logCommits(dir string, since time.Time, allAuthors bool) ([]Commit, error) {
 	if _, err := run(dir, "rev-parse", "--is-inside-work-tree"); err != nil {
 		return nil, errNotARepo
 	}
-	email, err := Identity(dir)
-	if err != nil {
-		return nil, err
+	var email string
+	if !allAuthors {
+		var err error
+		email, err = Identity(dir)
+		if err != nil {
+			return nil, err
+		}
 	}
 	out, err := run(dir, "log", "--no-merges",
 		"--since="+since.Format(time.RFC3339),
@@ -56,7 +75,7 @@ func Log(dir string, since time.Time) ([]Commit, error) {
 	}
 	var commits []Commit
 	for _, e := range parseLog(out) {
-		if !strings.EqualFold(e.author, email) && !coAuthored(e.raw, email) {
+		if !allAuthors && !strings.EqualFold(e.author, email) && !coAuthored(e.raw, email) {
 			continue
 		}
 		ts, err := time.Parse(time.RFC3339, e.when)
@@ -64,10 +83,39 @@ func Log(dir string, since time.Time) ([]Commit, error) {
 			return nil, fmt.Errorf("git: commit time %q: %w", e.when, err)
 		}
 		subject, body := cleanMessage(e.raw)
-		commits = append(commits, Commit{Hash: e.hash, Subject: subject, Body: body, When: ts})
+		commits = append(commits, Commit{Hash: e.hash, Subject: subject, Body: body, Author: e.author, When: ts})
 	}
 	slices.Reverse(commits)
+	names := nameRev(dir, commits)
+	for i := range commits {
+		commits[i].Branch = names[commits[i].Hash]
+	}
 	return commits, nil
+}
+
+// nameRev resolves a branch name per commit via one git name-rev call
+// (ancestors of a tip come out as name~N). Best-effort by design: a repo
+// name-rev chokes on must not lose the commits, so a failure yields no
+// names at all.
+func nameRev(dir string, commits []Commit) map[string]string {
+	if len(commits) == 0 {
+		return nil
+	}
+	hashes := make([]string, len(commits))
+	for i, c := range commits {
+		hashes[i] = c.Hash
+	}
+	out, err := run(dir, append([]string{"name-rev", "--name-only"}, hashes...)...)
+	if err != nil {
+		return nil
+	}
+	names := map[string]string{}
+	for i, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if i < len(hashes) {
+			names[hashes[i]] = line
+		}
+	}
+	return names
 }
 
 // entry is one raw log record; body lines are reattached by parseLog.
@@ -135,6 +183,13 @@ func cleanMessage(raw string) (subject, body string) {
 		}
 		end--
 	}
+	// A strip that would empty the message means the whole text looked like
+	// trailers (a conventional-commit subject such as "chore: seed repo") —
+	// keep it verbatim; only a block leaving at least one line behind is
+	// treated as trailers.
+	if end == 0 {
+		end = len(lines)
+	}
 	body = strings.TrimSpace(strings.Join(lines[:end], "\n"))
 	subject = strings.SplitN(body, "\n", 2)[0]
 	return subject, body
@@ -154,6 +209,33 @@ func isTrailer(line string) bool {
 		}
 	}
 	return i+1 < len(line) && line[i+1] == ' '
+}
+
+// Submodules returns the working-tree paths of the repository's submodules
+// (relative to dir, per .gitmodules); nil when there are none.
+func Submodules(dir string) ([]string, error) {
+	if _, err := os.Stat(filepath.Join(dir, ".gitmodules")); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	out, err := run(dir, "config", "-f", ".gitmodules", "--get-regexp", `submodule\..*\.path`)
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil, nil // a .gitmodules with no submodule sections
+		}
+		return nil, err
+	}
+	var subs []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		// "submodule.<name>.path <value>"
+		if f := strings.Fields(line); len(f) == 2 {
+			subs = append(subs, f[1])
+		}
+	}
+	return subs, nil
 }
 
 func run(dir string, args ...string) (string, error) {

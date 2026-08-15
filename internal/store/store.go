@@ -17,6 +17,8 @@ type Task struct {
 	ID        string    `json:"id"`
 	Text      string    `json:"task"`
 	Status    string    `json:"status"`
+	Author    string    `json:"author,omitempty"`
+	Branch    string    `json:"branch,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
 }
 
@@ -189,6 +191,36 @@ func (s *Store) SetStatus(id, status string) (Task, error) {
 	for i, t := range tasks {
 		if t.ID == id {
 			tasks[i].Status = status
+			return tasks[i], s.save(tasks)
+		}
+	}
+	return Task{}, fmt.Errorf("store: unknown id %q", id)
+}
+
+// SetAuthor records which commit author a task came from (team reports).
+func (s *Store) SetAuthor(id, author string) (Task, error) {
+	tasks, err := s.load()
+	if err != nil {
+		return Task{}, err
+	}
+	for i, t := range tasks {
+		if t.ID == id {
+			tasks[i].Author = author
+			return tasks[i], s.save(tasks)
+		}
+	}
+	return Task{}, fmt.Errorf("store: unknown id %q", id)
+}
+
+// SetBranch records the branch a task's commit was made on.
+func (s *Store) SetBranch(id, branch string) (Task, error) {
+	tasks, err := s.load()
+	if err != nil {
+		return Task{}, err
+	}
+	for i, t := range tasks {
+		if t.ID == id {
+			tasks[i].Branch = branch
 			return tasks[i], s.save(tasks)
 		}
 	}

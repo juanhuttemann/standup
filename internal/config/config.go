@@ -19,6 +19,14 @@ type Config struct {
 	DataFile              string
 	Offline               bool
 	Language              string
+	Timezone              string
+	SMTPHost              string
+	SMTPPort              int
+	SMTPUser              string
+	SMTPPassword          string
+	MailFrom              string
+	ReposInclude          []string
+	ReposExclude          []string
 	EditorInstructions    string
 	ReporterInstructions  string
 	GenerateInputTemplate string
@@ -99,12 +107,21 @@ func Load() (Config, error) {
 	v.SetDefault("data_file", "~/.standup/tasks.jsonl")
 	v.SetDefault("offline", false)
 	v.SetDefault("language", "")
+	v.SetDefault("smtp_port", 587)
 
 	cfg := Config{
-		MeetingTime: v.GetString("meeting_time"),
-		DataFile:    v.GetString("data_file"),
-		Offline:     v.GetBool("offline"),
-		Language:    v.GetString("language"),
+		MeetingTime:  v.GetString("meeting_time"),
+		DataFile:     v.GetString("data_file"),
+		Offline:      v.GetBool("offline"),
+		Language:     v.GetString("language"),
+		Timezone:     v.GetString("timezone"),
+		SMTPHost:     v.GetString("smtp_host"),
+		SMTPPort:     v.GetInt("smtp_port"),
+		SMTPUser:     v.GetString("smtp_user"),
+		SMTPPassword: v.GetString("smtp_password"),
+		MailFrom:     v.GetString("mail_from"),
+		ReposInclude: v.GetStringSlice("repos.include"),
+		ReposExclude: v.GetStringSlice("repos.exclude"),
 	}
 
 	dataFile, err := expandHome(cfg.DataFile)

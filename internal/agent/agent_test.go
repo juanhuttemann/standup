@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -259,6 +261,57 @@ func TestLocalGenerateRangeRendersDaysTemplate(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "## Thu 2026-08-13\n## Yesterday\n## Today\n- [todo] ship (08:00)\n", out)
 }
+
+func TestGenerateFoldsMultilineTaskText(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	ass, err := Local(committedCfg(t), st)
+	require.NoError(t, err)
+	multi := store.Task{
+		Text:      "feat: big thing\n\nline one of body\nline two of body",
+		Status:    "done",
+		Timestamp: time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC),
+	}
+
+	// Default window (two-section template) and the days template must both
+	// fold multi-line texts into one bullet.
+	sec := report.Section{
+		Days:  []report.Day{{Heading: "Yesterday"}, {Heading: "Today", Tasks: []store.Task{multi}}},
+		Today: []store.Task{multi},
+	}
+	out, err := ass.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "- [done] feat: big thing line one of body line two of body (12:00)")
+
+	sec = report.Section{Days: []report.Day{{Heading: "Today", Tasks: []store.Task{multi}}}}
+	out, err = ass.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "- [done] feat: big thing line one of body line two of body (12:00)")
+	assert.NotContains(t, out, "\n\nline one", "body lines keep the bullet prefix")
+}
+func TestGenerateRendersBranchWhenRecorded(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	ass, err := Local(committedCfg(t), st)
+	require.NoError(t, err)
+	task := store.Task{
+		Text:      "feat: x",
+		Status:    "done",
+		Branch:    "main",
+		Timestamp: time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC),
+	}
+	sec := report.Section{Days: []report.Day{{Heading: "Today", Tasks: []store.Task{task}}}}
+	out, err := ass.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "- [done] feat: x [main] (12:00)", "report rows attribute the branch when recorded")
+
+	task.Branch = ""
+	sec = report.Section{Days: []report.Day{{Heading: "Today", Tasks: []store.Task{task}}}}
+	out, err = ass.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "- [done] feat: x (12:00)", "no branch, no empty brackets")
+}
+
 func TestNewOfflineReturnsLocal(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
@@ -352,6 +405,39 @@ func TestCommittedTemplatesSkipEmptySections(t *testing.T) {
 	assert.Contains(t, out, "## Today")
 	assert.Contains(t, out, "ship release")
 	assert.NotContains(t, out, "## Yesterday", "empty sections are not rendered")
+}
+
+func TestAddTasksTimesOutOnSilentEndpoint(t *testing.T) {
+	old := modelTimeout
+	modelTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { modelTimeout = old })
+
+	// done unblocks the handler at cleanup so srv.Close does not wait out
+	// the sleep (cleanups run LIFO: close(done) fires before srv.Close).
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(10 * time.Second): // silent but established: worse than a black hole
+		case <-done:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(done) })
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	t.Setenv("OPENAI_MODEL", "test")
+
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	ass, err := New(committedCfg(t), st)
+	require.NoError(t, err)
+
+	start := time.Now()
+	_, err = ass.AddTasks(context.Background(), "fix bug")
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 5*time.Second, "the client timeout bounds the call, not the SDK default")
+	tasks, err := st.List()
+	require.NoError(t, err)
+	assert.Empty(t, tasks, "timeout must not leave partial writes")
 }
 
 func TestCommittedDaysTemplateSkipsEmptyDays(t *testing.T) {

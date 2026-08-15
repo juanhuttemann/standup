@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/smtp"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -28,6 +33,12 @@ import (
 
 // gitLog is swappable so CLI tests never depend on a real repository.
 var gitLog = git.Log
+
+// gitSubmodules is swappable so CLI tests never depend on a real repository.
+var gitSubmodules = git.Submodules
+
+// gitLogAll is swappable so CLI tests never depend on a real repository.
+var gitLogAll = git.LogAll
 
 // Deps carries everything a command needs; it is built lazily so help,
 // version, and init never touch config, store, or provider settings. The
@@ -122,6 +133,9 @@ func New(load func() (Deps, error)) *cobra.Command {
 	genCmd.Flags().String("from", "", "explicit window start date (YYYY-MM-DD, with --to)")
 	genCmd.Flags().String("to", "", "explicit window end date (YYYY-MM-DD, with --from)")
 	genCmd.Flags().Bool("clip", false, "copy the report to the clipboard")
+	genCmd.Flags().String("webhook", "", "POST the report to this webhook URL (Slack-compatible JSON)")
+	genCmd.Flags().String("mail", "", "send the report to this email address (needs smtp_* config)")
+	genCmd.Flags().Bool("team", false, "group the report by recorded commit author (see commits --all-authors)")
 
 	commitsCmd := &cobra.Command{
 		Use:   "commits [days] [paths...]",
@@ -132,6 +146,8 @@ func New(load func() (Deps, error)) *cobra.Command {
 		},
 		SilenceUsage: true,
 	}
+	commitsCmd.Flags().Bool("branch", false, "record the branch name with each imported commit")
+	commitsCmd.Flags().Bool("all-authors", false, "import every author's commits (team standup), recording the author")
 
 	doctorCmd := &cobra.Command{
 		Use:   "doctor",
@@ -195,6 +211,15 @@ func New(load func() (Deps, error)) *cobra.Command {
 		},
 	}
 
+	updateCmd := &cobra.Command{
+		Use:   "update",
+		Short: "check for a newer release",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runUpdate(cmd)
+		},
+		SilenceUsage: true,
+	}
+
 	skillCmd := &cobra.Command{
 		Use:   "skill install",
 		Short: "install the standup agent skill into the current repo (--global: your home dir)",
@@ -211,8 +236,65 @@ func New(load func() (Deps, error)) *cobra.Command {
 	}
 	skillCmd.Flags().BoolP("global", "g", false, "install to ~/.agents and ~/.claude instead of the repo")
 
-	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd, skillCmd)
+	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd, skillCmd, updateCmd)
 	return root
+}
+
+// releasesLatestURL is the redirecting "latest release" page; the Location
+// header names the newest tag without an API call or rate limit.
+var releasesLatestURL = "https://github.com/juanhuttemann/standup/releases/latest"
+
+// latestTag is swappable so tests never hit the network.
+var latestTag = func() (string, error) { return latestReleaseTag() }
+
+// latestReleaseTag resolves the newest release tag from the redirect. Var
+// URL, fixed URL in production.
+func latestReleaseTag() (string, error) {
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		// The first hop is the answer; do not follow it (the tag page is
+		// just HTML).
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	resp, err := client.Head(releasesLatestURL)
+	if err != nil {
+		return "", fmt.Errorf("%w (check network)", err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		return "", fmt.Errorf("no release redirect (status %s)", resp.Status)
+	}
+	return path.Base(loc), nil
+}
+
+// runUpdate compares the running version with the newest release and says
+// how to update; like init it never loads deps (nothing to configure, no
+// provider credentials — the check hits GitHub, not the model endpoint).
+func runUpdate(cmd *cobra.Command) error {
+	tag, err := latestTag()
+	if err != nil {
+		return fmt.Errorf("update: %w", err)
+	}
+	cur := "v" + strings.TrimPrefix(cmd.Root().Version, "v")
+	if "v"+strings.TrimPrefix(tag, "v") == cur {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "up to date (%s)\n", tag)
+		return err
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "update available: %s (current: %s)\n", tag, cur)
+	if err != nil {
+		return err
+	}
+	inst := "curl -fsSL https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.sh | bash"
+	if runtime.GOOS == "windows" {
+		inst = "iex (irm https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.ps1)"
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "rerun the installer to update:\n  %s\n", inst)
+	return err
 }
 
 // runSkillInstall writes the embedded agent skill as real files (symlinks
@@ -300,7 +382,7 @@ func runRm(cmd *cobra.Command, d Deps, args []string) error {
 	if err := d.Store.Delete(task.ID); err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "- removed: %s\n", task.Text)
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "- removed: %s\n", flat(task.Text))
 	return err
 }
 
@@ -457,7 +539,8 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 		if err != nil {
 			return err
 		}
-		text = string(b)
+		// Windows pipes carry CRLF; normalize so \r never reaches the store.
+		text = strings.ReplaceAll(string(b), "\r\n", "\n")
 	}
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("usage: %s add \"task text\" (or pipe text to %s add)", cmd.Root().Name(), cmd.Root().Name())
@@ -489,17 +572,34 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 	return nil
 }
 
+// nowIn returns the store clock in the configured timezone (empty = local).
+// Report windows, the meeting cutoff and the day split all derive from the
+// result's Location, so this one conversion covers every command.
+func nowIn(d Deps) (time.Time, error) {
+	if d.Config.Timezone == "" {
+		return d.Store.Now(), nil
+	}
+	loc, err := time.LoadLocation(d.Config.Timezone)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("config timezone %q: %w", d.Config.Timezone, err)
+	}
+	return d.Store.Now().In(loc), nil
+}
+
 func runCommits(cmd *cobra.Command, d Deps, args []string) error {
 	days, paths, err := commitsArgs(cmd, args)
 	if err != nil {
 		return err
 	}
-	now := d.Store.Now()
+	now, err := nowIn(d)
+	if err != nil {
+		return err
+	}
 	since := report.StartOfDay(report.LastWorkingDay(now))
 	if days > 0 {
 		since = report.StartOfDay(now.AddDate(0, 0, -(days - 1)))
 	}
-	commits, err := collectCommits(paths, since)
+	commits, err := collectCommits(d.Config, paths, since, flagBool(cmd, "all-authors"))
 	if err != nil {
 		return err
 	}
@@ -535,13 +635,34 @@ func commitsArgs(cmd *cobra.Command, args []string) (int, []string, error) {
 	return days, rest, nil
 }
 
-// collectCommits gathers commits from every repo, deduped by hash and
-// ordered oldest first across repos.
-func collectCommits(paths []string, since time.Time) ([]git.Commit, error) {
+// collectCommits gathers commits from every repo (and its submodules),
+// filtered by the repos.include/exclude globs, deduped by hash and ordered
+// oldest first across repos. allAuthors collects the whole team's commits
+// instead of just the configured git user's.
+func collectCommits(cfg config.Config, paths []string, since time.Time, allAuthors bool) ([]git.Commit, error) {
+	log := gitLog
+	if allAuthors {
+		log = gitLogAll
+	}
+	var repos []string
+	for _, p := range paths {
+		subs, err := gitSubmodules(p)
+		if err != nil {
+			return nil, err
+		}
+		repos = append(repos, p)
+		for _, s := range subs {
+			repos = append(repos, filepath.Join(p, s))
+		}
+	}
+	repos, err := filterRepos(repos, cfg)
+	if err != nil {
+		return nil, err
+	}
 	seen := map[string]bool{}
 	var commits []git.Commit
-	for _, p := range paths {
-		cs, err := gitLog(p, since)
+	for _, repo := range repos {
+		cs, err := log(repo, since)
 		if err != nil {
 			return nil, err
 		}
@@ -555,6 +676,38 @@ func collectCommits(paths []string, since time.Time) ([]git.Commit, error) {
 	}
 	sort.SliceStable(commits, func(i, j int) bool { return commits[i].When.Before(commits[j].When) })
 	return commits, nil
+}
+
+// filterRepos applies the repos.include/exclude globs (path.Match against
+// each path as passed); an empty include list keeps everything not excluded.
+func filterRepos(paths []string, cfg config.Config) ([]string, error) {
+	match := func(globs []string, p string) (bool, error) {
+		for _, g := range globs {
+			ok, err := path.Match(g, p)
+			if err != nil {
+				return false, fmt.Errorf("repos glob %q: %w", g, err)
+			}
+			if ok {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	var out []string
+	for _, p := range paths {
+		inc, err := match(cfg.ReposInclude, p)
+		if err != nil {
+			return nil, err
+		}
+		exc, err := match(cfg.ReposExclude, p)
+		if err != nil {
+			return nil, err
+		}
+		if (len(cfg.ReposInclude) == 0 || inc) && !exc {
+			out = append(out, p)
+		}
+	}
+	return out, nil
 }
 
 // importCommits stores commits as done tasks stamped with the commit time;
@@ -576,7 +729,22 @@ func importCommits(cmd *cobra.Command, st *store.Store, commits []git.Commit) er
 		}
 		t, err := st.AddAt(c.Body, "done", c.When)
 		if err != nil {
-			return err
+			// One bad commit must not abort the import: skip it, say so,
+			// keep going.
+			if _, werr := fmt.Fprintf(cmd.OutOrStdout(), "- skipped %s: %v\n", shortHash(c.Hash), err); werr != nil {
+				return werr
+			}
+			continue
+		}
+		if flagBool(cmd, "branch") && c.Branch != "" {
+			if t, err = st.SetBranch(t.ID, c.Branch); err != nil {
+				return err
+			}
+		}
+		if flagBool(cmd, "all-authors") && c.Author != "" {
+			if t, err = st.SetAuthor(t.ID, c.Author); err != nil {
+				return err
+			}
 		}
 		if err := echoTask(cmd, t); err != nil {
 			return err
@@ -649,61 +817,61 @@ func interactive() bool {
 
 func runList(cmd *cobra.Command, d Deps) error {
 	st := d.Store
-	now := st.Now()
-	date := flagString(cmd, "date")
-	days := flagInt(cmd, "days")
+	now, err := nowIn(d)
+	if err != nil {
+		return err
+	}
+	tasks, err := listTasks(cmd, st, now)
+	if err != nil {
+		return err
+	}
 	tag := flagString(cmd, "tag")
-	if date != "" && days != 0 {
-		return fmt.Errorf("usage: %s list: --date and --days are mutually exclusive", cmd.Root().Name())
-	}
-
-	var tasks []store.Task
-	var err error
-	switch {
-	case date != "":
-		var day time.Time
-		day, err = time.ParseInLocation("2006-01-02", date, now.Location())
-		if err != nil {
-			return fmt.Errorf("usage: %s list --date YYYY-MM-DD (got %q)", cmd.Root().Name(), date)
-		}
-		tasks, err = st.ListDay(day)
-		if err != nil {
-			return err
-		}
-	case days != 0:
-		if days < 0 {
-			return fmt.Errorf("usage: %s list --days N (N >= 1)", cmd.Root().Name())
-		}
-		tasks, err = st.ListRange(report.StartOfDay(now.AddDate(0, 0, -(days-1))), now)
-		if err != nil {
-			return err
-		}
-	default:
-		tasks, err = st.ListDay(now)
-		if err != nil {
-			return err
-		}
-		tasks = filterTag(tasks, tag)
-		if len(tasks) == 0 {
-			_, err := fmt.Fprintln(cmd.OutOrStdout(), "no tasks")
-			return err
-		}
-		if interactive() {
-			return selectLoop(st, tag, newPainter(cmd.OutOrStdout()))
-		}
-	}
 	tasks = filterTag(tasks, tag)
 	if len(tasks) == 0 {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "no tasks")
 		return err
 	}
+	if flagString(cmd, "date") == "" && flagInt(cmd, "days") == 0 && interactive() {
+		return selectLoop(st, tag, now, newPainter(cmd.OutOrStdout()))
+	}
 	p := newPainter(cmd.OutOrStdout())
 	for _, t := range tasks {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(shortID(t.ID)), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), flat(t.Text)); err != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(shortID(t.ID)), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), rowText(t)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// rowText renders a task row's text, attributing the branch when recorded.
+func rowText(t store.Task) string {
+	if t.Branch == "" {
+		return flat(t.Text)
+	}
+	return flat(t.Text) + " [" + t.Branch + "]"
+}
+
+// listTasks resolves the list window: one --date day, trailing --days, or
+// today (in the configured timezone — now carries its location).
+func listTasks(cmd *cobra.Command, st *store.Store, now time.Time) ([]store.Task, error) {
+	date, days := flagString(cmd, "date"), flagInt(cmd, "days")
+	if date != "" && days != 0 {
+		return nil, fmt.Errorf("usage: %s list: --date and --days are mutually exclusive", cmd.Root().Name())
+	}
+	if date != "" {
+		day, err := time.ParseInLocation("2006-01-02", date, now.Location())
+		if err != nil {
+			return nil, fmt.Errorf("usage: %s list --date YYYY-MM-DD (got %q)", cmd.Root().Name(), date)
+		}
+		return st.ListDay(day)
+	}
+	if days != 0 {
+		if days < 0 {
+			return nil, fmt.Errorf("usage: %s list --days N (N >= 1)", cmd.Root().Name())
+		}
+		return st.ListRange(report.StartOfDay(now.AddDate(0, 0, -(days-1))), now)
+	}
+	return st.ListDay(now)
 }
 
 // filterTag keeps tasks carrying the literal #tag token (case-insensitive),
@@ -733,19 +901,27 @@ func shortID(id string) string {
 	return id
 }
 
+// shortHash abbreviates a commit hash like git does (7 chars).
+func shortHash(h string) string {
+	if len(h) > 7 {
+		return h[:7]
+	}
+	return h
+}
+
 type taskEntry struct {
 	task  store.Task
 	label string
 }
 
-func taskEntries(st *store.Store, tag string, p painter) ([]taskEntry, error) {
-	tasks, err := st.ListDay(st.Now())
+func taskEntries(st *store.Store, tag string, now time.Time, p painter) ([]taskEntry, error) {
+	tasks, err := st.ListDay(now)
 	if err != nil {
 		return nil, err
 	}
 	entries := make([]taskEntry, 0, len(tasks))
 	for _, t := range filterTag(tasks, tag) {
-		entries = append(entries, taskEntry{task: t, label: fmt.Sprintf("%s [%s] %s %s", p.quiet(t.Timestamp.Format("15:04")), p.status(t.Status), p.quiet(shortID(t.ID)), flat(t.Text))})
+		entries = append(entries, taskEntry{task: t, label: fmt.Sprintf("%s [%s] %s %s", p.quiet(t.Timestamp.Format("15:04")), p.status(t.Status), p.quiet(shortID(t.ID)), rowText(t))})
 	}
 	return entries, nil
 }
@@ -759,10 +935,10 @@ func aborted(err error) bool {
 	return err == promptui.ErrInterrupt || err == io.EOF || err.Error() == "^D"
 }
 
-func selectLoop(st *store.Store, tag string, p painter) error {
+func selectLoop(st *store.Store, tag string, now time.Time, p painter) error {
 	actions := []string{"in-progress", "done", "blocked", "delete", "back"}
 	for {
-		entries, err := taskEntries(st, tag, p)
+		entries, err := taskEntries(st, tag, now, p)
 		if err != nil {
 			return err
 		}
@@ -803,7 +979,11 @@ func selectLoop(st *store.Store, tag string, p painter) error {
 }
 
 func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
-	dates, err := generateDates(cmd, args, d.Store.Now())
+	now, err := nowIn(d)
+	if err != nil {
+		return err
+	}
+	dates, err := generateDates(cmd, args, now)
 	if err != nil {
 		return err
 	}
@@ -811,43 +991,99 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	if err != nil {
 		return err
 	}
-	sec, err := report.Build(tasks, d.Store.Now(), d.Config.MeetingTime, dates)
+	out, err := renderReport(cmd, d, tasks, now, dates)
 	if err != nil {
 		return err
 	}
-	total := len(sec.Blockers)
-	for _, day := range sec.Days {
-		total += len(day.Tasks)
-	}
-	if total == 0 {
+	if out == "" {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "nothing to report")
 		return err
 	}
-	assist, err := d.Assistant()
-	if err != nil {
+	if err := deliverReport(cmd, d.Config, out); err != nil {
 		return err
-	}
-	var out string
-	var genErr error
-	if err := spin("generating standup", func() error {
-		out, genErr = assist.Generate(cmd.Context(), sec)
-		return nil
-	}); err != nil {
-		return err
-	}
-	if genErr != nil {
-		return genErr
-	}
-	if flagBool(cmd, "clip") {
-		if err := copyToClipboard(out); err != nil {
-			return err
-		}
 	}
 	if path := flagString(cmd, "output"); path != "" {
 		return os.WriteFile(filepath.Clean(path), []byte(out+"\n"), 0o644)
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), colorReport(out, newPainter(cmd.OutOrStdout())))
 	return err
+}
+
+// renderReport builds the section(s) and renders them through the
+// assistant: one section normally; with --team one section per recorded
+// author (each under a `## author` heading, unattributed tasks first with
+// none), so one person can run the standup for the whole team. The store
+// stays personal — grouping happens here, at report time. "" means no
+// tasks in the window.
+func renderReport(cmd *cobra.Command, d Deps, tasks []store.Task, now time.Time, dates []time.Time) (string, error) {
+	team := flagBool(cmd, "team")
+	groups := map[string][]store.Task{}
+	var order []string
+	for _, t := range tasks {
+		a := ""
+		if team {
+			a = t.Author
+		}
+		if _, ok := groups[a]; !ok {
+			order = append(order, a)
+		}
+		groups[a] = append(groups[a], t)
+	}
+	assist, err := d.Assistant()
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, a := range order {
+		sec, err := report.Build(groups[a], now, d.Config.MeetingTime, dates)
+		if err != nil {
+			return "", err
+		}
+		total := len(sec.Blockers)
+		for _, day := range sec.Days {
+			total += len(day.Tasks)
+		}
+		if total == 0 {
+			continue
+		}
+		var out string
+		var genErr error
+		if err := spin("generating standup", func() error {
+			out, genErr = assist.Generate(cmd.Context(), sec)
+			return nil
+		}); err != nil {
+			return "", err
+		}
+		if genErr != nil {
+			return "", genErr
+		}
+		if a != "" {
+			b.WriteString("## " + a + "\n")
+		}
+		b.WriteString(strings.TrimRight(out, "\n") + "\n")
+	}
+	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// deliverReport fans the rendered report out to the requested sinks:
+// webhook POST, email, clipboard.
+func deliverReport(cmd *cobra.Command, cfg config.Config, out string) error {
+	if u := flagString(cmd, "webhook"); u != "" {
+		if err := postWebhook(u, out); err != nil {
+			return err
+		}
+	}
+	if addr := flagString(cmd, "mail"); addr != "" {
+		if err := mailReport(cfg, addr, out); err != nil {
+			return err
+		}
+	}
+	if flagBool(cmd, "clip") {
+		if err := copyToClipboard(out); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // generateDates resolves the report window: explicit --from/--to dates, the
@@ -894,6 +1130,59 @@ func generateDates(cmd *cobra.Command, args []string, now time.Time) ([]time.Tim
 
 // copyToClipboard is swappable so tests never need a real clipboard.
 var copyToClipboard = copyClipboard
+
+// postWebhook is swappable so tests never need a real webhook target.
+var postWebhook = postReport
+
+// smtpSend is swappable so tests never need a real SMTP server.
+var smtpSend = smtp.SendMail
+
+// mailReport sends the report as a plain-text email via SMTP (SendMail does
+// STARTTLS when the server offers it; auth only when smtp_user is set).
+func mailReport(cfg config.Config, to, text string) error {
+	if cfg.SMTPHost == "" {
+		return fmt.Errorf("mail: smtp_host is not configured (set smtp_* in config.yaml)")
+	}
+	from := cfg.MailFrom
+	if from == "" {
+		from = cfg.SMTPUser
+	}
+	var auth smtp.Auth
+	if cfg.SMTPUser != "" {
+		auth = smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
+	}
+	msg := "From: " + from + "\r\nTo: " + to +
+		"\r\nSubject: standup " + time.Now().Format("2006-01-02") +
+		"\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n" +
+		strings.ReplaceAll(text, "\n", "\r\n")
+	addr := net.JoinHostPort(cfg.SMTPHost, strconv.Itoa(cfg.SMTPPort))
+	if err := smtpSend(addr, auth, from, []string{to}, []byte(msg)); err != nil {
+		return fmt.Errorf("mail: %w", err)
+	}
+	return nil
+}
+
+// postReport POSTs the report as a Slack-compatible JSON payload
+// ({"text": ...}) — a sensible generic body for any JSON webhook too.
+func postReport(url, text string) error {
+	body, err := json.Marshal(map[string]string{"text": text})
+	if err != nil {
+		return err
+	}
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("webhook: %w", err)
+	}
+	defer func() {
+		if cerr := resp.Body.Close(); cerr != nil {
+			err = errors.Join(err, cerr)
+		}
+	}()
+	if resp.StatusCode >= 300 {
+		return fmt.Errorf("webhook: %s", resp.Status)
+	}
+	return nil
+}
 
 func copyClipboard(text string) error {
 	var name string
@@ -982,6 +1271,11 @@ func errOr(healthy bool) error {
 var gitIdentity = git.Identity
 
 func checkWritable(path string) error {
+	// The data dir is created lazily by the first add; doctor (the natural
+	// first command after install) must not fail on a fresh install.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
