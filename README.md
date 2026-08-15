@@ -39,8 +39,10 @@ keep a `config/` dir next to where you run it. Resolution order per file:
 `$STANDUP_CONFIG_DIR` → `./config` → `~/.config/standup` → embedded defaults.
 
 Online mode needs `OPENAI_BASE_URL` (OpenAI-compatible endpoint) and
-`OPENAI_MODEL` (served model name) in the environment or a `.env` (checked in
-the working directory, then the config dirs). Skip both for offline mode (below).
+`OPENAI_MODEL` (served model name) in the environment or a `.env` — looked
+up in the working directory or any parent (like git resolves its config),
+then the config dirs. Only `add` and `generate` use a model; every other
+command runs without credentials. Skip both for offline mode (below).
 
 ## Use
 
@@ -48,17 +50,20 @@ the working directory, then the config dirs). Skip both for offline mode (below)
 standup add "fixed login bug"       # or: standup -a "fixed login bug"
 standup add --raw "verbatim text"   # skip the model, one paragraph = one task
 cat notes.txt | standup add         # piped text becomes tasks
-standup commits [days]              # git commits become tasks (default: last working day)
+standup commits [days] [paths...]   # git commits become done tasks (default: last working day)
 standup list                        # or: standup -l  (arrow keys to navigate, Enter to act)
 standup list --days 5               # trailing N days, oldest first, plain output
 standup list --date 2026-08-10      # one calendar day, plain output
-standup list --tag api              # only tasks containing a #tag token
-standup generate [days]             # or: standup -g  (yesterday + today before meeting time)
+standup list --tag api              # only tasks carrying the literal #api token
+standup generate                    # or: standup -g  (last working day + today before meeting time)
 standup generate 5 -o standup.md    # multi-day report written to a file
+standup generate --from 2026-08-03 --to 2026-08-07   # explicit window, dated headings
+standup generate --clip             # copy the report to the clipboard
 standup status <id> in-progress     # set status: todo, in-progress, blocked, done
 standup done <id>                   # mark done, no model involved
-standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi)
+standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
 standup rm <id>                     # delete, no model involved
+standup doctor                      # check the setup: data file, git identity, endpoint
 standup init                        # write default config files for editing
 ```
 
@@ -66,14 +71,33 @@ Commands that change a task print the resulting row. `<id>` accepts any
 unambiguous id prefix (list output shows the first 8 characters).
 
 Tasks carry a status (`todo`, `in-progress`, `blocked`, `done`). Yesterday's
-unfinished tasks carry over into the Today section, and blocked tasks get a
-`## Blockers` section until resolved. Tags are plain text: a trailing `#word`
-token anywhere in task text.
+unfinished tasks carry over into the Today section; blocked tasks are moved
+to a `## Blockers` section until resolved. Tags are plain text: a trailing
+`#word` token anywhere in task text.
+
+Imported commits are stored with the commit's author date (day attribution
+survives), the full message without its trailer block, and `done` status —
+including commits you only co-authored. Re-running `commits` skips commits
+already imported. Multi-repo: pass extra paths (`standup commits 1 ../api
+../web`).
 
 ## Report language
 
-Add a sentence like `Write the report in <language>.` to `reporter_instructions`
-in your `agent.yaml` (config dir, see Setup) — no rebuild, no flag needed.
+Set `language:` in `config.yaml` (or `STANDUP_LANGUAGE`) — the model
+rephrases task entries in that language. Empty keeps the input language.
+
+## Deterministic reports
+
+The report layout (sections, `[status]`, times) is always rendered by the
+binary; a model only rephrases the task texts. If the model is unreachable
+or answers off-contract, `generate` falls back to the verbatim texts — same
+layout, zero network dependency for the format.
+
+## Agent skills
+
+The repo ships a portable skill at `.agents/skills/standup/SKILL.md`
+(Claude Code reads it through the `.claude/skills/standup` symlink) so
+coding agents can log and report work.
 
 ## Offline mode
 

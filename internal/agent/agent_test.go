@@ -91,34 +91,86 @@ func TestImplAddTasksEditorError(t *testing.T) {
 	assert.ErrorIs(t, err, assert.AnError)
 }
 
-func TestImplGenerateWiring(t *testing.T) {
+func TestImplGenerateRephrasesViaReporter(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
-		reporter: func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "markdown", nil },
-		genTpl:   mustTpl(genTplText),
-		daysTpl:  mustTpl(daysTplText),
+		reporter: func(ctx context.Context, prompt string) (string, error) {
+			gotPrompt = prompt
+			return `{"tasks": ["Fixed login bug", "Ship the release"]}`, nil
+		},
+		instructions: "rephrase",
+		genTpl:       mustTpl(genTplText),
+		daysTpl:      mustTpl(daysTplText),
 	}
 	sec := report.Section{
 		Days: []report.Day{
-			{Heading: "Yesterday"},
-			{Heading: "Today"},
+			{Heading: "Yesterday", Tasks: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}}},
+			{Heading: "Today", Tasks: []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}}},
 		},
 		Yesterday: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}},
 		Today:     []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}},
 	}
 	out, err := a.Generate(context.Background(), sec)
 	require.NoError(t, err)
-	assert.Equal(t, "markdown", out)
-	assert.Contains(t, gotPrompt, "## Yesterday")
-	assert.Contains(t, gotPrompt, "[done] fix login bug (09:15)")
-	assert.Contains(t, gotPrompt, "## Today")
-	assert.Contains(t, gotPrompt, "[done] ship release (08:05)")
+	assert.Contains(t, gotPrompt, "rephrase")
+	assert.Contains(t, gotPrompt, "- fix login bug")
+	assert.Contains(t, gotPrompt, "- ship release")
+	assert.Contains(t, out, "## Yesterday")
+	assert.Contains(t, out, "- [done] Fixed login bug (09:15)", "formatting is deterministic, only phrasing comes from the model")
+	assert.Contains(t, out, "- [done] Ship the release (08:05)")
+	assert.NotContains(t, out, "fix login bug", "original wording replaced")
+}
+
+func TestImplGenerateLanguageInPrompt(t *testing.T) {
+	var gotPrompt string
+	a := &impl{
+		reporter:     func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "no json", nil },
+		instructions: "rephrase",
+		lang:         "German",
+		genTpl:       mustTpl(genTplText),
+		daysTpl:      mustTpl(daysTplText),
+	}
+	sec := report.Section{
+		Days:  []report.Day{{Heading: "Yesterday"}, {Heading: "Today", Tasks: []store.Task{{Text: "x", Status: "todo", Timestamp: time.Now()}}}},
+		Today: []store.Task{{Text: "x", Status: "todo", Timestamp: time.Now()}},
+	}
+	_, err := a.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, gotPrompt, "German")
+}
+
+func TestImplGenerateFallsBackDeterministically(t *testing.T) {
+	tests := []struct {
+		name     string
+		reporter func(ctx context.Context, prompt string) (string, error)
+	}{
+		{"reporter error", func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError }},
+		{"not json", func(ctx context.Context, prompt string) (string, error) { return "sure thing!", nil }},
+		{"count mismatch", func(ctx context.Context, prompt string) (string, error) { return `{"tasks":["only one"]}`, nil }},
+		{"empty entry", func(ctx context.Context, prompt string) (string, error) { return `{"tasks":["fixed","  "]}`, nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &impl{reporter: tt.reporter, genTpl: mustTpl(genTplText), daysTpl: mustTpl(daysTplText)}
+			sec := report.Section{
+				Days: []report.Day{
+					{Heading: "Yesterday", Tasks: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}}},
+					{Heading: "Today", Tasks: []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}}},
+				},
+				Yesterday: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}},
+				Today:     []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}},
+			}
+			out, err := a.Generate(context.Background(), sec)
+			require.NoError(t, err, "fallback keeps generate working")
+			assert.Contains(t, out, "- [done] fix login bug (09:15)")
+			assert.Contains(t, out, "- [done] ship release (08:05)")
+		})
+	}
 }
 
 func TestImplGenerateRangeUsesDaysTemplate(t *testing.T) {
-	var gotPrompt string
 	a := &impl{
-		reporter: func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "markdown", nil },
+		reporter: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
 		genTpl:   mustTpl(genTplText),
 		daysTpl:  mustTpl(daysTplText),
 	}
@@ -129,10 +181,40 @@ func TestImplGenerateRangeUsesDaysTemplate(t *testing.T) {
 	}}
 	out, err := a.Generate(context.Background(), sec)
 	require.NoError(t, err)
-	assert.Equal(t, "markdown", out)
-	assert.Contains(t, gotPrompt, "## Thu 2026-08-13")
-	assert.Contains(t, gotPrompt, "[done] old (09:00)")
-	assert.NotContains(t, gotPrompt, "## Yesterday\n\n## Today\n\n", "two-section template not used for ranges")
+	assert.Contains(t, out, "## Thu 2026-08-13")
+	assert.Contains(t, out, "- [done] old (09:00)")
+	assert.NotContains(t, out, "## Yesterday\n\n## Today\n", "two-section template not used for ranges")
+}
+
+func TestImplGenerateExplicitTwoDayWindowUsesDaysTemplate(t *testing.T) {
+	a := &impl{
+		reporter: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
+		genTpl:   mustTpl(genTplText),
+		daysTpl:  mustTpl(daysTplText),
+	}
+	sec := report.Section{Days: []report.Day{
+		{Heading: "Mon 2026-08-10", Tasks: []store.Task{{Text: "old", Status: "done", Timestamp: time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)}}},
+		{Heading: "Tue 2026-08-11", Tasks: []store.Task{{Text: "new", Status: "done", Timestamp: time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)}}},
+	}}
+	out, err := a.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Contains(t, out, "## Mon 2026-08-10", "no Yesterday/Today aliases: dated headings")
+	assert.Contains(t, out, "## Tue 2026-08-11")
+}
+
+func TestExtractStrings(t *testing.T) {
+	got, err := extractStrings(`{"tasks":["a","b"]}`)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a", "b"}, got)
+
+	got, err = extractStrings("sure:\n```json\n{\"tasks\":[\"x\"]}\n```")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"x"}, got)
+
+	_, err = extractStrings(`{"tasks":[]}`)
+	assert.Error(t, err)
+	_, err = extractStrings("no json")
+	assert.Error(t, err)
 }
 
 func TestLocalAddTasksSplitsParagraphs(t *testing.T) {

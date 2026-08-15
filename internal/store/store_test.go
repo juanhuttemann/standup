@@ -77,6 +77,23 @@ func TestAddListRoundtrip(t *testing.T) {
 	assert.Equal(t, []Task{t1, t2, t3}, got, "ordered by timestamp ascending")
 }
 
+func TestAddAtStampsGivenTime(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	s.Now = fixedClock(time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC))
+
+	at := time.Date(2026, 8, 14, 16, 42, 0, 0, time.UTC)
+	got, err := s.AddAt("imported commit", "done", at)
+	require.NoError(t, err)
+	assert.True(t, got.Timestamp.Equal(at), "explicit timestamp wins over the clock")
+	assert.Equal(t, "done", got.Status)
+
+	_, err = s.AddAt("bad status", "bogus", at)
+	assert.ErrorContains(t, err, "invalid status")
+	_, err = s.AddAt("  ", "done", at)
+	assert.ErrorContains(t, err, "empty task text")
+}
+
 func TestAddEmptyText(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)

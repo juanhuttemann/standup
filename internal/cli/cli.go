@@ -4,9 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,9 +29,13 @@ import (
 var gitLog = git.Log
 
 // Deps carries everything a command needs; it is built lazily so help,
-// version, and init never touch config, store, or provider settings.
+// version, and init never touch config, store, or provider settings. The
+// assistant itself is lazy on top: read-only commands (list, done, rm,
+// status, edit, commits) never require provider credentials.
 type Deps struct {
-	Assist agent.Assistant
+	// Assistant builds the model-backed assistant on first use (add and
+	// generate online; nil for commands that never call a model).
+	Assistant func() (agent.Assistant, error)
 	// Raw is the deterministic assistant used by `add --raw`.
 	Raw    agent.Assistant
 	Store  *store.Store
@@ -111,13 +118,25 @@ func New(load func() (Deps, error)) *cobra.Command {
 		SilenceUsage: true,
 	}
 	genCmd.Flags().StringP("output", "o", "", "write the report to this file")
+	genCmd.Flags().String("from", "", "explicit window start date (YYYY-MM-DD, with --to)")
+	genCmd.Flags().String("to", "", "explicit window end date (YYYY-MM-DD, with --from)")
+	genCmd.Flags().Bool("clip", false, "copy the report to the clipboard")
 
 	commitsCmd := &cobra.Command{
-		Use:   "commits [days]",
-		Args:  cobra.MaximumNArgs(1),
+		Use:   "commits [days] [paths...]",
+		Args:  cobra.ArbitraryArgs,
 		Short: "turn git commits from the last working day (or N days) into tasks",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runCommits(c, d, args) })
+		},
+		SilenceUsage: true,
+	}
+
+	doctorCmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "check the setup: data file, git identity, endpoint",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runDoctor(c, d) })
 		},
 		SilenceUsage: true,
 	}
@@ -175,7 +194,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 		},
 	}
 
-	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd)
+	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd)
 	return root
 }
 
@@ -243,10 +262,25 @@ func runStatus(cmd *cobra.Command, d Deps, args []string) error {
 	return echoTask(cmd, task)
 }
 
+// fallbackEditor is the OS default when $EDITOR is unset: Windows ships
+// notepad, everything else has vi.
+func fallbackEditor() string {
+	if runtime.GOOS == "windows" {
+		return "notepad"
+	}
+	return "vi"
+}
+
+// flat collapses a task text to one row: multi-line entries (commit bodies)
+// must not break the column layout.
+func flat(text string) string {
+	return strings.Join(strings.Fields(text), " ")
+}
+
 // echoTask prints the mutated row so silent mutations never happen.
 func echoTask(cmd *cobra.Command, t store.Task) error {
 	p := newPainter(cmd.OutOrStdout())
-	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), t.Text)
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), flat(t.Text))
 	return err
 }
 
@@ -271,12 +305,13 @@ func statusArg(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// editInEditor opens the user's editor (EDITOR, fallback vi) on a temp file
-// seeded with the current text and returns the saved content.
+// editInEditor opens the user's editor ($EDITOR, fallback vi — notepad on
+// Windows) on a temp file seeded with the current text and returns the saved
+// content.
 func editInEditor(current string) (text string, err error) {
 	editor := os.Getenv("EDITOR")
 	if editor == "" {
-		editor = "vi"
+		editor = fallbackEditor()
 	}
 	f, err := os.CreateTemp("", "standup-*.md")
 	if err != nil {
@@ -358,9 +393,13 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("usage: %s add \"task text\" (or pipe text to %s add)", cmd.Root().Name(), cmd.Root().Name())
 	}
-	a := d.Assist
-	if flagBool(cmd, "raw") {
-		a = d.Raw
+	a := d.Raw
+	if !flagBool(cmd, "raw") {
+		assist, err := d.Assistant()
+		if err != nil {
+			return err
+		}
+		a = assist
 	}
 	var tasks []store.Task
 	var addErr error
@@ -382,32 +421,103 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 }
 
 func runCommits(cmd *cobra.Command, d Deps, args []string) error {
-	days := 0
-	if len(args) == 1 {
-		n, err := strconv.Atoi(args[0])
-		if err != nil || n < 1 {
-			return fmt.Errorf("usage: %s commits [days] (days >= 1)", cmd.Root().Name())
-		}
-		days = n
+	days, paths, err := commitsArgs(cmd, args)
+	if err != nil {
+		return err
 	}
 	now := d.Store.Now()
 	since := report.StartOfDay(report.LastWorkingDay(now))
 	if days > 0 {
 		since = report.StartOfDay(now.AddDate(0, 0, -(days - 1)))
 	}
-	commits, err := gitLog(".", since)
+	commits, err := collectCommits(paths, since)
 	if err != nil {
 		return err
 	}
 	if len(commits) == 0 {
-		_, err := fmt.Fprintln(cmd.OutOrStdout(), "no commits found")
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "no commits found since %s — check that `git config user.email` matches your commit identity\n", since.Format("2006-01-02"))
 		return err
 	}
-	subjects := make([]string, len(commits))
-	for i, c := range commits {
-		subjects[i] = c.Subject
+	return importCommits(cmd, d.Store, commits)
+}
+
+// commitsArgs splits [days] [paths...]; days is optional, paths default to
+// the current directory.
+func commitsArgs(cmd *cobra.Command, args []string) (int, []string, error) {
+	rest := args
+	days := 0
+	if len(rest) > 0 {
+		if n, err := strconv.Atoi(rest[0]); err == nil {
+			if n < 1 {
+				return 0, nil, fmt.Errorf("usage: %s commits [days] [paths...] (days >= 1)", cmd.Root().Name())
+			}
+			days = n
+			rest = rest[1:]
+		}
 	}
-	return runAdd(cmd, d, []string{strings.Join(subjects, "\n\n")})
+	if len(rest) == 0 {
+		return days, []string{"."}, nil
+	}
+	for _, p := range rest {
+		if fi, err := os.Stat(p); err != nil || !fi.IsDir() {
+			return 0, nil, fmt.Errorf("usage: %s commits [days] [paths...] (no such directory: %q)", cmd.Root().Name(), p)
+		}
+	}
+	return days, rest, nil
+}
+
+// collectCommits gathers commits from every repo, deduped by hash and
+// ordered oldest first across repos.
+func collectCommits(paths []string, since time.Time) ([]git.Commit, error) {
+	seen := map[string]bool{}
+	var commits []git.Commit
+	for _, p := range paths {
+		cs, err := gitLog(p, since)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cs {
+			if c.Hash != "" && seen[c.Hash] {
+				continue
+			}
+			seen[c.Hash] = true
+			commits = append(commits, c)
+		}
+	}
+	sort.SliceStable(commits, func(i, j int) bool { return commits[i].When.Before(commits[j].When) })
+	return commits, nil
+}
+
+// importCommits stores commits as done tasks stamped with the commit time;
+// commits already imported (same text, same day) are skipped.
+func importCommits(cmd *cobra.Command, st *store.Store, commits []git.Commit) error {
+	existing, err := st.List()
+	if err != nil {
+		return err
+	}
+	known := map[string]bool{}
+	for _, t := range existing {
+		known[t.Text+"|"+t.Timestamp.Format("2006-01-02")] = true
+	}
+	skipped := 0
+	for _, c := range commits {
+		if known[c.Body+"|"+c.When.Format("2006-01-02")] {
+			skipped++
+			continue
+		}
+		t, err := st.AddAt(c.Body, "done", c.When)
+		if err != nil {
+			return err
+		}
+		if err := echoTask(cmd, t); err != nil {
+			return err
+		}
+	}
+	if skipped > 0 {
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "- skipped %d already imported\n", skipped)
+		return err
+	}
+	return nil
 }
 
 var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -520,23 +630,28 @@ func runList(cmd *cobra.Command, d Deps) error {
 	}
 	p := newPainter(cmd.OutOrStdout())
 	for _, t := range tasks {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(shortID(t.ID)), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), t.Text); err != nil {
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(shortID(t.ID)), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), flat(t.Text)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// filterTag keeps tasks whose text contains the token, case-insensitively.
+// filterTag keeps tasks carrying the literal #tag token (case-insensitive),
+// with or without the leading # in the query; plain words never match.
 func filterTag(tasks []store.Task, tag string) []store.Task {
 	if tag == "" {
 		return tasks
 	}
-	want := strings.ToLower(tag)
+	want := strings.TrimPrefix(strings.ToLower(tag), "#")
 	var out []store.Task
 	for _, t := range tasks {
-		if strings.Contains(strings.ToLower(t.Text), want) {
-			out = append(out, t)
+		for _, f := range strings.Fields(t.Text) {
+			f = strings.TrimRight(strings.TrimPrefix(f, "#"), ".,;:!?")
+			if f != "" && strings.EqualFold(f, want) {
+				out = append(out, t)
+				break
+			}
 		}
 	}
 	return out
@@ -561,7 +676,7 @@ func taskEntries(st *store.Store, tag string, p painter) ([]taskEntry, error) {
 	}
 	entries := make([]taskEntry, 0, len(tasks))
 	for _, t := range filterTag(tasks, tag) {
-		entries = append(entries, taskEntry{task: t, label: fmt.Sprintf("%s [%s] %s %s", p.quiet(t.Timestamp.Format("15:04")), p.status(t.Status), p.quiet(shortID(t.ID)), t.Text)})
+		entries = append(entries, taskEntry{task: t, label: fmt.Sprintf("%s [%s] %s %s", p.quiet(t.Timestamp.Format("15:04")), p.status(t.Status), p.quiet(shortID(t.ID)), flat(t.Text))})
 	}
 	return entries, nil
 }
@@ -619,19 +734,15 @@ func selectLoop(st *store.Store, tag string, p painter) error {
 }
 
 func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
-	days := 2
-	if len(args) == 1 {
-		n, err := strconv.Atoi(args[0])
-		if err != nil || n < 1 {
-			return fmt.Errorf("usage: %s generate [days] (days >= 1)", cmd.Root().Name())
-		}
-		days = n
+	dates, err := generateDates(cmd, args, d.Store.Now())
+	if err != nil {
+		return err
 	}
 	tasks, err := d.Store.List()
 	if err != nil {
 		return err
 	}
-	sec, err := report.Build(tasks, d.Store.Now(), d.Config.MeetingTime, days)
+	sec, err := report.Build(tasks, d.Store.Now(), d.Config.MeetingTime, dates)
 	if err != nil {
 		return err
 	}
@@ -643,10 +754,14 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "nothing to report")
 		return err
 	}
+	assist, err := d.Assistant()
+	if err != nil {
+		return err
+	}
 	var out string
 	var genErr error
 	if err := spin("generating standup", func() error {
-		out, genErr = d.Assist.Generate(cmd.Context(), sec)
+		out, genErr = assist.Generate(cmd.Context(), sec)
 		return nil
 	}); err != nil {
 		return err
@@ -654,9 +769,163 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	if genErr != nil {
 		return genErr
 	}
+	if flagBool(cmd, "clip") {
+		if err := copyToClipboard(out); err != nil {
+			return err
+		}
+	}
 	if path := flagString(cmd, "output"); path != "" {
 		return os.WriteFile(filepath.Clean(path), []byte(out+"\n"), 0o644)
 	}
 	_, err = fmt.Fprintln(cmd.OutOrStdout(), out)
 	return err
+}
+
+// generateDates resolves the report window: explicit --from/--to dates, the
+// weekend-aware default (last working day + today), or trailing N days.
+func generateDates(cmd *cobra.Command, args []string, now time.Time) ([]time.Time, error) {
+	from, to := flagString(cmd, "from"), flagString(cmd, "to")
+	if from != "" || to != "" {
+		if from == "" || to == "" {
+			return nil, fmt.Errorf("usage: %s generate --from and --to are both required (YYYY-MM-DD)", cmd.Root().Name())
+		}
+		if len(args) > 0 {
+			return nil, fmt.Errorf("usage: %s generate: [days] and --from/--to are mutually exclusive", cmd.Root().Name())
+		}
+		f, err := time.ParseInLocation("2006-01-02", from, now.Location())
+		if err != nil {
+			return nil, fmt.Errorf("usage: %s generate --from YYYY-MM-DD (got %q)", cmd.Root().Name(), from)
+		}
+		t, err := time.ParseInLocation("2006-01-02", to, now.Location())
+		if err != nil {
+			return nil, fmt.Errorf("usage: %s generate --to YYYY-MM-DD (got %q)", cmd.Root().Name(), to)
+		}
+		if t.Before(f) {
+			return nil, fmt.Errorf("usage: %s generate: --to must not be before --from", cmd.Root().Name())
+		}
+		var dates []time.Time
+		for d := report.StartOfDay(f); !d.After(report.StartOfDay(t)); d = d.AddDate(0, 0, 1) {
+			dates = append(dates, d)
+		}
+		return dates, nil
+	}
+	days := 2
+	if len(args) == 1 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("usage: %s generate [days] (days >= 1)", cmd.Root().Name())
+		}
+		days = n
+	}
+	if days == 2 {
+		return report.DefaultWindow(now), nil
+	}
+	return report.Trailing(now, days), nil
+}
+
+// copyToClipboard is swappable so tests never need a real clipboard.
+var copyToClipboard = copyClipboard
+
+func copyClipboard(text string) error {
+	var name string
+	var args []string
+	switch runtime.GOOS {
+	case "windows":
+		name = "clip"
+	case "darwin":
+		name = "pbcopy"
+	default:
+		for _, c := range []string{"wl-copy", "xclip", "xsel"} {
+			if _, err := exec.LookPath(c); err == nil {
+				name = c
+				break
+			}
+		}
+		if name == "" {
+			return errors.New("no clipboard command found (install xclip or wl-clipboard)")
+		}
+		if name == "xclip" {
+			args = []string{"-selection", "clipboard"}
+		}
+	}
+	c := exec.Command(name, args...)
+	c.Stdin = strings.NewReader(text)
+	if out, err := c.CombinedOutput(); err != nil {
+		return fmt.Errorf("clipboard %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func runDoctor(cmd *cobra.Command, d Deps) error {
+	out := cmd.OutOrStdout()
+	healthy := true
+	var werr error
+	report := func(format string, a ...any) {
+		if _, err := fmt.Fprintf(out, format, a...); err != nil && werr == nil {
+			werr = err
+		}
+	}
+	check := func(name string, err error) {
+		if err != nil {
+			healthy = false
+			report("fail %s: %v\n", name, err)
+			return
+		}
+		report("ok   %s\n", name)
+	}
+	check("data file writable", checkWritable(d.Config.DataFile))
+	if email, err := gitIdentity("."); err != nil {
+		check("git identity", err)
+	} else {
+		report("ok   git identity (%s)\n", email)
+	}
+	if d.Config.Offline {
+		report("ok   offline mode — endpoint checks skipped\n")
+		if werr != nil {
+			return werr
+		}
+		return errOr(healthy)
+	}
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
+		if os.Getenv(key) == "" {
+			check("env "+key, fmt.Errorf("not set (required for add/generate, or set offline: true)"))
+		} else {
+			report("ok   env %s\n", key)
+		}
+	}
+	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
+		check("endpoint reachable", reachable(base))
+	}
+	if werr != nil {
+		return werr
+	}
+	return errOr(healthy)
+}
+
+func errOr(healthy bool) error {
+	if !healthy {
+		return errors.New("doctor: problems found")
+	}
+	return nil
+}
+
+// gitIdentity is swappable so CLI tests never depend on a real repo.
+var gitIdentity = git.Identity
+
+func checkWritable(path string) error {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// reachable reports whether the endpoint answers at all (any HTTP status).
+var reachable = func(base string) error {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(base)
+	if err != nil {
+		return fmt.Errorf("%w (check OPENAI_BASE_URL and network)", err)
+	}
+	return resp.Body.Close()
 }

@@ -85,6 +85,12 @@ func (s *Store) Add(text string) (Task, error) {
 // AddWithStatus adds a task with an explicit status; an empty status defaults
 // to todo. Status is validated at this boundary.
 func (s *Store) AddWithStatus(text, status string) (Task, error) {
+	return s.AddAt(text, status, s.now())
+}
+
+// AddAt adds a task with an explicit status and timestamp (imports stamp the
+// event time, not the import time).
+func (s *Store) AddAt(text, status string, ts time.Time) (Task, error) {
 	if status == "" {
 		status = "todo"
 	}
@@ -94,7 +100,7 @@ func (s *Store) AddWithStatus(text, status string) (Task, error) {
 	if strings.TrimSpace(text) == "" {
 		return Task{}, errors.New("store: empty task text")
 	}
-	t := Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: s.now()}
+	t := Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: ts}
 	tasks, err := s.load()
 	if err != nil {
 		return Task{}, err

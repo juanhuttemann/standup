@@ -65,7 +65,7 @@ func unsetenv(t *testing.T, keys ...string) {
 func cleanStandupEnv(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		for _, k := range []string{"STANDUP_MEETING_TIME", "STANDUP_DATA_FILE", "STANDUP_OFFLINE"} {
+		for _, k := range []string{"STANDUP_MEETING_TIME", "STANDUP_DATA_FILE", "STANDUP_OFFLINE", "STANDUP_LANGUAGE"} {
 			if err := os.Unsetenv(k); err != nil {
 				t.Errorf("unset %s: %v", k, err)
 			}
@@ -216,6 +216,42 @@ func TestCwdDotEnvWinsOverConfigDirDotEnv(t *testing.T) {
 	cfg, err := Load()
 	require.NoError(t, err)
 	assert.Equal(t, "19:00", cfg.MeetingTime, "cwd .env wins over the config dir's")
+}
+
+func TestDotEnvFoundInParentDir(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	root := t.TempDir()
+	write(t, filepath.Join(root, ".env"), "STANDUP_MEETING_TIME=18:45\n")
+	write(t, filepath.Join(root, "config", "config.yaml"), "")
+	write(t, filepath.Join(root, "config", "agent.yaml"), agentYAML)
+	sub := filepath.Join(root, "web", "src", "deep")
+	require.NoError(t, os.MkdirAll(sub, 0o755))
+	t.Chdir(sub)
+	t.Setenv("STANDUP_CONFIG_DIR", filepath.Join(root, "config"))
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "18:45", cfg.MeetingTime, ".env found by walking up to the project root")
+}
+
+func TestLanguageKey(t *testing.T) {
+	isolateDirs(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "language: de\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "de", cfg.Language)
+
+	t.Setenv("STANDUP_LANGUAGE", "fr")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "fr", cfg.Language, "STANDUP_LANGUAGE overrides the yaml")
+
+	cleanStandupEnv(t)
 }
 
 func TestMissingPromptKey(t *testing.T) {

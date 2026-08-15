@@ -5,8 +5,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -56,7 +59,7 @@ func newHarness(t *testing.T, ass *fakeAss) (*store.Store, *cobra.Command, *byte
 	require.NoError(t, err)
 	buf := &bytes.Buffer{}
 	root := New(func() (Deps, error) {
-		return Deps{Assist: ass, Raw: ass, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
+		return Deps{Assistant: func() (agent.Assistant, error) { return ass, nil }, Raw: ass, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
 	})
 	root.SetOut(buf)
 	root.SetErr(buf)
@@ -504,6 +507,46 @@ func TestListTagNoMatch(t *testing.T) {
 	assert.Contains(t, buf.String(), "no tasks", "tag-less tasks never match")
 }
 
+func TestListTagMatchesLiteralTokenOnly(t *testing.T) {
+	pipeStdin(t, "")
+	st, root, buf := newHarness(t, &fakeAss{})
+	st.Now = today(8, 0)
+	_, err := st.Add("Fixed login bug #auth")
+	require.NoError(t, err)
+	_, err = st.Add("Call the API about caching")
+	require.NoError(t, err)
+	_, err = st.Add("Patched the endpoint #fix, among others")
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"list", "--tag", "fix"})
+	require.NoError(t, root.Execute())
+	out := buf.String()
+	assert.NotContains(t, out, "#auth", "substring of another tag never matches")
+	assert.NotContains(t, out, "Call the API", "plain words never match without a #token")
+	assert.Contains(t, out, "#fix", "literal #token matches, trailing punctuation tolerated")
+}
+
+func TestListFlattensMultilineTasks(t *testing.T) {
+	pipeStdin(t, "")
+	st, root, buf := newHarness(t, &fakeAss{})
+	st.Now = today(8, 0)
+	_, err := st.AddWithStatus("fix login bug\n\nThe token was expired.", "done")
+	require.NoError(t, err)
+	root.SetArgs([]string{"list"})
+	require.NoError(t, root.Execute())
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	require.Len(t, lines, 1, "multi-line task renders as one row")
+	assert.Contains(t, lines[0], "fix login bug The token was expired.")
+}
+
+func TestFallbackEditor(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		assert.Equal(t, "notepad", fallbackEditor())
+		return
+	}
+	assert.Equal(t, "vi", fallbackEditor())
+}
+
 func TestGenerateDaysArg(t *testing.T) {
 	ass := &fakeAss{genOut: "## Today"}
 	st, root, _ := newHarness(t, ass)
@@ -585,6 +628,159 @@ func TestGenerateOutputFileTruncates(t *testing.T) {
 	assert.Equal(t, "short\n", string(b))
 }
 
+func TestGenerateFromToWindow(t *testing.T) {
+	ass := &fakeAss{genOut: "x"}
+	st, root, _ := newHarness(t, ass)
+	seedDays(t, st)
+	st.Now = today(9, 0)
+	root.SetArgs([]string{"generate", "--from", "2026-08-13", "--to", "2026-08-14"})
+	require.NoError(t, root.Execute())
+	require.Len(t, ass.genSec.Days, 2)
+	assert.Equal(t, []string{"Thu 2026-08-13", "Fri 2026-08-14"},
+		[]string{ass.genSec.Days[0].Heading, ass.genSec.Days[1].Heading},
+		"explicit historical windows get dated headings, no cutoff")
+	assert.Nil(t, ass.genSec.Yesterday)
+}
+
+func TestGenerateFromToUsage(t *testing.T) {
+	for _, args := range [][]string{
+		{"generate", "--from", "2026-08-13"},
+		{"generate", "--to", "2026-08-14"},
+		{"generate", "--from", "bogus", "--to", "2026-08-14"},
+		{"generate", "--from", "2026-08-14", "--to", "2026-08-13"},
+		{"generate", "3", "--from", "2026-08-13", "--to", "2026-08-14"},
+	} {
+		_, root, _ := newHarness(t, &fakeAss{})
+		root.SetArgs(args)
+		err := root.Execute()
+		require.Error(t, err, "args %v must fail", args)
+		assert.Contains(t, err.Error(), "usage")
+	}
+}
+
+func TestGenerateWeekendAwareDefault(t *testing.T) {
+	ass := &fakeAss{genOut: "x"}
+	st, root, _ := newHarness(t, ass)
+	// Saturday 2026-08-15: the default window is Friday + Saturday.
+	st.Now = func() time.Time { return time.Date(2026, 8, 15, 9, 0, 0, 0, time.Local) }
+	_, err := st.AddWithStatus("friday work", "done")
+	require.NoError(t, err)
+	st.Now = func() time.Time { return time.Date(2026, 8, 15, 8, 0, 0, 0, time.Local) }
+	// seed a friday task by stamping it directly
+	_, err = st.AddAt("friday task", "done", time.Date(2026, 8, 14, 16, 0, 0, 0, time.Local))
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate"})
+	require.NoError(t, root.Execute())
+	require.Len(t, ass.genSec.Days, 2, "Friday + today")
+	assert.Equal(t, []string{"friday task"}, taskTextsOf(ass.genSec.Yesterday))
+}
+
+func taskTextsOf(ts []store.Task) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = t.Text
+	}
+	return out
+}
+
+func TestGenerateClip(t *testing.T) {
+	ass := &fakeAss{genOut: "## Today\n- did stuff"}
+	st, root, _ := newHarness(t, ass)
+	st.Now = today(8, 0)
+	_, err := st.Add("fix bug")
+	require.NoError(t, err)
+	var got string
+	old := copyToClipboard
+	copyToClipboard = func(text string) error { got = text; return nil }
+	t.Cleanup(func() { copyToClipboard = old })
+	root.SetArgs([]string{"generate", "--clip"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "## Today\n- did stuff", got)
+}
+
+func TestGenerateClipError(t *testing.T) {
+	ass := &fakeAss{genOut: "x"}
+	st, root, _ := newHarness(t, ass)
+	st.Now = today(8, 0)
+	_, err := st.Add("fix bug")
+	require.NoError(t, err)
+	old := copyToClipboard
+	copyToClipboard = func(text string) error { return errors.New("no clipboard") }
+	t.Cleanup(func() { copyToClipboard = old })
+	root.SetArgs([]string{"generate", "--clip"})
+	assert.Error(t, root.Execute(), "clipboard failure surfaces")
+}
+
+func TestDoctorChecks(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(srv.Close)
+	srv.Close() // unreachable variant below uses the closed URL
+
+	good := t.TempDir()
+	assert.NoError(t, checkWritable(filepath.Join(good, "tasks.jsonl")))
+	assert.Error(t, checkWritable(filepath.Join(good, "no-such-dir", "tasks.jsonl")))
+
+	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	t.Cleanup(live.Close)
+	assert.NoError(t, reachable(live.URL))
+	assert.Error(t, reachable(srv.URL), "closed endpoint is unreachable")
+}
+
+func TestDoctorOfflineSkipsEndpoint(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	st.Now = today(8, 0)
+	oldIdent := gitIdentity
+	gitIdentity = func(dir string) (string, error) { return "me@example.com", nil }
+	t.Cleanup(func() { gitIdentity = oldIdent })
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_MODEL", "")
+
+	ass := &fakeAss{}
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return ass, nil },
+			Raw:       ass,
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", Offline: true, DataFile: st.Path},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"doctor"})
+	require.NoError(t, root.Execute(), "offline doctor never requires endpoint env")
+	assert.Contains(t, buf.String(), "offline mode")
+	assert.Contains(t, buf.String(), "ok   data file writable")
+	assert.Contains(t, buf.String(), "ok   git identity (me@example.com)")
+}
+
+func TestDoctorFailsOnMissingEnv(t *testing.T) {
+	pipeStdin(t, "")
+	st, _, _ := newHarness(t, &fakeAss{})
+	st.Now = today(8, 0)
+	oldIdent := gitIdentity
+	gitIdentity = func(dir string) (string, error) { return "me@example.com", nil }
+	t.Cleanup(func() { gitIdentity = oldIdent })
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENAI_MODEL", "")
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return &fakeAss{}, nil },
+			Raw:       &fakeAss{},
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", DataFile: filepath.Join(t.TempDir(), "tasks.jsonl")},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"doctor"})
+	err := root.Execute()
+	require.Error(t, err, "missing provider env is a failure in online mode")
+	assert.Contains(t, buf.String(), "fail env OPENAI_BASE_URL")
+}
+
 func TestGenerateOutputFileUnwritable(t *testing.T) {
 	ass := &fakeAss{genOut: "x"}
 	st, root, _ := newHarness(t, ass)
@@ -608,31 +804,79 @@ func TestGenerateBlockedSection(t *testing.T) {
 	assert.Equal(t, blocked.ID, ass.genSec.Blockers[0].ID)
 }
 
-func TestCommits(t *testing.T) {
-	ass := &fakeAss{addResult: []store.Task{{ID: "1", Text: "fix login bug"}}}
+func TestCommitsStampsCommitTime(t *testing.T) {
+	ass := &fakeAss{}
 	st, root, buf := newHarness(t, ass)
 	st.Now = today(9, 0)
+	fri := time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
 		assert.Equal(t, ".", dir)
 		assert.True(t, since.Equal(time.Date(2026, 8, 14, 0, 0, 0, 0, time.Local)), "default lookback: last working day")
 		return []git.Commit{
-			{Subject: "fix login bug", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)},
-			{Subject: "write tests", When: time.Date(2026, 8, 14, 16, 0, 0, 0, time.Local)},
+			{Hash: "h1", Subject: "fix login bug", Body: "fix login bug", When: fri},
+			{Hash: "h2", Subject: "write tests", Body: "write tests", When: time.Date(2026, 8, 14, 16, 0, 0, 0, time.Local)},
 		}, nil
 	}
 	t.Cleanup(func() { gitLog = old })
 	root.SetArgs([]string{"commits"})
 	require.NoError(t, root.Execute())
-	require.Len(t, ass.added, 1)
-	assert.Equal(t, "fix login bug\n\nwrite tests", ass.added[0], "blank-line separated so offline mode splits them")
-	assert.Contains(t, buf.String(), "fix login bug")
+
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	assert.True(t, tasks[0].Timestamp.Equal(fri), "task timestamp is the commit time, not the import time")
+	assert.Equal(t, "done", tasks[0].Status, "shipped commits land as done")
+	assert.Equal(t, "fix login bug", tasks[0].Text)
+	assert.Contains(t, buf.String(), "- [done] fix login bug")
+	assert.Empty(t, ass.added, "commit ingestion is deterministic — no model involved")
+}
+
+func TestCommitsMultiRepoDedupesAndSorts(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAss{})
+	dirs := []string{t.TempDir(), t.TempDir()}
+	for _, d := range dirs {
+		require.NoError(t, os.MkdirAll(d, 0o755))
+	}
+	old := gitLog
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		switch dir {
+		case dirs[0]:
+			return []git.Commit{{Hash: "b", Body: "later", When: time.Date(2026, 8, 14, 16, 0, 0, 0, time.Local)}}, nil
+		default:
+			return []git.Commit{{Hash: "a", Body: "earlier", When: time.Date(2026, 8, 14, 9, 0, 0, 0, time.Local)}}, nil
+		}
+	}
+	t.Cleanup(func() { gitLog = old })
+	root.SetArgs([]string{"commits", dirs[0], dirs[1]})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	assert.Equal(t, "earlier", tasks[0].Text, "commits ordered by time across repos")
+}
+
+func TestCommitsSkipsAlreadyImported(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAss{})
+	st.Now = today(9, 0)
+	when := time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)
+	_, err := st.AddAt("fix login bug", "done", when)
+	require.NoError(t, err)
+	old := gitLog
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
+		return []git.Commit{{Hash: "h1", Body: "fix login bug", When: when}}, nil
+	}
+	t.Cleanup(func() { gitLog = old })
+	root.SetArgs([]string{"commits"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 1, "re-running commits never duplicates tasks")
+	assert.Contains(t, buf.String(), "skipped 1 already imported")
 }
 
 func TestCommitsDaysArg(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, _ := newHarness(t, ass)
-	st.Now = today(9, 0)
+	_, root, _ := newHarness(t, &fakeAss{})
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
 		assert.True(t, since.Equal(time.Date(2026, 8, 13, 0, 0, 0, 0, time.Local)), "3 days: since start of two days ago")
@@ -651,17 +895,15 @@ func TestCommitsBadArg(t *testing.T) {
 	assert.Contains(t, err.Error(), "usage")
 }
 
-func TestCommitsEmpty(t *testing.T) {
-	ass := &fakeAss{}
-	st, root, buf := newHarness(t, ass)
-	st.Now = today(9, 0)
+func TestCommitsEmptyHintsAtIdentity(t *testing.T) {
+	_, root, buf := newHarness(t, &fakeAss{})
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) { return nil, nil }
 	t.Cleanup(func() { gitLog = old })
 	root.SetArgs([]string{"commits"})
 	require.NoError(t, root.Execute())
-	assert.Contains(t, buf.String(), "no commits found")
-	assert.Empty(t, ass.added)
+	assert.Contains(t, buf.String(), "no commits found since")
+	assert.Contains(t, buf.String(), "user.email", "zero-match hint names the likely cause")
 }
 
 func TestEditArg(t *testing.T) {
@@ -841,7 +1083,7 @@ func TestAddRawBypassesModel(t *testing.T) {
 	require.NoError(t, err)
 	buf := &bytes.Buffer{}
 	root := New(func() (Deps, error) {
-		return Deps{Assist: model, Raw: raw, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
+		return Deps{Assistant: func() (agent.Assistant, error) { return model, nil }, Raw: raw, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
 	})
 	root.SetOut(buf)
 	root.SetErr(buf)
@@ -854,6 +1096,59 @@ func TestAddRawBypassesModel(t *testing.T) {
 	require.Len(t, tasks, 2)
 	assert.Equal(t, "verbatim one", tasks[0].Text, "text stored verbatim, paragraph-split")
 	assert.Equal(t, "verbatim two", tasks[1].Text)
+}
+
+func TestReadOnlyCommandsSkipAssistant(t *testing.T) {
+	old := gitLog
+	gitLog = func(dir string, since time.Time) ([]git.Commit, error) { return nil, nil }
+	t.Cleanup(func() { gitLog = old })
+
+	for name, args := range map[string][]string{
+		"list":    {"list"},
+		"done":    {"done", "%s"},
+		"rm":      {"rm", "%s"},
+		"status":  {"status", "%s", "done"},
+		"edit":    {"edit", "%s", "new text"},
+		"commits": {"commits"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pipeStdin(t, "")
+			called := false
+			st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+			require.NoError(t, err)
+			st.Now = today(8, 0)
+			added, err := st.Add("some task")
+			require.NoError(t, err)
+			buf := &bytes.Buffer{}
+			root := New(func() (Deps, error) {
+				return Deps{
+					Assistant: func() (agent.Assistant, error) {
+						called = true
+						return nil, errors.New("credentials must not be required here")
+					},
+					Raw:    &fakeAss{},
+					Store:  st,
+					Config: config.Config{MeetingTime: "09:30"},
+				}, nil
+			})
+			root.SetOut(buf)
+			root.SetErr(buf)
+			var final []string
+			for _, a := range args {
+				final = append(final, strings.ReplaceAll(a, "%s", added.ID))
+			}
+			root.SetArgs(final)
+			require.NoError(t, root.Execute(), "%s must not need credentials", name)
+			assert.False(t, called)
+		})
+	}
+}
+
+func TestAddUsesAssistant(t *testing.T) {
+	pipeStdin(t, "")
+	_, root, _ := newHarness(t, &fakeAss{addResult: []store.Task{{ID: "1", Text: "cleaned"}}})
+	root.SetArgs([]string{"add", "raw text"})
+	require.NoError(t, root.Execute())
 }
 
 func TestHelpAndVersionNeverLoadConfig(t *testing.T) {

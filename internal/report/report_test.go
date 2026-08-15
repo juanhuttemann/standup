@@ -97,7 +97,7 @@ func TestBuild(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sec, err := Build(tt.tasks, tt.now, "09:30", 2)
+			sec, err := Build(tt.tasks, tt.now, "09:30", Trailing(tt.now, 2))
 			require.NoError(t, err)
 			assert.Equal(t, tt.yesterdayID, ids(sec.Yesterday))
 			assert.Equal(t, tt.todayID, ids(sec.Today))
@@ -115,28 +115,28 @@ func TestBuildCarryOver(t *testing.T) {
 	today1 := task(time.Date(2026, 8, 15, 8, 0, 0, 0, loc), "todo")
 	today2 := task(time.Date(2026, 8, 15, 9, 0, 0, 0, loc), "todo")
 
-	sec, err := Build([]store.Task{today2, unfinished, today1, finished, blocked}, now, "09:30", 2)
+	sec, err := Build([]store.Task{today2, unfinished, today1, finished, blocked}, now, "09:30", Trailing(now, 2))
 	require.NoError(t, err)
 
 	// Today keeps its own order ahead of carried tasks; only unfinished ones carry.
-	assert.Equal(t, []string{today1.ID, today2.ID, unfinished.ID, blocked.ID}, ids(sec.Today))
-	// Done yesterday tasks stay in Yesterday only; carried ones stay listed there too.
-	assert.Equal(t, []string{unfinished.ID, finished.ID, blocked.ID}, ids(sec.Yesterday))
-	// Blockers lists blocked tasks from covered days, once each.
-	assert.Equal(t, []string{blocked.ID}, ids(sec.Blockers))
+	assert.Equal(t, []string{today1.ID, today2.ID, unfinished.ID}, ids(sec.Today))
+	assert.Equal(t, []string{unfinished.ID, finished.ID}, ids(sec.Yesterday), "blocked task moved out of Yesterday")
+	assert.Empty(t, sec.Blockers[1:], "blockers listed once")
+	assert.Equal(t, []string{blocked.ID}, ids(sec.Blockers), "blocked task lives in Blockers only")
 }
 
 func TestBuildCarryOverBlockedUntilResolved(t *testing.T) {
 	now := d(9, 0, 0)
 	blocked := task(time.Date(2026, 8, 14, 16, 0, 0, 0, loc), "blocked")
-	sec, err := Build([]store.Task{blocked}, now, "09:30", 2)
+	sec, err := Build([]store.Task{blocked}, now, "09:30", Trailing(now, 2))
 	require.NoError(t, err)
 	assert.Equal(t, []string{blocked.ID}, ids(sec.Blockers), "blocked task still reported next day")
-	assert.Equal(t, []string{blocked.ID}, ids(sec.Today), "blocked task carried to today")
+	assert.Empty(t, sec.Today, "blocked task is not duplicated into day sections")
+	assert.Empty(t, sec.Yesterday)
 
 	resolved := blocked
 	resolved.Status = "done"
-	sec, err = Build([]store.Task{resolved}, now, "09:30", 2)
+	sec, err = Build([]store.Task{resolved}, now, "09:30", Trailing(now, 2))
 	require.NoError(t, err)
 	assert.Empty(t, sec.Blockers, "resolved blocker disappears from blockers")
 	assert.Empty(t, sec.Today, "done yesterday task does not carry")
@@ -150,7 +150,7 @@ func TestBuildRange(t *testing.T) {
 	afterCutoff := task(time.Date(2026, 8, 15, 9, 45, 0, 0, loc), "todo")
 	outside := task(time.Date(2026, 8, 12, 10, 0, 0, 0, loc), "done")
 
-	sec, err := Build([]store.Task{afterCutoff, outside, older, beforeCutoff, old}, now, "09:30", 3)
+	sec, err := Build([]store.Task{afterCutoff, outside, older, beforeCutoff, old}, now, "09:30", Trailing(now, 3))
 	require.NoError(t, err)
 
 	require.Len(t, sec.Days, 3, "one section per day")
@@ -158,7 +158,7 @@ func TestBuildRange(t *testing.T) {
 	assert.Equal(t, []string{older.ID}, ids(sec.Days[0].Tasks))
 	assert.Equal(t, []string{old.ID}, ids(sec.Days[1].Tasks))
 	assert.Equal(t, []string{beforeCutoff.ID}, ids(sec.Days[2].Tasks), "cutoff still trims today only")
-	assert.Nil(t, sec.Yesterday, "compat fields only set for the two-day default")
+	assert.Nil(t, sec.Yesterday, "compat fields only set for the default window")
 	assert.Nil(t, sec.Today)
 }
 
@@ -166,21 +166,83 @@ func TestBuildRangeSingleDay(t *testing.T) {
 	now := d(10, 0, 0)
 	t1 := task(time.Date(2026, 8, 15, 8, 0, 0, 0, loc), "todo")
 	y1 := task(time.Date(2026, 8, 14, 8, 0, 0, 0, loc), "in-progress")
-	sec, err := Build([]store.Task{t1, y1}, now, "09:30", 1)
+	sec, err := Build([]store.Task{t1, y1}, now, "09:30", Trailing(now, 1))
 	require.NoError(t, err)
 	require.Len(t, sec.Days, 1)
 	assert.Equal(t, []string{"Today"}, headings(sec))
 	assert.Equal(t, []string{t1.ID}, ids(sec.Days[0].Tasks), "single day covers today only, no carry")
 }
 
+func TestBuildWeekendDefaultWindow(t *testing.T) {
+	now := time.Date(2026, 8, 17, 9, 0, 0, 0, loc) // Monday
+	fri := task(time.Date(2026, 8, 14, 16, 0, 0, 0, loc), "done")
+	sat := task(time.Date(2026, 8, 15, 11, 0, 0, 0, loc), "done")
+	mon := task(time.Date(2026, 8, 17, 8, 0, 0, 0, loc), "todo")
+
+	sec, err := Build([]store.Task{sat, fri, mon}, now, "09:30", DefaultWindow(now))
+	require.NoError(t, err)
+	require.Len(t, sec.Days, 2, "Friday + Monday, weekend skipped")
+	assert.Equal(t, []string{fri.ID}, ids(sec.Yesterday), "Friday is Monday's yesterday")
+	assert.Equal(t, []string{mon.ID}, ids(sec.Today))
+	assert.Equal(t, []string{fri.ID}, ids(sec.Days[0].Tasks))
+	assert.Equal(t, []string{mon.ID}, ids(sec.Days[1].Tasks))
+}
+
+func TestBuildExplicitWindowKeepsDatedHeadings(t *testing.T) {
+	now := d(9, 0, 0)
+	a := task(time.Date(2026, 8, 10, 10, 0, 0, 0, loc), "done")
+	b := task(time.Date(2026, 8, 11, 10, 0, 0, 0, loc), "done")
+
+	sec, err := Build([]store.Task{a, b}, now, "09:30", []time.Time{
+		StartOfDay(time.Date(2026, 8, 10, 0, 0, 0, 0, loc)),
+		StartOfDay(time.Date(2026, 8, 11, 0, 0, 0, 0, loc)),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Mon 2026-08-10", "Tue 2026-08-11"}, headings(sec),
+		"historical windows get dated headings, not Yesterday/Today")
+	assert.Nil(t, sec.Yesterday)
+	assert.Nil(t, sec.Today)
+	assert.Equal(t, []string{b.ID}, ids(sec.Days[1].Tasks), "no cutoff on historical days")
+}
+
 func TestBuildBadInputs(t *testing.T) {
-	for _, days := range []int{0, -1} {
-		_, err := Build(nil, time.Now(), "09:30", days)
-		assert.Error(t, err, "day count %d must fail", days)
-	}
+	_, err := Build(nil, time.Now(), "09:30", nil)
+	assert.Error(t, err, "empty date list must fail")
+	_, err = Build(nil, time.Now(), "09:30", Trailing(time.Now(), 0))
+	assert.Error(t, err, "zero days must fail")
+	d1 := StartOfDay(time.Now())
+	_, err = Build(nil, time.Now(), "09:30", []time.Time{d1, d1})
+	assert.Error(t, err, "non-ascending dates must fail")
 	for _, bad := range []string{"25:99", "abc", ""} {
-		_, err := Build(nil, time.Now(), bad, 2)
+		_, err = Build(nil, time.Now(), bad, Trailing(time.Now(), 2))
 		assert.Error(t, err, "meeting time %q must fail", bad)
+	}
+}
+
+func TestTrailing(t *testing.T) {
+	now := d(9, 0, 0)
+	assert.Nil(t, Trailing(now, 0))
+	got := Trailing(now, 3)
+	require.Len(t, got, 3)
+	assert.Equal(t, "2026-08-13", got[0].Format("2006-01-02"))
+	assert.Equal(t, "2026-08-15", got[2].Format("2006-01-02"))
+	for _, day := range got {
+		assert.Equal(t, 0, day.Hour()+day.Minute()+day.Second())
+	}
+}
+
+func TestDefaultWindow(t *testing.T) {
+	tests := []struct {
+		now  time.Time
+		want []string
+	}{
+		{time.Date(2026, 8, 17, 9, 0, 0, 0, loc), []string{"2026-08-14", "2026-08-17"}}, // Monday -> Friday
+		{time.Date(2026, 8, 18, 9, 0, 0, 0, loc), []string{"2026-08-17", "2026-08-18"}}, // Tuesday -> Monday
+	}
+	for _, tt := range tests {
+		got := DefaultWindow(tt.now)
+		require.Len(t, got, 2)
+		assert.Equal(t, tt.want, []string{got[0].Format("2006-01-02"), got[1].Format("2006-01-02")})
 	}
 }
 

@@ -18,6 +18,7 @@ type Config struct {
 	MeetingTime           string
 	DataFile              string
 	Offline               bool
+	Language              string
 	EditorInstructions    string
 	ReporterInstructions  string
 	GenerateInputTemplate string
@@ -76,7 +77,7 @@ func Init() (string, error) {
 }
 
 // Load resolves configuration via the Dirs chain. Precedence for values:
-// STANDUP_* env > .env (cwd first, then config dirs) > yaml.
+// STANDUP_* env > .env (nearest ancestor of the cwd, then config dirs) > yaml.
 func Load() (Config, error) {
 	dirs := Dirs()
 	if err := loadDotEnv(dirs); err != nil {
@@ -97,11 +98,13 @@ func Load() (Config, error) {
 	v.SetDefault("meeting_time", "09:30")
 	v.SetDefault("data_file", "~/.standup/tasks.jsonl")
 	v.SetDefault("offline", false)
+	v.SetDefault("language", "")
 
 	cfg := Config{
 		MeetingTime: v.GetString("meeting_time"),
 		DataFile:    v.GetString("data_file"),
 		Offline:     v.GetBool("offline"),
+		Language:    v.GetString("language"),
 	}
 
 	dataFile, err := expandHome(cfg.DataFile)
@@ -152,10 +155,11 @@ func readFile(dirs []string, name, embedded string) (string, error) {
 	return embedded, nil
 }
 
-// loadDotEnv loads ./.env first, then a .env in each config dir. godotenv
-// never overrides variables that are already set, so earlier files win.
+// loadDotEnv loads the nearest .env found walking up from the cwd (like git
+// resolves its config), then a .env in each config dir. godotenv never
+// overrides variables that are already set, so earlier files win.
 func loadDotEnv(dirs []string) error {
-	paths := []string{".env"}
+	paths := findUp(".env")
 	for _, d := range dirs {
 		paths = append(paths, filepath.Join(d, ".env"))
 	}
@@ -168,6 +172,25 @@ func loadDotEnv(dirs []string) error {
 		}
 	}
 	return nil
+}
+
+// findUp returns the path if it exists in the cwd or any parent directory.
+func findUp(name string) []string {
+	dir, err := os.Getwd()
+	if err != nil {
+		return nil
+	}
+	for {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			return []string{p}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return nil
+		}
+		dir = parent
+	}
 }
 
 func expandHome(p string) (string, error) {

@@ -3,3 +3,5 @@ meeting_time: "09:30"
 data_file: "~/.standup/tasks.jsonl"
 # true: no model endpoint — add splits paragraphs, generate renders deterministically.
 offline: false
+# report language for the model's rephrasing (empty: keep the input language).
+language: ""

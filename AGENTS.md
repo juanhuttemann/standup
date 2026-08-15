@@ -30,15 +30,24 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Models read; Go writes. A model never mutates the store: extracted editor output is
   persisted deterministically in Go (a model-driven tool loop was observed to execute
   the same write repeatedly). Store mutations happen in `store`/`cli` only.
+- Models phrase; Go formats. Report layout (sections, `[status]`, times) is rendered
+  from the template in Go; the reporter only rephrases task texts over a count-checked
+  JSON contract and any failure falls back to verbatim texts.
 - Deterministic work stays deterministic: time math, day split, ordering, and the meeting
-  cutoff live in `internal/report`. A model never sorts, filters by time, or invents ids.
+  cutoff live in `internal/report`. Commit ingestion is deterministic end to end (author
+  dates, dedupe, `done` status) — a model never touches it. A model never sorts, filters
+  by time, or invents ids.
+- The assistant is lazy: only `add` (online) and `generate` construct it, so read-only
+  commands never require provider credentials.
 
 ### Config policy
 - Each setting has exactly one home — never duplicate a setting across files:
-  application settings (`meeting_time`, `data_file`) in `config/config.yaml`;
-  provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`) in local `.env`/env only.
-- Precedence: `STANDUP_*` env > `.env` > yaml. Config files resolve per file
-  through the dir chain `$STANDUP_CONFIG_DIR` → `./config` → user config dir →
+  application settings (`meeting_time`, `data_file`, `offline`, `language`) in
+  `config/config.yaml`; provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`) in
+  local `.env`/env only.
+- Precedence: `STANDUP_*` env > `.env` > yaml. `.env` resolves by walking up from
+  the cwd (like git); config files resolve per file through the dir chain
+  `$STANDUP_CONFIG_DIR` → `./config` → user config dir →
   embedded defaults (`config/embed.go` embeds the committed yaml; the yaml
   files stay the single home of every setting).
 - Committed files contain zero provider references: no endpoints, no model

@@ -14,8 +14,8 @@ import (
 var version = "dev"
 
 func main() {
-	// Built lazily so help, version, and init never touch config or
-	// provider settings; memoized so each process wires at most once.
+	// Built lazily so help, version, init, and every read-only command never
+	// touch provider settings; memoized so each process wires at most once.
 	load := sync.OnceValues(func() (cli.Deps, error) {
 		cfg, err := config.Load()
 		if err != nil {
@@ -25,15 +25,20 @@ func main() {
 		if err != nil {
 			return cli.Deps{}, err
 		}
-		ass, err := agent.New(cfg, st)
-		if err != nil {
-			return cli.Deps{}, err
-		}
 		raw, err := agent.Local(cfg, st)
 		if err != nil {
 			return cli.Deps{}, err
 		}
-		return cli.Deps{Assist: ass, Raw: raw, Store: st, Config: cfg}, nil
+		return cli.Deps{
+			// Only add and generate (online) need credentials; the check
+			// stays in agent.New and runs on first use, not at startup.
+			Assistant: sync.OnceValues(func() (agent.Assistant, error) {
+				return agent.New(cfg, st)
+			}),
+			Raw:    raw,
+			Store:  st,
+			Config: cfg,
+		}, nil
 	})
 	root := cli.New(load)
 	root.Version = version

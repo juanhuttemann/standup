@@ -5,6 +5,63 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `commits` no longer destroys day attribution: imported tasks are stamped
+  with the commit's author date (not the import time), so `list --date` and
+  the Yesterday section find them again. Importing is fully deterministic
+  now (no model in the pipeline); commits land as `done` tasks.
+- Re-running `commits` no longer duplicates tasks: already-imported commits
+  (same text, same day) are skipped and reported as `skipped N`.
+- Read-only commands (`list`, `done`, `rm`, `status`, `edit`, `commits`,
+  `doctor`) no longer require `OPENAI_BASE_URL`/`OPENAI_MODEL` — the
+  assistant is built on first use by `add`/`generate` only, restoring the
+  zero-config claim for everything else.
+- `list --tag` now matches the literal `#token` (case-insensitive,
+  punctuation tolerated) instead of a substring search: `--tag fix` no
+  longer matches "Fixed login bug #auth" or the word "API".
+- `edit` without `$EDITOR` falls back to `notepad` on Windows (was `vi`,
+  which does not exist there).
+- `commits` outside a repository now says so (`not inside a git working
+  tree`) instead of misdiagnosing a missing `user.email`; the repo check
+  runs first. A zero-match run hints at a `git config user.email` /
+  commit-identity mismatch instead of a bare "no commits found".
+- `.env` lookup walks up parent directories from the cwd (like git), so
+  running from a project subdir keeps the endpoint configuration.
+- Blocked tasks are no longer duplicated: they appear under `## Blockers`
+  only, not additionally in the day sections (and no longer carry over
+  into Today while also being listed as blockers).
+- `generate` output is deterministic: section layout, `[status]`, and times
+  are rendered by the binary; the model only rephrases task texts (JSON
+  contract, count-checked). Any model failure falls back to verbatim texts
+  — same layout, no network dependency for the format.
+- Multi-line tasks (imported commit bodies) render as one row in `list`
+  and the interactive browser instead of breaking the column layout.
+- Unreachable endpoints report a friendly hint (`check OPENAI_BASE_URL and
+  network`) instead of a raw connection dump.
+
+### Added
+
+- Multi-repo commit ingestion: `commits [days] [paths...]` collects from
+  several repositories, deduped by commit hash, ordered by commit time.
+- Co-authored commits count as yours: commits carrying your address in a
+  `Co-authored-by:` trailer are collected too.
+- Full commit bodies: the whole commit message (trailer block stripped)
+  becomes the task text, not just the subject line.
+- Explicit report windows: `generate --from/--to YYYY-MM-DD` with dated
+  headings and no meeting cutoff on historical days.
+- Weekend-aware default window: bare `generate` (and `generate 2`) covers
+  the last working day onward (Monday reports Friday+Monday), matching the
+  `commits` lookback.
+- `generate --clip`: copy the report to the clipboard (pbcopy / wl-copy /
+  xclip / clip).
+- `language` config key (env `STANDUP_LANGUAGE`): report language for the
+  model's rephrasing; empty preserves the input language.
+- `standup doctor`: checks data-file writability, git identity, provider
+  env presence, and endpoint reachability (skipped in offline mode).
+- Agent skill at `.agents/skills/standup/SKILL.md` (`.claude/skills/standup`
+  symlink) so coding agents can drive the CLI.
+
 ## [0.4.0] - 2026-08-15
 
 ### Added

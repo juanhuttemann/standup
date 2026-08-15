@@ -59,10 +59,37 @@ func TestLogOneLinePerCommit(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, commits, 2)
 	assert.Equal(t, "fix login bug", commits[0].Subject)
+	assert.Equal(t, "fix login bug", commits[0].Body)
+	assert.NotEmpty(t, commits[0].Hash)
 	want, err := time.Parse(time.RFC3339, "2026-08-14T10:00:00+02:00")
 	require.NoError(t, err)
 	assert.True(t, commits[0].When.Equal(want), "timestamp parsed per commit")
 	assert.Equal(t, "write tests", commits[1].Subject)
+}
+
+func TestLogFullBodyWithoutTrailers(t *testing.T) {
+	dir := scratchRepo(t)
+	msg := "fix login bug\n\nThe token was expired.\n\nSigned-off-by: Me <me@example.com>\nCo-authored-by: Someone <someone@example.com>"
+	commitAt(t, dir, msg, meEmail, "2026-08-14T10:00:00+02:00")
+
+	commits, err := Log(dir, time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	assert.Equal(t, "fix login bug", commits[0].Subject)
+	assert.Equal(t, "fix login bug\n\nThe token was expired.", commits[0].Body,
+		"full message kept, trailer block stripped")
+}
+
+func TestLogCoAuthored(t *testing.T) {
+	dir := scratchRepo(t)
+	commitAt(t, dir, "teammate feature\n\nCo-authored-by: me <me@example.com>", "teammate@example.com", "2026-08-14T11:00:00+02:00")
+	commitAt(t, dir, "other teammate work", "teammate@example.com", "2026-08-14T12:00:00+02:00")
+
+	commits, err := Log(dir, time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	require.Len(t, commits, 1, "co-authored commits collected, plain teammate work excluded")
+	assert.Equal(t, "teammate feature", commits[0].Subject)
+	assert.Equal(t, "teammate feature", commits[0].Body, "co-authored trailer stripped from the task text")
 }
 
 func TestLogAuthorFilter(t *testing.T) {
@@ -110,7 +137,9 @@ func TestLogMergeCommitsExcluded(t *testing.T) {
 
 func TestLogNotARepo(t *testing.T) {
 	_, err := Log(t.TempDir(), time.Now())
-	assert.Error(t, err)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not inside a git working tree",
+		"repo check runs before the identity check, so the diagnosis is right")
 }
 
 func TestLogNoUserEmailSuggestsFix(t *testing.T) {

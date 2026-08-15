@@ -27,11 +27,13 @@ type Assistant interface {
 type runFunc func(ctx context.Context, prompt string) (string, error)
 
 type impl struct {
-	editor   runFunc
-	reporter runFunc
-	st       *store.Store
-	genTpl   *template.Template
-	daysTpl  *template.Template
+	editor       runFunc
+	reporter     runFunc
+	instructions string // reporter prompt
+	lang         string // optional output language
+	st           *store.Store
+	genTpl       *template.Template
+	daysTpl      *template.Template
 }
 
 var _ Assistant = (*impl)(nil)
@@ -72,17 +74,19 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		return func(ctx context.Context, prompt string) (string, error) {
 			out, err := a.RunText(ctx, prompt).Collect()
 			if err != nil {
-				return "", err
+				return "", fmt.Errorf("endpoint call failed — check OPENAI_BASE_URL and network: %w", err)
 			}
 			return out.String(), nil
 		}
 	}
 	return &impl{
-		editor:   newRun("editor", cfg.EditorInstructions),
-		reporter: newRun("reporter", cfg.ReporterInstructions),
-		st:       st,
-		genTpl:   genTpl,
-		daysTpl:  daysTpl,
+		editor:       newRun("editor", cfg.EditorInstructions),
+		reporter:     newRun("reporter", cfg.ReporterInstructions),
+		instructions: cfg.ReporterInstructions,
+		lang:         cfg.Language,
+		st:           st,
+		genTpl:       genTpl,
+		daysTpl:      daysTpl,
 	}, nil
 }
 
@@ -120,12 +124,49 @@ func (a *impl) AddTasks(ctx context.Context, rawText string) ([]store.Task, erro
 	return persist(a.st, parsed)
 }
 
+// Generate renders the report deterministically in Go; online mode first
+// rephrases the task texts through the reporter (formatting never depends on
+// the model). Any rephrase failure falls back to the original texts.
 func (a *impl) Generate(ctx context.Context, sec report.Section) (string, error) {
-	var prompt strings.Builder
-	if err := tplFor(sec, a.genTpl, a.daysTpl).Execute(&prompt, sec); err != nil {
+	texts := taskTexts(sec)
+	if len(texts) > 0 {
+		if repl, ok := a.rephrase(ctx, texts); ok {
+			applyTexts(&sec, repl)
+		}
+	}
+	var b strings.Builder
+	if err := tplFor(sec, a.genTpl, a.daysTpl).Execute(&b, sec); err != nil {
 		return "", fmt.Errorf("agent: generate template: %w", err)
 	}
-	return a.reporter(ctx, prompt.String())
+	return b.String(), nil
+}
+
+// rephrase exchanges the task texts for rewritten ones, one per input, via
+// the reporter agent's JSON contract.
+func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, bool) {
+	var prompt strings.Builder
+	prompt.WriteString(a.instructions)
+	if a.lang != "" {
+		fmt.Fprintf(&prompt, " Write the entries in %s.", a.lang)
+	}
+	prompt.WriteString("\nTasks:")
+	for _, t := range texts {
+		prompt.WriteString("\n- " + t)
+	}
+	out, err := a.reporter(ctx, prompt.String())
+	if err != nil {
+		return nil, false
+	}
+	repl, err := extractStrings(out)
+	if err != nil || len(repl) != len(texts) {
+		return nil, false
+	}
+	for _, r := range repl {
+		if strings.TrimSpace(r) == "" {
+			return nil, false
+		}
+	}
+	return repl, true
 }
 
 func (l *local) AddTasks(_ context.Context, rawText string) ([]store.Task, error) {
@@ -145,12 +186,72 @@ func (l *local) Generate(_ context.Context, sec report.Section) (string, error) 
 }
 
 // tplFor picks the two-section template for the default window and the
-// range template for any other day count.
+// range template for any other layout (aliases are only set for the default
+// window, including empty ones skipped by both templates).
 func tplFor(sec report.Section, genTpl, daysTpl *template.Template) *template.Template {
-	if len(sec.Days) == 2 {
+	if len(sec.Days) == 2 && (sec.Yesterday != nil || sec.Today != nil) {
 		return genTpl
 	}
 	return daysTpl
+}
+
+// taskTexts flattens the section's tasks in render order: days first, then
+// blockers.
+func taskTexts(sec report.Section) []string {
+	var out []string
+	for _, d := range sec.Days {
+		for _, t := range d.Tasks {
+			out = append(out, t.Text)
+		}
+	}
+	for _, t := range sec.Blockers {
+		out = append(out, t.Text)
+	}
+	return out
+}
+
+// applyTexts writes rephrased texts back in the same order taskTexts read
+// them.
+func applyTexts(sec *report.Section, repl []string) {
+	i := 0
+	for di := range sec.Days {
+		for ti := range sec.Days[di].Tasks {
+			if i < len(repl) {
+				sec.Days[di].Tasks[ti].Text = repl[i]
+				i++
+			}
+		}
+	}
+	for bi := range sec.Blockers {
+		if i < len(repl) {
+			sec.Blockers[bi].Text = repl[i]
+			i++
+		}
+	}
+	if len(sec.Days) == 2 {
+		if sec.Yesterday != nil {
+			sec.Yesterday = sec.Days[0].Tasks
+		}
+		if sec.Today != nil {
+			sec.Today = sec.Days[1].Tasks
+		}
+	}
+}
+
+// extractStrings finds the reporter's JSON reply: {"tasks": ["...", ...]}.
+func extractStrings(s string) ([]string, error) {
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' {
+			continue
+		}
+		var v struct {
+			Tasks []string `json:"tasks"`
+		}
+		if err := json.NewDecoder(strings.NewReader(s[i:])).Decode(&v); err == nil && len(v.Tasks) > 0 {
+			return v.Tasks, nil
+		}
+	}
+	return nil, errors.New("agent: no tasks found in reporter output")
 }
 
 func persist(st *store.Store, parsed []extracted) ([]store.Task, error) {

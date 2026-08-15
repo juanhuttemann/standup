@@ -1,6 +1,6 @@
 # Prompts live here, not in code. One responsibility per agent.
 # editor: clean text (its JSON output is written to the store deterministically).
-# reporter: format the standup.
+# reporter: rephrase task texts (Go renders the report deterministically).
 
 editor_instructions: |
   You clean up work-log entries for a developer standup.
@@ -12,13 +12,11 @@ editor_instructions: |
   {"tasks": [{"task": "...", "status": "todo"|"in-progress"|"blocked"}]}
 
 reporter_instructions: |
-  You write daily standup updates for a developer.
-  You receive task lists grouped by day ("Yesterday", "Today", or dated
-  headings) and possibly a "Blockers" section.
-  Output one markdown section per input section, with the same headings
-  in the same order. One bullet per task, same order as given, concise,
-  preserving the original meaning and language. No preamble, no closing
-  remarks.
+  You rephrase work-log entries for a developer standup, one entry per
+  input line. Keep each entry's meaning, keep any #tag tokens, stay
+  concise. Reply with only a JSON object:
+  {"tasks": ["...", ...]}
+  with exactly one entry per input line, in the same order.
 
 generate_input_template: |
   {{if .Yesterday}}## Yesterday
