@@ -29,6 +29,7 @@ type Config struct {
 	ReposExclude          []string
 	EditorInstructions    string
 	ReporterInstructions  string
+	SpeakerInstructions   string
 	GenerateInputTemplate string
 	DaysTemplate          string
 }
@@ -147,6 +148,7 @@ func Load() (Config, error) {
 		{"reporter_instructions", &cfg.ReporterInstructions},
 		{"generate_input_template", &cfg.GenerateInputTemplate},
 		{"generate_input_template_days", &cfg.DaysTemplate},
+		{"speaker_instructions", &cfg.SpeakerInstructions},
 	} {
 		s := strings.TrimRight(a.GetString(in.key), " \t\r\n")
 		if s == "" {

@@ -32,19 +32,25 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   the same write repeatedly). Store mutations happen in `store`/`cli` only.
 - Models phrase; Go formats. Report layout (sections, `[status]`, times) is rendered
   from the template in Go; the reporter only rephrases task texts over a count-checked
-  JSON contract and any failure falls back to verbatim texts.
+  JSON contract and any failure falls back to verbatim texts. The speaker rewrites the
+  rendered report as a spoken brief over the same contract-free boundary: `speak`
+  prints the script (a free preview) and `-o` synthesizes it via a streaming chat
+  completion with the audio modality; the pcm16 bytes are WAV-wrapped in Go and the
+  audio model never sees the store.
 - Deterministic work stays deterministic: time math, day split, ordering, and the meeting
   cutoff live in `internal/report`. Commit ingestion is deterministic end to end (author
   dates, dedupe, `done` status) — a model never touches it. A model never sorts, filters
   by time, or invents ids.
-- The assistant is lazy: only `add` (online) and `generate` construct it, so read-only
-  commands never require provider credentials.
+- The assistant is lazy: only `add` (online), `generate`, and `speak` construct it, so
+  read-only commands never require provider credentials. Speech env
+  (`OPENAI_SPEECH_MODEL`/`OPENAI_SPEECH_VOICE`) is checked even later: at `speak -o`
+  synthesis time, so the preview needs only the chat vars.
 
 ### Config policy
 - Each setting has exactly one home — never duplicate a setting across files:
   application settings (`meeting_time`, `data_file`, `offline`, `language`) in
-  `config/config.yaml`; provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`) in
-  local `.env`/env only.
+  `config/config.yaml`; provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`,
+  `OPENAI_SPEECH_MODEL`, `OPENAI_SPEECH_VOICE`) in local `.env`/env only.
 - Precedence: `STANDUP_*` env > `.env` > yaml. `.env` resolves by walking up from
   the cwd (like git); config files resolve per file through the dir chain
   `$STANDUP_CONFIG_DIR` → `./config` → user config dir →

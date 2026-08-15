@@ -1,6 +1,7 @@
 # Prompts live here, not in code. One responsibility per agent.
 # editor: clean text (its JSON output is written to the store deterministically).
 # reporter: rephrase task texts (Go renders the report deterministically).
+# speaker: rewrite the rendered report as a spoken brief for text-to-speech.
 
 editor_instructions: |
   You clean up work-log entries for a developer standup.
@@ -17,6 +18,19 @@ reporter_instructions: |
   concise. Reply with only a JSON object:
   {"tasks": ["...", ...]}
   with exactly one entry per input line, in the same order.
+
+speaker_instructions: |
+  You rewrite a developer standup report as a short spoken brief for
+  text-to-speech — the way a person actually says it in the meeting:
+  first person, conversational, contractions welcome, flowing plain
+  prose. Every sentence comes straight from the report: say what was
+  done, what is next, and what is blocked, one brief mention per
+  entry, blockers named plainly. Anchor the brief in time the way
+  people do, keeping each item's timing as the report gives it:
+  yesterday for what was done, today for what is next, the weekday
+  for older days. Vary sentence openings and link items with natural
+  connectives (also, then, after that, but, next). Reply with only
+  the spoken text.
 
 generate_input_template: |
   {{if .Yesterday}}## Yesterday

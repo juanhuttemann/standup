@@ -137,6 +137,20 @@ func New(load func() (Deps, error)) *cobra.Command {
 	genCmd.Flags().String("mail", "", "send the report to this email address (needs smtp_* config)")
 	genCmd.Flags().Bool("team", false, "group the report by recorded commit author (see commits --all-authors)")
 
+	speakCmd := &cobra.Command{
+		Use:   "speak [days]",
+		Args:  cobra.MaximumNArgs(1),
+		Short: "speak the standup report (prints the script; -o synthesizes audio)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, func(c *cobra.Command, d Deps) error { return runSpeak(c, d, args) })
+		},
+		SilenceUsage: true,
+	}
+	speakCmd.Flags().StringP("output", "o", "", "synthesize the script into this audio file (wav)")
+	speakCmd.Flags().String("from", "", "explicit window start date (YYYY-MM-DD, with --to)")
+	speakCmd.Flags().String("to", "", "explicit window end date (YYYY-MM-DD, with --from)")
+	speakCmd.Flags().Bool("team", false, "group the report by recorded commit author (see commits --all-authors)")
+
 	commitsCmd := &cobra.Command{
 		Use:   "commits [days] [paths...]",
 		Args:  cobra.ArbitraryArgs,
@@ -236,7 +250,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 	}
 	skillCmd.Flags().BoolP("global", "g", false, "install to ~/.agents and ~/.claude instead of the repo")
 
-	root.AddCommand(addCmd, listCmd, genCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd, skillCmd, updateCmd)
+	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd, skillCmd, updateCmd)
 	return root
 }
 
@@ -1084,6 +1098,70 @@ func deliverReport(cmd *cobra.Command, cfg config.Config, out string) error {
 		}
 	}
 	return nil
+}
+
+// runSpeak renders the report and rewrites it as a spoken brief. The script
+// is always printed — the preview; -o additionally synthesizes it into an
+// audio file. Nothing is stored: speak is a read-only command.
+func runSpeak(cmd *cobra.Command, d Deps, args []string) error {
+	now, err := nowIn(d)
+	if err != nil {
+		return err
+	}
+	dates, err := generateDates(cmd, args, now)
+	if err != nil {
+		return err
+	}
+	tasks, err := d.Store.List()
+	if err != nil {
+		return err
+	}
+	out, err := renderReport(cmd, d, tasks, now, dates)
+	if err != nil {
+		return err
+	}
+	if out == "" {
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), "nothing to report")
+		return err
+	}
+	assist, err := d.Assistant()
+	if err != nil {
+		return err
+	}
+	var script string
+	var scriptErr error
+	if err := spin("writing the brief", func() error {
+		script, scriptErr = assist.Script(cmd.Context(), out)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if scriptErr != nil {
+		return scriptErr
+	}
+	if _, err := fmt.Fprintln(cmd.OutOrStdout(), script); err != nil {
+		return err
+	}
+	path := flagString(cmd, "output")
+	if path == "" {
+		return nil
+	}
+	var audio []byte
+	var synthErr error
+	if err := spin("synthesizing speech", func() error {
+		audio, synthErr = assist.Synthesize(cmd.Context(), script)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if synthErr != nil {
+		return synthErr
+	}
+	if err := os.WriteFile(filepath.Clean(path), audio, 0o644); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path)
+	return err
 }
 
 // generateDates resolves the report window: explicit --from/--to dates, the

@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,18 +26,26 @@ import (
 type Assistant interface {
 	AddTasks(ctx context.Context, rawText string) ([]store.Task, error)
 	Generate(ctx context.Context, sec report.Section) (string, error)
+	Script(ctx context.Context, report string) (string, error)
+	Synthesize(ctx context.Context, script string) ([]byte, error)
 }
 
 type runFunc func(ctx context.Context, prompt string) (string, error)
 
+// ttsFunc turns a script into audio bytes via the speech endpoint.
+type ttsFunc func(ctx context.Context, input string) ([]byte, error)
+
 type impl struct {
-	editor       runFunc
-	reporter     runFunc
-	instructions string // reporter prompt
-	lang         string // optional output language
-	st           *store.Store
-	genTpl       *template.Template
-	daysTpl      *template.Template
+	editor              runFunc
+	reporter            runFunc
+	speaker             runFunc
+	tts                 ttsFunc
+	instructions        string // reporter prompt
+	speakerInstructions string
+	lang                string // optional output language
+	st                  *store.Store
+	genTpl              *template.Template
+	daysTpl             *template.Template
 }
 
 var _ Assistant = (*impl)(nil)
@@ -89,14 +99,109 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		}
 	}
 	return &impl{
-		editor:       newRun("editor", cfg.EditorInstructions),
-		reporter:     newRun("reporter", cfg.ReporterInstructions),
-		instructions: cfg.ReporterInstructions,
-		lang:         cfg.Language,
-		st:           st,
-		genTpl:       genTpl,
-		daysTpl:      daysTpl,
+		editor:              newRun("editor", cfg.EditorInstructions),
+		reporter:            newRun("reporter", cfg.ReporterInstructions),
+		speaker:             newRun("speaker", cfg.SpeakerInstructions),
+		tts:                 newTTS(client),
+		instructions:        cfg.ReporterInstructions,
+		speakerInstructions: cfg.SpeakerInstructions,
+		lang:                cfg.Language,
+		st:                  st,
+		genTpl:              genTpl,
+		daysTpl:             daysTpl,
 	}, nil
+}
+
+// maxSpeechInput bounds the script sent to synthesis; a standup brief past
+// it means the speaker agent misbehaved, so fail closed.
+const maxSpeechInput = 4096
+
+// newTTS builds the speech call on the shared client: a streaming chat
+// completion with the audio modality (the audio-output shape OpenAI-
+// compatible endpoints implement; audio requires streaming). The speech
+// model and voice are deployment facts (env, never config); they are
+// checked at call time so add/generate never require them.
+func newTTS(client openai.Client) ttsFunc {
+	return func(ctx context.Context, input string) (audio []byte, err error) {
+		var missing []string
+		for _, key := range []string{"OPENAI_SPEECH_MODEL", "OPENAI_SPEECH_VOICE"} {
+			if os.Getenv(key) == "" {
+				missing = append(missing, key)
+			}
+		}
+		if len(missing) > 0 {
+			return nil, fmt.Errorf("missing required environment variables: %s (needed by speak -o)", strings.Join(missing, ", "))
+		}
+		stream := client.Chat.Completions.NewStreaming(ctx, openai.ChatCompletionNewParams{
+			Model:      os.Getenv("OPENAI_SPEECH_MODEL"),
+			Messages:   []openai.ChatCompletionMessageParamUnion{openai.UserMessage(input)},
+			Modalities: []string{"text", "audio"},
+			Audio: openai.ChatCompletionAudioParam{
+				Format: openai.ChatCompletionAudioParamFormatPcm16,
+				Voice:  openai.ChatCompletionAudioParamVoiceUnion{OfString: openai.String(os.Getenv("OPENAI_SPEECH_VOICE"))},
+			},
+		})
+		defer func() {
+			if cerr := stream.Close(); cerr != nil {
+				err = errors.Join(err, cerr)
+			}
+		}()
+		// delta.audio is not in the SDK's typed schema; ExtraFields is its
+		// designed escape hatch for exactly this case. Extra fields carry
+		// the "invalid" status (Valid() is false by design), so gate on
+		// Raw() content, not Valid().
+		var b64 strings.Builder
+		for stream.Next() {
+			chunk := stream.Current()
+			if len(chunk.Choices) == 0 {
+				continue
+			}
+			f, ok := chunk.Choices[0].Delta.JSON.ExtraFields["audio"]
+			if !ok || f.Raw() == "" {
+				continue
+			}
+			var a struct {
+				Data string `json:"data"`
+			}
+			if uerr := json.Unmarshal([]byte(f.Raw()), &a); uerr != nil {
+				return nil, fmt.Errorf("agent: speech stream audio chunk: %w", uerr)
+			}
+			b64.WriteString(a.Data)
+		}
+		if err := stream.Err(); err != nil {
+			return nil, fmt.Errorf("speech endpoint call failed — check OPENAI_BASE_URL and network: %w", err)
+		}
+		if b64.Len() == 0 {
+			return nil, errors.New("agent: speech endpoint returned no audio")
+		}
+		out, derr := base64.StdEncoding.DecodeString(b64.String())
+		if derr != nil {
+			return nil, fmt.Errorf("agent: speech stream audio encoding: %w", derr)
+		}
+		return wavWrap(out), nil
+	}
+}
+
+// speechSampleRate is the speech endpoints' pcm16 output rate (24 kHz mono).
+const speechSampleRate = 24000
+
+// wavWrap wraps raw pcm16 audio in a RIFF/WAV container so the file is
+// playable: endpoints stream raw pcm16 only, no compressed formats.
+func wavWrap(pcm []byte) []byte {
+	out := make([]byte, 44, 44+len(pcm))
+	copy(out[0:], "RIFF")
+	binary.LittleEndian.PutUint32(out[4:], uint32(36+len(pcm)))
+	copy(out[8:], "WAVEfmt ")
+	binary.LittleEndian.PutUint32(out[16:], 16) // fmt chunk size
+	binary.LittleEndian.PutUint16(out[20:], 1)  // PCM
+	binary.LittleEndian.PutUint16(out[22:], 1)  // mono
+	binary.LittleEndian.PutUint32(out[24:], speechSampleRate)
+	binary.LittleEndian.PutUint32(out[28:], speechSampleRate*2) // byte rate (16-bit mono)
+	binary.LittleEndian.PutUint16(out[32:], 2)                  // block align
+	binary.LittleEndian.PutUint16(out[34:], 16)                 // bits per sample
+	copy(out[36:], "data")
+	binary.LittleEndian.PutUint32(out[40:], uint32(len(pcm)))
+	return append(out, pcm...)
 }
 
 // Local returns the deterministic assistant: no model endpoint, paragraph
@@ -185,6 +290,43 @@ func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, bool) {
 		}
 	}
 	return repl, true
+}
+
+// Script rewrites the rendered report as a spoken brief via the speaker
+// agent; the brief is printed before any speech call so users can preview it.
+func (a *impl) Script(ctx context.Context, report string) (string, error) {
+	var prompt strings.Builder
+	prompt.WriteString(a.speakerInstructions)
+	if a.lang != "" {
+		fmt.Fprintf(&prompt, " Write the brief in %s.", a.lang)
+	}
+	prompt.WriteString("\nReport:\n" + report)
+	out, err := a.speaker(ctx, prompt.String())
+	if err != nil {
+		return "", err
+	}
+	script := strings.TrimSpace(out)
+	if script == "" {
+		return "", errors.New("agent: empty speaker output")
+	}
+	return script, nil
+}
+
+// Synthesize narrates the script through the speech endpoint. Go writes the
+// returned bytes to a file; the model never touches the store.
+func (a *impl) Synthesize(ctx context.Context, script string) ([]byte, error) {
+	if len(script) > maxSpeechInput {
+		return nil, fmt.Errorf("agent: script is %d chars, over the %d limit for speech", len(script), maxSpeechInput)
+	}
+	return a.tts(ctx, script)
+}
+
+func (l *local) Script(context.Context, string) (string, error) {
+	return "", errors.New("agent: speak requires a model endpoint (offline mode)")
+}
+
+func (l *local) Synthesize(context.Context, string) ([]byte, error) {
+	return nil, errors.New("agent: speak requires a model endpoint (offline mode)")
 }
 
 func (l *local) AddTasks(_ context.Context, rawText string) ([]store.Task, error) {

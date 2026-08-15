@@ -5,6 +5,20 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `standup speak [days]`: rewrites the standup report as a spoken brief via
+  a new `speaker_instructions` agent (`config/agent.yaml`) and prints the
+  script — a free preview that never touches the speech endpoint.
+  `speak -o standup.wav` additionally synthesizes the script into an audio
+  file (streaming chat completion with the audio modality — the audio-output
+  shape OpenAI-compatible endpoints implement; raw pcm16 is wrapped in a WAV
+  container deterministically). The speech model and voice are deployment
+  facts: `OPENAI_SPEECH_MODEL`/`OPENAI_SPEECH_VOICE` env, checked only when
+  `-o` is given. Same window flags as `generate` (`--from`/`--to`, `--team`);
+  scripts over 4096 chars fail closed; offline mode and empty reports skip
+  the model entirely.
+
 ### Fixed
 
 - `install.sh` aborted with a spurious "checksum mismatch" on every install:

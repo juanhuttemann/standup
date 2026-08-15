@@ -18,6 +18,9 @@ editor_instructions: |
 reporter_instructions: |
   Report things.
 
+speaker_instructions: |
+  Speak things.
+
 generate_input_template: |
   {{range .Yesterday}}- {{.Text}}
   {{range .Today}}- {{.Text}}
@@ -88,6 +91,7 @@ func TestLoadYAMLAndPlaceholders(t *testing.T) {
 	assert.Equal(t, filepath.Join(home, "tasks.jsonl"), cfg.DataFile)
 	assert.Equal(t, "Edit things.", cfg.EditorInstructions)
 	assert.Equal(t, "Report things.", cfg.ReporterInstructions)
+	assert.Equal(t, "Speak things.", cfg.SpeakerInstructions)
 	assert.Contains(t, cfg.GenerateInputTemplate, "{{range .Yesterday}}")
 }
 
@@ -300,6 +304,19 @@ func TestMissingPromptKey(t *testing.T) {
 	_, err := Load()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "reporter_instructions")
+}
+
+func TestMissingSpeakerKey(t *testing.T) {
+	isolateDirs(t)
+	base := "editor_instructions: |\n  Edit things.\nreporter_instructions: |\n  Report things.\ngenerate_input_template: |\n  {{range .Yesterday}}- {{.Text}}\ngenerate_input_template_days: |\n  {{range .Days}}## {{.Heading}}\n  {{end}}\n"
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "")
+	write(t, filepath.Join(dir, "agent.yaml"), base)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "speaker_instructions")
 }
 
 func TestMissingTemplateKey(t *testing.T) {

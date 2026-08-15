@@ -30,14 +30,22 @@ import (
 )
 
 type fakeAssistant struct {
-	added     []string
-	addResult []store.Task
-	addErr    error
-	genCalls  int
-	genSec    *report.Section
-	genSecs   []report.Section
-	genOut    string
-	genErr    error
+	added       []string
+	addResult   []store.Task
+	addErr      error
+	genCalls    int
+	genSec      *report.Section
+	genSecs     []report.Section
+	genOut      string
+	genErr      error
+	scriptCalls int
+	scriptRep   string
+	scriptOut   string
+	scriptErr   error
+	synthCalls  int
+	synthScript string
+	synthAudio  []byte
+	synthErr    error
 }
 
 func (f *fakeAssistant) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {
@@ -53,6 +61,18 @@ func (f *fakeAssistant) Generate(ctx context.Context, sec report.Section) (strin
 	*f.genSec = sec
 	f.genSecs = append(f.genSecs, sec)
 	return f.genOut, f.genErr
+}
+
+func (f *fakeAssistant) Script(ctx context.Context, report string) (string, error) {
+	f.scriptCalls++
+	f.scriptRep = report
+	return f.scriptOut, f.scriptErr
+}
+
+func (f *fakeAssistant) Synthesize(ctx context.Context, script string) ([]byte, error) {
+	f.synthCalls++
+	f.synthScript = script
+	return f.synthAudio, f.synthErr
 }
 
 var _ agent.Assistant = (*fakeAssistant)(nil)
@@ -239,6 +259,98 @@ func TestGenerateFlagShorthand(t *testing.T) {
 	root.SetArgs([]string{"-g"})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, buf.String(), "nothing to report")
+}
+
+func TestSpeak(t *testing.T) {
+	assistant := &fakeAssistant{
+		genOut:     "## Yesterday\n- did stuff",
+		scriptOut:  "Yesterday I did stuff.",
+		synthAudio: []byte("MP3BYTES"),
+	}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(7, 0)
+	_, err := st.Add("did stuff")
+	require.NoError(t, err)
+	st.Now = today(8, 0)
+	out := filepath.Join(t.TempDir(), "standup.mp3")
+	root.SetArgs([]string{"speak", "-o", out})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, 1, assistant.scriptCalls)
+	assert.Contains(t, assistant.scriptRep, "did stuff", "the rendered report feeds the speaker")
+	assert.Equal(t, 1, assistant.synthCalls)
+	assert.Equal(t, "Yesterday I did stuff.", assistant.synthScript, "TTS narrates the printed script")
+	audio, err := os.ReadFile(out)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("MP3BYTES"), audio, "Go writes the audio bytes deterministically")
+	assert.Contains(t, buf.String(), "Yesterday I did stuff.", "the script is printed")
+	assert.Contains(t, buf.String(), out, "the written path is echoed")
+}
+
+func TestSpeakPreviewSkipsSynthesis(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- x", scriptOut: "Today I did x."}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("x")
+	require.NoError(t, err)
+	t.Chdir(t.TempDir())
+	root.SetArgs([]string{"speak"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, 1, assistant.scriptCalls)
+	assert.Equal(t, 0, assistant.synthCalls, "no -o: preview only, no speech endpoint call")
+	assert.Contains(t, buf.String(), "Today I did x.")
+	_, statErr := os.Stat("standup.mp3")
+	assert.ErrorIs(t, statErr, os.ErrNotExist, "preview writes no file")
+}
+
+func TestSpeakEmpty(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	root.SetArgs([]string{"speak", "-o", filepath.Join(t.TempDir(), "out.mp3")})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, 0, assistant.scriptCalls, "no report, no speaker call")
+	assert.Contains(t, buf.String(), "nothing to report")
+}
+
+func TestSpeakScriptErrorSkipsSynthesis(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- x", scriptErr: assert.AnError}
+	st, root, _ := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("x")
+	require.NoError(t, err)
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	root.SetArgs([]string{"speak", "-o", out})
+	err = root.Execute()
+	assert.ErrorIs(t, err, assert.AnError)
+	assert.Equal(t, 0, assistant.synthCalls)
+	_, statErr := os.Stat(out)
+	assert.ErrorIs(t, statErr, os.ErrNotExist, "a failed script leaves no partial file")
+}
+
+func TestSpeakSynthesizeErrorWritesNothing(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- x", scriptOut: "x", synthErr: assert.AnError}
+	st, root, _ := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("x")
+	require.NoError(t, err)
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	root.SetArgs([]string{"speak", "-o", out})
+	err = root.Execute()
+	assert.ErrorIs(t, err, assert.AnError)
+	_, statErr := os.Stat(out)
+	assert.ErrorIs(t, statErr, os.ErrNotExist, "a failed speech call leaves no partial file")
+}
+
+func TestSpeakWindowFlags(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "x", scriptOut: "x", synthAudio: []byte("A")}
+	st, root, _ := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("x")
+	require.NoError(t, err)
+	root.SetArgs([]string{"speak", "--from", "2026-08-14"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--from and --to are both required")
 }
 
 func TestListFlagShorthand(t *testing.T) {
@@ -1485,6 +1597,14 @@ func (r *rawAss) AddTasks(ctx context.Context, rawText string) ([]store.Task, er
 
 func (r *rawAss) Generate(ctx context.Context, sec report.Section) (string, error) {
 	return "", nil
+}
+
+func (r *rawAss) Script(ctx context.Context, report string) (string, error) {
+	return "", nil
+}
+
+func (r *rawAss) Synthesize(ctx context.Context, script string) ([]byte, error) {
+	return nil, nil
 }
 
 var _ agent.Assistant = (*rawAss)(nil)

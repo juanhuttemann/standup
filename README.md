@@ -48,8 +48,8 @@ keep a `config/` dir next to where you run it. Resolution order per file:
 Online mode needs `OPENAI_BASE_URL` (OpenAI-compatible endpoint) and
 `OPENAI_MODEL` (served model name) in the environment or a `.env` — looked
 up in the working directory or any parent (like git resolves its config),
-then the config dirs. Only `add` and `generate` use a model; every other
-command runs without credentials. Skip both for offline mode (below).
+then the config dirs. Only `add`, `generate`, and `speak` use a model; every
+other command runs without credentials. Skip both for offline mode (below).
 
 ## Use
 
@@ -68,6 +68,8 @@ standup generate --from 2026-08-03 --to 2026-08-07   # explicit window, dated he
 standup generate --clip             # copy the report to the clipboard
 standup generate --webhook <url>    # POST the report (Slack-compatible JSON)
 standup generate --mail <address>   # email the report (needs smtp_* in config.yaml)
+standup speak                       # print the standup as a spoken brief (free preview, no audio)
+standup speak -o standup.wav        # synthesize the brief to audio (needs OPENAI_SPEECH_MODEL/VOICE env)
 standup status <id> in-progress     # set status: todo, in-progress, blocked, done
 standup done <id>                   # mark done, no model involved
 standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
@@ -122,7 +124,8 @@ Goose. Then ask your agent:
 ## Report language
 
 Set `language:` in `config.yaml` (or `STANDUP_LANGUAGE`) — the model
-rephrases task entries in that language. Empty keeps the input language.
+rephrases task entries (and the `speak` brief) in that language. Empty keeps
+the input language.
 
 ## Timezone
 

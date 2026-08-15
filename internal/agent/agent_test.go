@@ -2,14 +2,19 @@ package agent
 
 import (
 	"context"
+	"encoding/binary"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"text/template"
 	"time"
 
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -217,6 +222,165 @@ func TestExtractStrings(t *testing.T) {
 	assert.Error(t, err)
 	_, err = extractStrings("no json")
 	assert.Error(t, err)
+}
+
+func TestImplScriptReturnsTrimmedScript(t *testing.T) {
+	var gotPrompt string
+	a := &impl{
+		speaker: func(ctx context.Context, prompt string) (string, error) {
+			gotPrompt = prompt
+			return "  Yesterday I fixed the login bug. Today I ship the release. \n", nil
+		},
+		speakerInstructions: "speak plainly",
+	}
+	script, err := a.Script(context.Background(), "## Yesterday\n- [done] fix login bug")
+	require.NoError(t, err)
+	assert.Contains(t, gotPrompt, "speak plainly", "instructions steer the speaker agent")
+	assert.Contains(t, gotPrompt, "## Yesterday\n- [done] fix login bug", "the rendered report is the speaker input")
+	assert.Equal(t, "Yesterday I fixed the login bug. Today I ship the release.", script, "script is trimmed")
+}
+
+func TestImplScriptLanguageInPrompt(t *testing.T) {
+	var gotPrompt string
+	a := &impl{
+		speaker:             func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "x", nil },
+		speakerInstructions: "speak",
+		lang:                "German",
+	}
+	_, err := a.Script(context.Background(), "report")
+	require.NoError(t, err)
+	assert.Contains(t, gotPrompt, "German")
+}
+
+func TestImplScriptEmptyIsAnError(t *testing.T) {
+	a := &impl{
+		speaker: func(ctx context.Context, prompt string) (string, error) { return "  \n ", nil },
+	}
+	_, err := a.Script(context.Background(), "report")
+	assert.Error(t, err, "an empty script must not be narrated")
+}
+
+func TestImplScriptErrorPropagates(t *testing.T) {
+	a := &impl{
+		speaker: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
+	}
+	_, err := a.Script(context.Background(), "report")
+	assert.ErrorIs(t, err, assert.AnError)
+}
+
+func TestImplSynthesizeNarratesTheScript(t *testing.T) {
+	var gotInput string
+	a := &impl{
+		tts: func(ctx context.Context, input string) ([]byte, error) {
+			gotInput = input
+			return []byte("AUDIO"), nil
+		},
+	}
+	audio, err := a.Synthesize(context.Background(), "the script")
+	require.NoError(t, err)
+	assert.Equal(t, "the script", gotInput, "TTS narrates exactly the script")
+	assert.Equal(t, []byte("AUDIO"), audio)
+}
+
+func TestImplSynthesizeTooLongFailsClosed(t *testing.T) {
+	called := false
+	a := &impl{
+		tts: func(ctx context.Context, input string) ([]byte, error) { called = true; return nil, nil },
+	}
+	_, err := a.Synthesize(context.Background(), strings.Repeat("x", 4097))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "4096", "the API input limit is named in the error")
+	assert.False(t, called, "over-limit scripts never reach the speech endpoint")
+}
+
+func TestLocalSpeakUnavailable(t *testing.T) {
+	l := &local{}
+	_, err := l.Script(context.Background(), "report")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "offline")
+	_, err = l.Synthesize(context.Background(), "script")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "offline")
+}
+
+func TestNewTTSRequiresSpeechEnv(t *testing.T) {
+	t.Setenv("OPENAI_SPEECH_MODEL", "")
+	t.Setenv("OPENAI_SPEECH_VOICE", "")
+	tts := newTTS(openai.NewClient(option.WithBaseURL("http://x/v1")))
+	_, err := tts(context.Background(), "hello")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OPENAI_SPEECH_MODEL")
+	assert.Contains(t, err.Error(), "OPENAI_SPEECH_VOICE")
+}
+
+func TestNewTTSStreamsScriptAndReturnsAudio(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		gotBody, err = io.ReadAll(r.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, "/chat/completions", r.URL.Path)
+		w.Header().Set("Content-Type", "text/event-stream")
+		chunks := []string{
+			"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"id\":\"a1\",\"data\":\"TVAz\"}}}]}\n\n",
+			"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"QllURVM=\",\"transcript\":\"hi\"}},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, c := range chunks {
+			_, err := w.Write([]byte(c))
+			assert.NoError(t, err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("OPENAI_SPEECH_MODEL", "test-tts")
+	t.Setenv("OPENAI_SPEECH_VOICE", "test-voice")
+
+	tts := newTTS(openai.NewClient(option.WithBaseURL(srv.URL)))
+	audio, err := tts(context.Background(), "hello standup")
+	require.NoError(t, err)
+	want := wavWrap([]byte("MP3BYTES"))
+	assert.Equal(t, want, audio, "base64 audio chunks are joined, decoded and wav-wrapped")
+	body := string(gotBody)
+	assert.Contains(t, body, `"stream":true`, "audio output requires streaming")
+	assert.Contains(t, body, `"modalities":["text","audio"]`)
+	assert.Contains(t, body, `"format":"pcm16"`, "endpoints stream raw pcm16 only")
+	assert.Contains(t, body, `"model":"test-tts"`)
+	assert.Contains(t, body, `"voice":"test-voice"`)
+	assert.Contains(t, body, `"content":"hello standup"`)
+}
+
+func TestWavWrap(t *testing.T) {
+	pcm := []byte{1, 2, 3, 4, 5}
+	out := wavWrap(pcm)
+	require.Len(t, out, 44+len(pcm))
+	assert.Equal(t, "RIFF", string(out[0:4]))
+	assert.Equal(t, uint32(36+len(pcm)), binary.LittleEndian.Uint32(out[4:]))
+	assert.Equal(t, "WAVE", string(out[8:12]))
+	assert.Equal(t, "fmt ", string(out[12:16]))
+	assert.Equal(t, uint16(1), binary.LittleEndian.Uint16(out[20:]), "PCM format tag")
+	assert.Equal(t, uint16(1), binary.LittleEndian.Uint16(out[22:]), "mono")
+	assert.Equal(t, uint32(24000), binary.LittleEndian.Uint32(out[24:]), "speech pcm16 rate")
+	assert.Equal(t, uint32(48000), binary.LittleEndian.Uint32(out[28:]), "byte rate")
+	assert.Equal(t, uint16(16), binary.LittleEndian.Uint16(out[34:]), "16-bit samples")
+	assert.Equal(t, "data", string(out[36:40]))
+	assert.Equal(t, uint32(len(pcm)), binary.LittleEndian.Uint32(out[40:]))
+	assert.Equal(t, pcm, out[44:], "payload preserved verbatim")
+}
+
+func TestNewTTSFailsClosedOnMissingAudio(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err := w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"no audio here\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("OPENAI_SPEECH_MODEL", "test-tts")
+	t.Setenv("OPENAI_SPEECH_VOICE", "test-voice")
+
+	tts := newTTS(openai.NewClient(option.WithBaseURL(srv.URL)))
+	_, err := tts(context.Background(), "hello")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no audio", "a text-only reply is a speech failure, not an empty file")
 }
 
 func TestLocalAddTasksSplitsParagraphs(t *testing.T) {
