@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-15
+
 ### Added
 - Zero-config startup: config defaults are embedded in the binary; every
   command works right after install. Config resolution per file:
