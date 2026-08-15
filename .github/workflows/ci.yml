@@ -73,6 +73,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # goreleaser needs full history (previous tags)
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26.5'
