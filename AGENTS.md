@@ -49,8 +49,10 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Write the failing test first (testify). Tests use `t.TempDir()` and fake `Assistant` impls.
 - Pure packages (`store`, `report`, `config`) are tested without any network.
 - `internal/agent` exposes an `Assistant` interface so CLI tests never hit a server.
-- `make verify` (fmt, vet, cyclo, ineffassign, golangci, deadcode, test) must pass before
-  any commit and before calling any work done.
+- `make verify` (fmt, vet, cyclo, ineffassign, golangci, deadcode, test,
+  ignored-go — the last fails if any `.go` file is gitignored, e.g. by an
+  unanchored pattern) must pass before any commit and before calling any work
+  done.
 - Never discard errors (`_ =`, `_, _ =`). Handle, wrap, or return them — in tests, assert
   them. Lazy work is not allowed.
 
@@ -93,6 +95,9 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - `internal/report` — standup split/ordering, day ranges, carry-over, lookback time math.
 - `internal/git` — commit collection (shells out to git, filtered to the repo's user).
 - `internal/config` — viper loading, env overrides.
+- `scripts/` — release-binary installers (`install.sh`, `install.ps1`); the
+  release pipeline itself is `.goreleaser.yml` + the CI `release` job, flow in
+  `RELEASING.md`.
 
 ### Statuses
 - `todo` | `in-progress` | `blocked` | `done` — validated at the store boundary.

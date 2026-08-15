@@ -1,6 +1,33 @@
 # standup
 
+<div align="center">
+
+[![Go version](https://img.shields.io/github/go-mod/go-version/juanhuttemann/standup)](https://github.com/juanhuttemann/standup/blob/main/go.mod)
+[![CI](https://github.com/juanhuttemann/standup/actions/workflows/ci.yml/badge.svg)](https://github.com/juanhuttemann/standup/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/juanhuttemann/standup)](https://github.com/juanhuttemann/standup/releases)
+[![Go report](https://goreportcard.com/badge/github.com/juanhuttemann/standup)](https://goreportcard.com/report/github.com/juanhuttemann/standup)
+[![MIT license](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/juanhuttemann/standup/blob/main/LICENSE)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue.svg)
+
+</div>
+
 AI-assisted standup CLI. Requires Go 1.26+.
+
+## Quick install
+
+Linux, macOS, WSL2, Termux (installs to `~/.local/bin`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.sh | bash
+```
+
+Windows (native, PowerShell):
+
+```powershell
+iex (irm https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.ps1)
+```
+
+Both fetch the latest release binaries; see [releases](https://github.com/juanhuttemann/standup/releases). To build from source: `go build -o standup ./cmd/standup`.
 
 ## Setup
 

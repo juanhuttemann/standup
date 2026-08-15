@@ -1,0 +1,17 @@
+version: 2
+builds:
+  - env: [CGO_ENABLED=0]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{.Version}}"]
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+archives:
+  - name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+release:
+  draft: true
+changelog:
+  disable: true # CHANGELOG.md is maintained by hand (see RELEASING.md)

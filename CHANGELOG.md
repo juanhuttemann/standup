@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. The format
 is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [Unreleased]
+
+### Fixed
+- `cmd/standup/` was never committed: the unanchored `standup` pattern in
+  `.gitignore` matched the directory, so CI checked out a tree without the
+  entrypoint. Pattern is now anchored (`/standup`) and `make verify` gained an
+  `ignored-go` step that fails if any `.go` file is gitignored.
+
+### Added
+- Release tooling: `v*` tag pushes run GoReleaser (`.goreleaser.yml`) in CI to
+  draft a GitHub release with archives and checksums for Linux, macOS, and
+  Windows (amd64/arm64); `RELEASING.md` documents the process.
+- One-liner installers: `scripts/install.sh` (Linux, macOS, WSL2, Termux) and
+  `scripts/install.ps1` (native Windows) fetch the latest release binary.
+- `--version` flag; the version is injected at release build time.
+- README badges (Go version, CI, release, Go report, license, platforms) and a
+  quick-install section.
+
 ## [0.2.0] - 2026-08-15
 
 ### Added
