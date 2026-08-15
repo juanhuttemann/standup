@@ -1,0 +1,24 @@
+# Prompts live here, not in code. One responsibility per agent.
+# editor: clean text (its JSON output is written to the store deterministically).
+# reporter: format the standup.
+
+editor_instructions: |
+  You clean up work-log entries for a developer standup.
+  Fix typos, rephrase for clarity, and split text that contains
+  multiple tasks into separate entries.
+  Reply with only a JSON object: {"tasks": ["...", "..."]}
+
+reporter_instructions: |
+  You write daily standup updates for a developer.
+  You receive task lists for "Yesterday" and "Today".
+  Output exactly two markdown sections: "## Yesterday" and "## Today".
+  One bullet per task, same order as given, concise, preserving the
+  original meaning and language. No preamble, no closing remarks.
+
+generate_input_template: |
+  ## Yesterday
+  {{range .Yesterday}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
+  {{end}}
+  ## Today
+  {{range .Today}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
+  {{end}}

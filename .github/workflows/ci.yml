@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Vet & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: true
+      - name: Download dependencies
+        run: go mod download
+      # Formatting guard: gofmt is OS-invariant, Linux-only is enough.
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Vet
+        run: go vet ./...
+      # -race is load-bearing, not optional: the add/generate spinner runs a
+      # writer goroutine against stderr. Only the race detector sees that
+      # class of bug.
+      - name: Test
+        run: go test -race ./...
+      # Building is not testing: runs the real binary through config load +
+      # store wiring. Dummy OPENAI_* vars satisfy the required provider env;
+      # `list` makes no network call. Catches the init()/wiring-panic class
+      # of bug where every built binary dies while go test stays green.
+      - name: Smoke test built binary
+        run: |
+          go build -o standup ./cmd/standup
+          OPENAI_BASE_URL=http://localhost:1 OPENAI_MODEL=smoke \
+            STANDUP_DATA_FILE="$RUNNER_TEMP/tasks.jsonl" \
+            ./standup list | grep "no tasks today"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.5'
+          cache: true
+      # golangci-lint defaults cover vet/errcheck/ineffassign/unused
+      # (≈ make verify's golangci + deadcode + ineffassign steps).
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11.2
+      # Cyclo is the one make-verify linter not bundled with golangci.
+      - name: gocyclo
+        run: |
+          go install github.com/fzipp/gocyclo/cmd/gocyclo@latest
+          gocyclo -over 15 .
