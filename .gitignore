@@ -2,3 +2,6 @@
 /standup
 dist/
 *.jsonl
+
+# local working notes, never shipped
+TODO.md
