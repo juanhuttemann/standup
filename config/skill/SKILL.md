@@ -26,7 +26,8 @@ trailing `#word` tokens in task text.
   `## Blockers`. `standup generate 5` for more days, `--from`/`--to
   YYYY-MM-DD` for an explicit window, `--clip` to copy the report,
   `--webhook <url>` to POST it (Slack-compatible JSON), `--mail <address>`
-  to email it (needs `smtp_*` config).
+  to email it (needs `smtp_*` config), `--obsidian` to publish into the
+  configured Obsidian vault.
 - Status changes: `standup done <id>`, `standup status <id> blocked` (or
   `todo`, `in-progress`).
 - Review: `standup list` (interactive), `standup list --days 5`, `--date
@@ -37,6 +38,11 @@ trailing `#word` tokens in task text.
 - `<id>` accepts any unambiguous prefix; `list` shows short ids.
 - No model endpoint: `STANDUP_OFFLINE=true` — add splits paragraphs,
   generate renders deterministically. Online mode needs provider env vars.
+- Obsidian export is one-way. Configure `obsidian.vault` and optionally
+  `obsidian.note` (default `Standups/{date}.md`); `{date}` is the report's
+  current date in the configured timezone. Existing notes retain everything
+  outside the managed `standup:start`/`standup:end` markers. The JSONL store
+  remains authoritative.
 - `standup doctor` sanity-checks the setup; `standup init` writes editable
   config files (meeting time, timezone, SMTP, repo globs); `standup update`
   securely installs the latest release in place (`--check` only checks).

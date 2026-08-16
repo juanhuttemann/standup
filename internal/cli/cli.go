@@ -27,6 +27,7 @@ import (
 	"standup/internal/agent"
 	"standup/internal/config"
 	"standup/internal/git"
+	"standup/internal/obsidian"
 	"standup/internal/report"
 	"standup/internal/store"
 	standupupdate "standup/internal/update"
@@ -137,6 +138,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 	genCmd.Flags().String("webhook", "", "POST the report to this webhook URL (Slack-compatible JSON)")
 	genCmd.Flags().String("mail", "", "send the report to this email address (needs smtp_* config)")
 	genCmd.Flags().Bool("team", false, "group the report by recorded commit author (see commits --all-authors)")
+	genCmd.Flags().Bool("obsidian", false, "publish into the configured Obsidian vault")
 
 	speakCmd := &cobra.Command{
 		Use:   "speak [days]",
@@ -1024,6 +1026,9 @@ func selectLoop(st *store.Store, tag string, now time.Time, p painter) error {
 }
 
 func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
+	if flagBool(cmd, "obsidian") && d.Config.ObsidianVault == "" {
+		return errors.New("obsidian.vault is not configured (run: standup config set obsidian.vault /path/to/vault)")
+	}
 	now, err := nowIn(d)
 	if err != nil {
 		return err
@@ -1046,6 +1051,19 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	}
 	if err := deliverReport(cmd, d.Config, out); err != nil {
 		return err
+	}
+	if flagBool(cmd, "obsidian") {
+		note := strings.ReplaceAll(d.Config.ObsidianNote, "{date}", now.Format("2006-01-02"))
+		path, err := obsidian.Publish(d.Config.ObsidianVault, note, out)
+		if err != nil {
+			return fmt.Errorf("obsidian: %w", err)
+		}
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path); err != nil {
+			return err
+		}
+		if flagString(cmd, "output") == "" {
+			return nil
+		}
 	}
 	if path := flagString(cmd, "output"); path != "" {
 		return os.WriteFile(filepath.Clean(path), []byte(out+"\n"), 0o644)

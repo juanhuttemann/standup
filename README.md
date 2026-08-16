@@ -52,6 +52,8 @@ standup config set offline true
 ```sh
 standup config set offline true       # use without a model endpoint
 standup config set meeting_time 09:30
+standup config set obsidian.vault /path/to/vault
+standup config set obsidian.note 'Standups/{date}.md'
 standup config set OPENAI_BASE_URL http://localhost:8080/v1
 standup config set OPENAI_MODEL my-model
 standup config edit                   # open config.yaml in $EDITOR
@@ -80,55 +82,74 @@ standup add "fixed login bug"       # or: standup -a "fixed login bug"
 standup add --raw "verbatim text"   # skip the model, one paragraph = one task
 cat notes.txt | standup add         # piped text becomes tasks
 standup commits [days] [paths...]   # git commits become done tasks (default: last working day)
+
+standup generate                    # or: standup -g  (last working day + today before meeting time)
+standup generate 5 -o standup.md    # multi-day report written to a file
+standup generate --from 2026-08-03 --to 2026-08-07   # explicit window, dated headings
+
 standup list                        # or: standup -l  (arrow keys to navigate, Enter to act)
 standup list --days 5               # trailing N days, oldest first, plain output
 standup list --date 2026-08-10      # one calendar day, plain output
 standup list --tag api              # only tasks carrying the literal #api token
-standup generate                    # or: standup -g  (last working day + today before meeting time)
-standup generate 5 -o standup.md    # multi-day report written to a file
-standup generate --from 2026-08-03 --to 2026-08-07   # explicit window, dated headings
+
+standup done <id>                   # mark done, no model involved
+standup status <id> in-progress     # set status: todo, in-progress, blocked, done
+standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
+standup rm <id>                     # delete, no model involved
+
 standup generate --clip             # copy the report to the clipboard
+standup generate --obsidian         # publish into the configured Obsidian vault
 standup generate --webhook <url>    # POST the report (Slack-compatible JSON)
 standup generate --mail <address>   # email the report (needs smtp_* in config.yaml)
 standup speak                       # print the standup as a spoken brief (free preview, no audio)
 standup speak -o standup.wav        # synthesize the brief to audio (needs OPENAI_SPEECH_MODEL/VOICE env)
-standup status <id> in-progress     # set status: todo, in-progress, blocked, done
-standup done <id>                   # mark done, no model involved
-standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
-standup rm <id>                     # delete, no model involved
+
 standup doctor                      # check the setup: data file, git identity, endpoint
-standup skill install               # teach your AI agent the standup workflow (this repo)
-standup skill install --global      # same, for every repo (~/.agents, ~/.claude)
 standup init                        # write default config files for editing
 standup config set KEY VALUE        # set an app or provider value
 standup config edit                 # open the user config.yaml
+standup skill install               # teach your AI agent the standup workflow (this repo)
+standup skill install --global      # same, for every repo (~/.agents, ~/.claude)
 standup update                      # securely update to the latest release
 standup update --check              # check without installing
 ```
 
-Commands that change a task print the resulting row. `<id>` accepts any
-unambiguous id prefix (list output shows the first 8 characters).
+### Tasks and reports
 
-Tasks carry a status (`todo`, `in-progress`, `blocked`, `done`). Yesterday's
-unfinished tasks carry over into the Today section; blocked tasks are moved
-to a `## Blockers` section until resolved. Tags are plain text: a trailing
-`#word` token anywhere in task text.
+- Statuses are `todo`, `in-progress`, `blocked`, and `done`.
+- Commands that change a task print the updated row.
+- Task IDs accept any unambiguous prefix; `list` displays the first 8 characters.
+- Unfinished tasks from yesterday carry over into Today.
+- Blocked tasks appear under `## Blockers` until resolved.
+- Tags are `#word` tokens in task text.
 
-Imported commits are stored with the commit's author date (day attribution
-survives), the full message without its trailer block, and `done` status —
-including commits you only co-authored. Re-running `commits` skips commits
-already imported. Multi-repo: pass extra paths (`standup commits 1 ../api
-../web`); submodules of each repo are included automatically. The
-`repos.include`/`repos.exclude` glob lists in `config.yaml` filter which
-repos and submodules get ingested (matched against each path as passed) —
-skip forks and vendored dirs without listing paths every run.
-`standup commits --branch` also records the branch name (best-effort,
-`git name-rev` semantics); `list` and reports then render it as `[branch]`.
+### Importing commits
 
-Team standup: `standup commits --all-authors` imports everyone's commits
-and records the author on each; `standup generate --team` then renders one
-section per author (`## alice@example.com`). The store stays one personal
-file — grouping happens at report time.
+`standup commits` imports commits as completed tasks. It preserves the commit's
+author date and full message, removes trailer blocks, includes co-authored
+commits, and skips commits already imported.
+
+- Pass repository paths for a multi-repo import:
+  `standup commits 1 ../api ../web`.
+- Submodules are included automatically.
+- Use `repos.include` and `repos.exclude` in `config.yaml` to filter repositories.
+- Add `--branch` to show branch attribution as `[branch]` in lists and reports.
+
+For a team report, run `standup commits --all-authors`, followed by
+`standup generate --team`. The report gets one section per author while the
+underlying store remains a single personal file.
+
+### Obsidian
+
+Obsidian export is one-way; the JSONL task store remains the source of truth.
+
+1. Set `obsidian.vault` to the vault directory.
+2. Optionally set `obsidian.note` (default: `Standups/{date}.md`).
+3. Run `standup generate --obsidian`.
+
+`{date}` resolves to `YYYY-MM-DD` in the configured timezone. For existing
+notes, standup replaces only the content between its managed
+`standup:start` and `standup:end` markers.
 
 ## Use with AI agents
 

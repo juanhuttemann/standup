@@ -5,6 +5,15 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-16
+
+### Added
+
+- `standup generate --obsidian` publishes a report into the configured
+  Obsidian vault. `obsidian.note` defaults to `Standups/{date}.md`, with the
+  date resolved in the configured timezone; existing notes keep all content
+  outside standup's managed markers, and the JSONL store remains authoritative.
+
 ## [0.9.0] - 2026-08-16
 
 ### Changed

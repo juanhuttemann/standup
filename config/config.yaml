@@ -18,3 +18,7 @@ mail_from: ""
 repos:
   include: []
   exclude: []
+# One-way Markdown publication into an Obsidian vault (`generate --obsidian`).
+obsidian:
+  vault: ""
+  note: "Standups/{date}.md"

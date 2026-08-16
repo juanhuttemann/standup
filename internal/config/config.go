@@ -29,6 +29,8 @@ type Config struct {
 	MailFrom              string
 	ReposInclude          []string
 	ReposExclude          []string
+	ObsidianVault         string
+	ObsidianNote          string
 	EditorInstructions    string
 	ReporterInstructions  string
 	SpeakerInstructions   string
@@ -147,6 +149,7 @@ func setYAMLValue(doc *yaml.Node, key, value string) error {
 		"meeting_time": "!!str", "data_file": "!!str", "offline": "!!bool",
 		"language": "!!str", "timezone": "!!str", "smtp_host": "!!str",
 		"smtp_port": "!!int", "smtp_user": "!!str", "mail_from": "!!str",
+		"obsidian.vault": "!!str", "obsidian.note": "!!str",
 	}
 	tag, ok := tags[key]
 	if !ok {
@@ -171,18 +174,46 @@ func setYAMLValue(doc *yaml.Node, key, value string) error {
 	if root.Kind != yaml.MappingNode {
 		return errors.New("config.yaml must contain a mapping")
 	}
-	for i := 0; i < len(root.Content); i += 2 {
-		if root.Content[i].Value == key {
-			root.Content[i+1].Value = value
-			root.Content[i+1].Tag = tag
-			return nil
+	parts := strings.Split(key, ".")
+	parent := root
+	for _, part := range parts[:len(parts)-1] {
+		next, err := mappingValue(parent, part)
+		if err != nil {
+			return err
+		}
+		parent = next
+	}
+	setMappingValue(parent, parts[len(parts)-1], tag, value)
+	return nil
+}
+
+func mappingValue(parent *yaml.Node, key string) (*yaml.Node, error) {
+	for i := 0; i < len(parent.Content); i += 2 {
+		if parent.Content[i].Value == key {
+			child := parent.Content[i+1]
+			if child.Kind != yaml.MappingNode {
+				return nil, fmt.Errorf("%s must be a mapping", key)
+			}
+			return child, nil
 		}
 	}
-	root.Content = append(root.Content,
+	child := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	parent.Content = append(parent.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, child)
+	return child, nil
+}
+
+func setMappingValue(parent *yaml.Node, key, tag, value string) {
+	for i := 0; i < len(parent.Content); i += 2 {
+		if parent.Content[i].Value == key {
+			parent.Content[i+1].Value = value
+			parent.Content[i+1].Tag = tag
+			return
+		}
+	}
+	parent.Content = append(parent.Content,
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
-		&yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value},
-	)
-	return nil
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value})
 }
 
 func setEnv(key, value string) (string, error) {
@@ -267,26 +298,30 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("read config.yaml: %w", err)
 	}
 	v.SetEnvPrefix("STANDUP")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	v.AutomaticEnv()
 	v.SetDefault("meeting_time", "09:30")
 	v.SetDefault("data_file", "~/.standup/tasks.jsonl")
 	v.SetDefault("offline", false)
 	v.SetDefault("language", "")
 	v.SetDefault("smtp_port", 587)
+	v.SetDefault("obsidian.note", "Standups/{date}.md")
 
 	cfg := Config{
-		MeetingTime:  v.GetString("meeting_time"),
-		DataFile:     v.GetString("data_file"),
-		Offline:      v.GetBool("offline"),
-		Language:     v.GetString("language"),
-		Timezone:     v.GetString("timezone"),
-		SMTPHost:     v.GetString("smtp_host"),
-		SMTPPort:     v.GetInt("smtp_port"),
-		SMTPUser:     v.GetString("smtp_user"),
-		SMTPPassword: v.GetString("smtp_password"),
-		MailFrom:     v.GetString("mail_from"),
-		ReposInclude: v.GetStringSlice("repos.include"),
-		ReposExclude: v.GetStringSlice("repos.exclude"),
+		MeetingTime:   v.GetString("meeting_time"),
+		DataFile:      v.GetString("data_file"),
+		Offline:       v.GetBool("offline"),
+		Language:      v.GetString("language"),
+		Timezone:      v.GetString("timezone"),
+		SMTPHost:      v.GetString("smtp_host"),
+		SMTPPort:      v.GetInt("smtp_port"),
+		SMTPUser:      v.GetString("smtp_user"),
+		SMTPPassword:  v.GetString("smtp_password"),
+		MailFrom:      v.GetString("mail_from"),
+		ReposInclude:  v.GetStringSlice("repos.include"),
+		ReposExclude:  v.GetStringSlice("repos.exclude"),
+		ObsidianVault: v.GetString("obsidian.vault"),
+		ObsidianNote:  v.GetString("obsidian.note"),
 	}
 
 	dataFile, err := expandHome(cfg.DataFile)
@@ -294,6 +329,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.DataFile = dataFile
+	if cfg.ObsidianVault != "" {
+		cfg.ObsidianVault, err = expandHome(cfg.ObsidianVault)
+		if err != nil {
+			return Config{}, fmt.Errorf("expand ~ in obsidian vault: %w", err)
+		}
+	}
 
 	agentYAML, err := readFile(dirs, "agent.yaml", defaults.AgentYAML)
 	if err != nil {

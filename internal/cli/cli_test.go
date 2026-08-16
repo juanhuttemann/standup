@@ -773,6 +773,47 @@ func TestGenerateOutputFileTruncates(t *testing.T) {
 	assert.Equal(t, "short\n", string(b))
 }
 
+func TestGenerateObsidianPublishesConfiguredNote(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- did stuff"}
+	st, _, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("fix bug")
+	require.NoError(t, err)
+	vault := t.TempDir()
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
+			Store:     st,
+			Config: config.Config{
+				MeetingTime:   "09:30",
+				ObsidianVault: vault,
+				ObsidianNote:  "Standups/{date}.md",
+			},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"generate", "--obsidian"})
+	require.NoError(t, root.Execute())
+	b, err := os.ReadFile(filepath.Join(vault, "Standups", "2026-08-15.md"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "<!-- standup:start -->\n## Today\n- did stuff\n<!-- standup:end -->")
+	assert.Contains(t, buf.String(), "wrote ")
+}
+
+func TestGenerateObsidianRequiresVault(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "x"}
+	st, root, _ := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("fix bug")
+	require.NoError(t, err)
+	root.SetArgs([]string{"generate", "--obsidian"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "obsidian.vault")
+}
+
 func TestGenerateFromToWindow(t *testing.T) {
 	assistant := &fakeAssistant{genOut: "x"}
 	st, root, _ := newHarness(t, assistant)

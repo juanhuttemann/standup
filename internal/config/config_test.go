@@ -128,6 +128,26 @@ func TestLoadReposLists(t *testing.T) {
 	assert.Equal(t, []string{"*/vendor"}, cfg.ReposExclude)
 }
 
+func TestLoadObsidianSettings(t *testing.T) {
+	isolateDirs(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "obsidian:\n  vault: \"~/Notes\"\n  note: \"Daily/{date}.md\"\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	home, err := os.UserHomeDir()
+	require.NoError(t, err)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(home, "Notes"), cfg.ObsidianVault)
+	assert.Equal(t, "Daily/{date}.md", cfg.ObsidianNote)
+
+	t.Setenv("STANDUP_OBSIDIAN_VAULT", "/env/vault")
+	cfg, err = Load()
+	require.NoError(t, err)
+	assert.Equal(t, "/env/vault", cfg.ObsidianVault)
+}
+
 func TestLoadDefaults(t *testing.T) {
 	isolateDirs(t)
 	dir := t.TempDir()
@@ -144,6 +164,8 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Equal(t, 587, cfg.SMTPPort, "submission port by default")
 	assert.Empty(t, cfg.SMTPHost, "mail is opt-in: no host, no --mail")
 	assert.Empty(t, cfg.Timezone, "empty timezone = local")
+	assert.Empty(t, cfg.ObsidianVault, "Obsidian export is opt-in")
+	assert.Equal(t, "Standups/{date}.md", cfg.ObsidianNote)
 }
 
 func TestEmbeddedFallbackWhenNoConfigAnywhere(t *testing.T) {
@@ -386,6 +408,44 @@ func TestSetApplicationValue(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(b), "offline: true")
 	assert.Contains(t, string(b), "# Application settings", "setting one value preserves the useful comments")
+}
+
+func TestSetNestedObsidianValue(t *testing.T) {
+	xdg := isolateDirs(t)
+
+	path, err := Set("obsidian.vault", "/notes")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(xdg, "standup", "config.yaml"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "obsidian:\n    vault: \"/notes\"")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "/notes", cfg.ObsidianVault)
+}
+
+func TestSetNestedValueRejectsNonMappingParent(t *testing.T) {
+	for name, value := range map[string]string{
+		"scalar":   "legacy",
+		"sequence": "[legacy]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			isolateDirs(t)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.yaml")
+			original := "obsidian: " + value + "\n"
+			write(t, path, original)
+			t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+			_, err := Set("obsidian.vault", "/notes")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "obsidian must be a mapping")
+			b, readErr := os.ReadFile(path)
+			require.NoError(t, readErr)
+			assert.Equal(t, original, string(b))
+		})
+	}
 }
 
 func TestSetUsesExplicitConfigDir(t *testing.T) {
