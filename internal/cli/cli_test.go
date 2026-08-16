@@ -1406,7 +1406,8 @@ func TestCommitsContinuesPastBadCommit(t *testing.T) {
 }
 
 func TestCommitsDaysArg(t *testing.T) {
-	_, root, _ := newHarness(t, &fakeAssistant{})
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	st.Now = today(8, 0)
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) {
 		assert.True(t, since.Equal(time.Date(2026, 8, 13, 0, 0, 0, 0, time.Local)), "3 days: since start of two days ago")
@@ -1731,6 +1732,64 @@ func TestInitCmdWritesDefaults(t *testing.T) {
 		_, err := os.Stat(filepath.Join(xdg, "standup", name))
 		require.NoError(t, err, "%s written", name)
 	}
+}
+
+func TestConfigSetNeverLoadsDeps(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("deps must not load") })
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetArgs([]string{"config", "set", "offline", "true"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "offline=true")
+	b, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "offline: true")
+}
+
+func TestConfigSetProviderWritesDotEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("deps must not load") })
+	root.SetArgs([]string{"config", "set", "OPENAI_BASE_URL", "http://localhost:8080/v1"})
+	require.NoError(t, root.Execute())
+	b, err := os.ReadFile(filepath.Join(dir, ".env"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "OPENAI_BASE_URL=http://localhost:8080/v1")
+}
+
+func TestConfigEditOpensConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	script := filepath.Join(t.TempDir(), "fake-editor.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf 'offline: true\n' > \"$1\"\n"), 0o755))
+	t.Setenv("EDITOR", script)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("deps must not load") })
+	root.SetArgs([]string{"config", "edit"})
+	require.NoError(t, root.Execute())
+	b, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "offline: true")
+}
+
+func TestConfigEditRestoresInvalidYAML(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	path, err := config.EnsureConfig()
+	require.NoError(t, err)
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	script := filepath.Join(t.TempDir(), "bad-editor.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf ': bad' > \"$1\"\n"), 0o755))
+	t.Setenv("EDITOR", script)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("deps must not load") })
+	root.SetArgs([]string{"config", "edit"})
+	err = root.Execute()
+	require.Error(t, err)
+	after, readErr := os.ReadFile(path)
+	require.NoError(t, readErr)
+	assert.Equal(t, before, after)
 }
 
 func TestUpdateAvailable(t *testing.T) {

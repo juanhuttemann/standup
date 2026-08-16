@@ -508,7 +508,7 @@ func TestNewRequiresProviderEnv(t *testing.T) {
 	_, err := New(cfg, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "OPENAI_BASE_URL")
-	assert.Contains(t, err.Error(), "offline: true")
+	assert.Contains(t, err.Error(), "standup config set offline true")
 
 	t.Setenv("OPENAI_BASE_URL", "http://x/v1")
 	_, err = New(cfg, nil)

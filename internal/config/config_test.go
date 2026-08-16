@@ -375,3 +375,58 @@ func TestInitKeepsExistingFiles(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "meeting_time: \"23:45\"\n", string(b), "init never clobbers user edits")
 }
+
+func TestSetApplicationValue(t *testing.T) {
+	xdg := isolateDirs(t)
+
+	path, err := Set("offline", "true")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(xdg, "standup", "config.yaml"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "offline: true")
+	assert.Contains(t, string(b), "# Application settings", "setting one value preserves the useful comments")
+}
+
+func TestSetUsesExplicitConfigDir(t *testing.T) {
+	isolateDirs(t)
+	dir := t.TempDir()
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	path, err := Set("meeting_time", "10:15")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dir, "config.yaml"), path)
+}
+
+func TestSetRejectsInvalidOrUnknownApplicationValue(t *testing.T) {
+	isolateDirs(t)
+	_, err := Set("offline", "sometimes")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boolean")
+	_, err = Set("mystery", "value")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown config key")
+}
+
+func TestSetProviderValueWritesDotEnv(t *testing.T) {
+	xdg := isolateDirs(t)
+	dir := filepath.Join(xdg, "standup")
+	write(t, filepath.Join(dir, ".env"), "# local provider\nOPENAI_MODEL=old\nKEEP=me\n")
+
+	path, err := Set("OPENAI_MODEL", "new-model")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dir, ".env"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "# local provider\nOPENAI_MODEL=new-model\nKEEP=me\n", string(b))
+}
+
+func TestEnsureConfigCreatesEditableFile(t *testing.T) {
+	xdg := isolateDirs(t)
+	path, err := EnsureConfig()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(xdg, "standup", "config.yaml"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, defaults.ConfigYAML, string(b))
+}

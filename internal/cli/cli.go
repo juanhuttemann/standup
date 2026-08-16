@@ -225,6 +225,8 @@ func New(load func() (Deps, error)) *cobra.Command {
 		},
 	}
 
+	configCmd := newConfigCmd()
+
 	updateCmd := &cobra.Command{
 		Use:   "update",
 		Short: "check for a newer release",
@@ -250,8 +252,55 @@ func New(load func() (Deps, error)) *cobra.Command {
 	}
 	skillCmd.Flags().BoolP("global", "g", false, "install to ~/.agents and ~/.claude instead of the repo")
 
-	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, doctorCmd, skillCmd, updateCmd)
+	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd)
 	return root
+}
+
+func newConfigCmd() *cobra.Command {
+	configCmd := &cobra.Command{Use: "config", Short: "set or edit configuration"}
+	configSetCmd := &cobra.Command{
+		Use:   "set KEY VALUE",
+		Short: "set a configuration value",
+		Args:  cobra.ExactArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			file, err := config.Set(args[0], args[1])
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "set %s=%s in %s\n", args[0], args[1], file)
+			return err
+		},
+		SilenceUsage: true,
+	}
+	configEditCmd := &cobra.Command{
+		Use:          "edit",
+		Short:        "open config.yaml in $EDITOR",
+		Args:         cobra.NoArgs,
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			file, err := config.EnsureConfig()
+			if err != nil {
+				return err
+			}
+			before, err := os.ReadFile(file)
+			if err != nil {
+				return err
+			}
+			if err := runEditor(file); err != nil {
+				return err
+			}
+			if err := config.ValidateFile(file); err != nil {
+				if restoreErr := os.WriteFile(file, before, 0o644); restoreErr != nil {
+					return errors.Join(err, fmt.Errorf("restore config: %w", restoreErr))
+				}
+				return fmt.Errorf("invalid config; original restored: %w", err)
+			}
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "config: %s\n", file)
+			return err
+		},
+	}
+	configCmd.AddCommand(configSetCmd, configEditCmd)
+	return configCmd
 }
 
 // releasesLatestURL is the redirecting "latest release" page; the Location
@@ -493,17 +542,32 @@ func editInEditor(current string) (text string, err error) {
 	if err := f.Close(); err != nil {
 		return "", err
 	}
-	parts := strings.Fields(editor)
-	c := exec.Command(parts[0], append(parts[1:], f.Name())...)
-	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := c.Run(); err != nil {
-		return "", fmt.Errorf("editor %q: %w", editor, err)
+	if err := runEditorWith(editor, f.Name()); err != nil {
+		return "", err
 	}
 	b, err := os.ReadFile(f.Name())
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+func runEditor(file string) error {
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = fallbackEditor()
+	}
+	return runEditorWith(editor, file)
+}
+
+func runEditorWith(editor, file string) error {
+	parts := strings.Fields(editor)
+	c := exec.Command(parts[0], append(parts[1:], file)...)
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("editor %q: %w", editor, err)
+	}
+	return nil
 }
 
 // flagString reads a string flag that may not exist on this command.

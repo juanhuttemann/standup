@@ -38,12 +38,33 @@ delete `%LOCALAPPDATA%\standup` and remove it from PATH).
 
 ## Setup
 
-Zero-config: the binary embeds working defaults — install and run.
+The binary embeds working defaults, so read-only commands work immediately.
+Before model-assisted `add`, `generate`, or `speak`, configure a provider or
+enable offline mode:
 
-To customize, either run `standup init` (writes `config.yaml` + `agent.yaml`
-to `~/.config/standup/`, or `%APPDATA%\standup` on Windows, for editing) or
-keep a `config/` dir next to where you run it. Resolution order per file:
-`$STANDUP_CONFIG_DIR` → `./config` → `~/.config/standup` → embedded defaults.
+```sh
+standup config set offline true
+```
+
+## Configuration
+
+```sh
+standup config set offline true       # use without a model endpoint
+standup config set meeting_time 09:30
+standup config set OPENAI_BASE_URL http://localhost:8080/v1
+standup config set OPENAI_MODEL my-model
+standup config edit                   # open config.yaml in $EDITOR
+```
+
+Application settings are stored in the user `config.yaml`
+(`~/.config/standup`, or `%APPDATA%\standup` on Windows). Provider settings
+are stored in its local `.env`, never YAML. `$STANDUP_CONFIG_DIR` changes the
+directory these commands use.
+
+You can also run `standup init` to write `config.yaml` + `agent.yaml`, or keep
+a `config/` dir beside the working directory. Resolution order per file is
+`$STANDUP_CONFIG_DIR` → `./config` → the user config dir → embedded defaults.
+`STANDUP_*` environment variables override YAML.
 
 Online mode needs `OPENAI_BASE_URL` (OpenAI-compatible endpoint) and
 `OPENAI_MODEL` (served model name) in the environment or a `.env` — looked
@@ -78,6 +99,8 @@ standup doctor                      # check the setup: data file, git identity, 
 standup skill install               # teach your AI agent the standup workflow (this repo)
 standup skill install --global      # same, for every repo (~/.agents, ~/.claude)
 standup init                        # write default config files for editing
+standup config set KEY VALUE        # set an app or provider value
+standup config edit                 # open the user config.yaml
 standup update                      # check for a newer release
 ```
 

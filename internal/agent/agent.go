@@ -78,7 +78,7 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing required environment variables: %s (or set offline: true)", strings.Join(missing, ", "))
+		return nil, fmt.Errorf("missing required environment variables: %s (or run: standup config set offline true)", strings.Join(missing, ", "))
 	}
 	client := openai.NewClient(
 		option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),

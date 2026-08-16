@@ -5,6 +5,22 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-16
+
+### Added
+
+- `standup config set KEY VALUE` updates application settings in the user
+  `config.yaml`; `OPENAI_BASE_URL` and `OPENAI_MODEL` stay provider facts and
+  are written to the local config `.env` instead.
+- `standup config edit` opens the user `config.yaml` in `$EDITOR` (falling
+  back to `vi`, or Notepad on Windows) and restores the original if the edit
+  is invalid YAML.
+
+### Changed
+
+- Missing-provider errors now give the terminal-ready fix:
+  `standup config set offline true`.
+
 ## [0.7.0] - 2026-08-15
 
 ### Added

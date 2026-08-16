@@ -6,10 +6,12 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
+	"go.yaml.in/yaml/v3"
 
 	defaults "standup/config"
 )
@@ -56,6 +58,160 @@ func UserDir() (string, error) {
 		return "", fmt.Errorf("config: user config dir: %w", err)
 	}
 	return filepath.Join(base, "standup"), nil
+}
+
+// writeDir is the explicit config directory, or the per-user directory.
+// Commands never modify a repository's ./config implicitly.
+func writeDir() (string, error) {
+	if dir := os.Getenv("STANDUP_CONFIG_DIR"); dir != "" {
+		return dir, nil
+	}
+	return UserDir()
+}
+
+// EnsureConfig creates the editable config.yaml from the embedded defaults.
+func EnsureConfig() (string, error) {
+	dir, err := writeDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, "config.yaml")
+	if _, err := os.Stat(path); err == nil {
+		return path, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(defaults.ConfigYAML), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// ValidateFile checks that an edited application config is valid YAML.
+func ValidateFile(path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("read config.yaml: %w", err)
+	}
+	return nil
+}
+
+// Set persists application settings in config.yaml and provider deployment
+// facts in the config directory's .env.
+func Set(key, value string) (string, error) {
+	if key == "OPENAI_BASE_URL" || key == "OPENAI_MODEL" {
+		return setEnv(key, value)
+	}
+	path, err := EnsureConfig()
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return "", fmt.Errorf("read config.yaml: %w", err)
+	}
+	if err := setYAMLValue(&doc, key, value); err != nil {
+		return "", err
+	}
+	b, err = yaml.Marshal(&doc)
+	if err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func setYAMLValue(doc *yaml.Node, key, value string) error {
+	tags := map[string]string{
+		"meeting_time": "!!str", "data_file": "!!str", "offline": "!!bool",
+		"language": "!!str", "timezone": "!!str", "smtp_host": "!!str",
+		"smtp_port": "!!int", "smtp_user": "!!str", "mail_from": "!!str",
+	}
+	tag, ok := tags[key]
+	if !ok {
+		return fmt.Errorf("unknown config key %q", key)
+	}
+	switch tag {
+	case "!!bool":
+		parsed, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("%s must be a boolean: %w", key, err)
+		}
+		value = strconv.FormatBool(parsed)
+	case "!!int":
+		if _, err := strconv.Atoi(value); err != nil {
+			return fmt.Errorf("%s must be an integer: %w", key, err)
+		}
+	}
+	if len(doc.Content) == 0 {
+		doc.Content = append(doc.Content, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
+	}
+	root := doc.Content[0]
+	if root.Kind != yaml.MappingNode {
+		return errors.New("config.yaml must contain a mapping")
+	}
+	for i := 0; i < len(root.Content); i += 2 {
+		if root.Content[i].Value == key {
+			root.Content[i+1].Value = value
+			root.Content[i+1].Tag = tag
+			return nil
+		}
+	}
+	root.Content = append(root.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value},
+	)
+	return nil
+}
+
+func setEnv(key, value string) (string, error) {
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return "", fmt.Errorf("%s must be a non-empty single-line value", key)
+	}
+	dir, err := writeDir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	path := filepath.Join(dir, ".env")
+	b, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
+	line := key + "=" + value
+	lines := strings.Split(string(b), "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	found := false
+	for i := range lines {
+		if strings.HasPrefix(lines[i], key+"=") {
+			lines[i], found = line, true
+		}
+	}
+	if !found {
+		lines = append(lines, line)
+	}
+	out := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 // Init writes the embedded default config files into the user config dir,

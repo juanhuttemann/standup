@@ -51,6 +51,10 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   application settings (`meeting_time`, `data_file`, `offline`, `language`) in
   `config/config.yaml`; provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`,
   `OPENAI_SPEECH_MODEL`, `OPENAI_SPEECH_VOICE`) in local `.env`/env only.
+- `config set` writes application keys to the user `config.yaml` and the
+  supported provider keys to its `.env`; `config edit` opens that YAML.
+  `$STANDUP_CONFIG_DIR` redirects both commands. Neither command implicitly
+  edits a repository's `./config`.
 - Precedence: `STANDUP_*` env > `.env` > yaml. `.env` resolves by walking up from
   the cwd (like git); config files resolve per file through the dir chain
   `$STANDUP_CONFIG_DIR` → `./config` → user config dir →
