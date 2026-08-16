@@ -70,6 +70,13 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   One short comment per setting. No policy essays, no cross-references to other
   files, no conflicting instructions.
 
+### Update policy
+- `standup update` installs the latest release in place; `--check` is read-only.
+- Release tags are compared as semantic versions and updates never downgrade.
+- Downloads use version-pinned release URLs, require the matching SHA-256 entry,
+  accept only the expected binary archive, validate the candidate's `--version`,
+  and replace from the executable's directory so failures leave the old binary.
+
 ### TDD loop
 - Write the failing test first (testify). Tests use `t.TempDir()` and fake `Assistant` impls.
 - Pure packages (`store`, `report`, `config`) are tested without any network.

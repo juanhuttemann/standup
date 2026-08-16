@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-16
+
+### Changed
+
+- `standup update` now securely downloads, verifies, and installs the latest
+  release in place instead of printing an installer command; `--check` keeps
+  the previous check-only behavior.
+- Installers now require a matching SHA-256 checksum and fail closed when the
+  checksum file or entry is missing.
+
 ## [0.8.1] - 2026-08-16
 
 ### Fixed

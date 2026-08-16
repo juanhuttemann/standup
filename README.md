@@ -31,8 +31,9 @@ iex (irm https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/in
 
 Both fetch the latest release binaries; see [releases](https://github.com/juanhuttemann/standup/releases). To build from source: `go build -o standup ./cmd/standup`.
 
-`standup update` compares your version with the latest release and prints
-the installer command to rerun. Uninstall: delete the binary
+`standup update` securely downloads, verifies, and installs the latest release
+in place; `standup update --check` only reports whether one is available.
+Uninstall: delete the binary
 (`rm ~/.local/bin/standup`; root installs live in `/usr/local/bin`; Windows:
 delete `%LOCALAPPDATA%\standup` and remove it from PATH).
 
@@ -101,7 +102,8 @@ standup skill install --global      # same, for every repo (~/.agents, ~/.claude
 standup init                        # write default config files for editing
 standup config set KEY VALUE        # set an app or provider value
 standup config edit                 # open the user config.yaml
-standup update                      # check for a newer release
+standup update                      # securely update to the latest release
+standup update --check              # check without installing
 ```
 
 Commands that change a task print the resulting row. `<id>` accepts any

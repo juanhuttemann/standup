@@ -29,6 +29,7 @@ import (
 	"standup/internal/git"
 	"standup/internal/report"
 	"standup/internal/store"
+	standupupdate "standup/internal/update"
 )
 
 // gitLog is swappable so CLI tests never depend on a real repository.
@@ -229,12 +230,13 @@ func New(load func() (Deps, error)) *cobra.Command {
 
 	updateCmd := &cobra.Command{
 		Use:   "update",
-		Short: "check for a newer release",
+		Short: "update to the latest release",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runUpdate(cmd)
 		},
 		SilenceUsage: true,
 	}
+	updateCmd.Flags().Bool("check", false, "check for an update without installing it")
 
 	skillCmd := &cobra.Command{
 		Use:   "skill install",
@@ -303,60 +305,25 @@ func newConfigCmd() *cobra.Command {
 	return configCmd
 }
 
-// releasesLatestURL is the redirecting "latest release" page; the Location
-// header names the newest tag without an API call or rate limit.
-var releasesLatestURL = "https://github.com/juanhuttemann/standup/releases/latest"
+var selfUpdate = standupupdate.Run
 
-// latestTag is swappable so tests never hit the network.
-var latestTag = func() (string, error) { return latestReleaseTag() }
-
-// latestReleaseTag resolves the newest release tag from the redirect. Var
-// URL, fixed URL in production.
-func latestReleaseTag() (string, error) {
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		// The first hop is the answer; do not follow it (the tag page is
-		// just HTML).
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-	resp, err := client.Head(releasesLatestURL)
-	if err != nil {
-		return "", fmt.Errorf("%w (check network)", err)
-	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			err = errors.Join(err, cerr)
-		}
-	}()
-	loc := resp.Header.Get("Location")
-	if loc == "" {
-		return "", fmt.Errorf("no release redirect (status %s)", resp.Status)
-	}
-	return path.Base(loc), nil
-}
-
-// runUpdate compares the running version with the newest release and says
-// how to update; like init it never loads deps (nothing to configure, no
-// provider credentials — the check hits GitHub, not the model endpoint).
+// runUpdate updates the running binary without loading application or model
+// dependencies. --check preserves a read-only path for automation.
 func runUpdate(cmd *cobra.Command) error {
-	tag, err := latestTag()
+	result, err := selfUpdate(cmd.Context(), cmd.Root().Version, flagBool(cmd, "check"))
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
 	}
-	cur := "v" + strings.TrimPrefix(cmd.Root().Version, "v")
-	if "v"+strings.TrimPrefix(tag, "v") == cur {
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "up to date (%s)\n", tag)
-		return err
+	switch {
+	case result.Updated:
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "updated %s -> %s\n", result.Current, result.Latest)
+	case result.State == standupupdate.UpgradeAvailable:
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "update available: %s (current: %s)\n", result.Latest, result.Current)
+	case result.State == standupupdate.NewerInstalled:
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "installed version %s is newer than latest release %s\n", result.Current, result.Latest)
+	default:
+		_, err = fmt.Fprintf(cmd.OutOrStdout(), "up to date (%s)\n", result.Latest)
 	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "update available: %s (current: %s)\n", tag, cur)
-	if err != nil {
-		return err
-	}
-	inst := "curl -fsSL https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.sh | bash"
-	if runtime.GOOS == "windows" {
-		inst = "iex (irm https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.ps1)"
-	}
-	_, err = fmt.Fprintf(cmd.OutOrStdout(), "rerun the installer to update:\n  %s\n", inst)
 	return err
 }
 

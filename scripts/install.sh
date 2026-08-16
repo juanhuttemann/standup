@@ -24,32 +24,33 @@ bin_dir=${STANDUP_BIN_DIR:-$HOME/.local/bin}
 if [ "$(id -u)" = 0 ]; then bin_dir=/usr/local/bin; fi
 if [ -n "${TERMUX_VERSION:-}" ]; then bin_dir=${PREFIX:?}/bin; fi
 
-url="https://github.com/$repo/releases/latest/download/standup_${os}_${arch}.tar.gz"
+asset="standup_${os}_${arch}.tar.gz"
+url="https://github.com/$repo/releases/latest/download/$asset"
 sum_url="https://github.com/$repo/releases/latest/download/standup_checksums.txt"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
 echo "Downloading $url"
 # Keep the release filename: sha256sum -c resolves it relative to $tmp.
-curl -fsSL "$url" -o "$tmp/standup_${os}_${arch}.tar.gz"
+curl -fsSL "$url" -o "$tmp/$asset"
 
-# Verify the archive checksum when this release publishes one (older
-# releases have only a versioned checksums file — skip with a note).
-if curl -fsSL "$sum_url" -o "$tmp/checksums.txt" 2>/dev/null; then
-  line=$(grep "standup_${os}_${arch}.tar.gz" "$tmp/checksums.txt" || true)
-  if [ -n "$line" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      sum=sha256sum
-    else
-      sum="shasum -a 256"
-    fi
-    (cd "$tmp" && echo "$line" | $sum -c -) || { echo "checksum mismatch — aborting" >&2; exit 1; }
-  fi
+# A release without a matching checksum is not safe to install.
+curl -fsSL "$sum_url" -o "$tmp/checksums.txt"
+line=$(awk -v asset="$asset" '$2 == asset { print }' "$tmp/checksums.txt")
+[ "$(printf '%s\n' "$line" | awk 'NF { count++ } END { print count + 0 }')" = 1 ] || {
+  echo "expected exactly one checksum for $asset — aborting" >&2
+  exit 1
+}
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$tmp" && printf '%s\n' "$line" | sha256sum -c -)
+elif command -v shasum >/dev/null 2>&1; then
+  (cd "$tmp" && printf '%s\n' "$line" | shasum -a 256 -c -)
 else
-  echo "note: no checksums file on this release, skipping verification" >&2
+  echo "sha256sum or shasum is required — aborting" >&2
+  exit 1
 fi
 
-tar -xzf "$tmp/standup_${os}_${arch}.tar.gz" -C "$tmp"
+tar -xzf "$tmp/$asset" -C "$tmp"
 
 mkdir -p "$bin_dir"
 mv "$tmp/standup" "$bin_dir/standup"

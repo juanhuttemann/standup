@@ -39,4 +39,4 @@ trailing `#word` tokens in task text.
   generate renders deterministically. Online mode needs provider env vars.
 - `standup doctor` sanity-checks the setup; `standup init` writes editable
   config files (meeting time, timezone, SMTP, repo globs); `standup update`
-  checks for a newer release.
+  securely installs the latest release in place (`--check` only checks).

@@ -27,6 +27,7 @@ import (
 	"standup/internal/git"
 	"standup/internal/report"
 	"standup/internal/store"
+	standupupdate "standup/internal/update"
 )
 
 type fakeAssistant struct {
@@ -1800,21 +1801,24 @@ func TestConfigEditRestoresInvalidYAML(t *testing.T) {
 }
 
 func TestUpdateAvailable(t *testing.T) {
-	old := latestTag
-	latestTag = func() (string, error) { return "v0.6.0", nil }
-	t.Cleanup(func() { latestTag = old })
+	old := selfUpdate
+	selfUpdate = func(context.Context, string, bool) (standupupdate.Result, error) {
+		return standupupdate.Result{Current: "v0.5.0", Latest: "v0.6.0", State: standupupdate.UpgradeAvailable}, nil
+	}
+	t.Cleanup(func() { selfUpdate = old })
 	_, root, buf := newHarness(t, &fakeAssistant{})
 	root.Version = "0.5.0"
-	root.SetArgs([]string{"update"})
+	root.SetArgs([]string{"update", "--check"})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, buf.String(), "update available: v0.6.0 (current: v0.5.0)")
-	assert.Contains(t, buf.String(), "install.sh", "the message says how to update")
 }
 
 func TestUpdateUpToDate(t *testing.T) {
-	old := latestTag
-	latestTag = func() (string, error) { return "v0.5.0", nil }
-	t.Cleanup(func() { latestTag = old })
+	old := selfUpdate
+	selfUpdate = func(context.Context, string, bool) (standupupdate.Result, error) {
+		return standupupdate.Result{Current: "v0.5.0", Latest: "v0.5.0", State: standupupdate.UpToDate}, nil
+	}
+	t.Cleanup(func() { selfUpdate = old })
 	_, root, buf := newHarness(t, &fakeAssistant{})
 	root.Version = "0.5.0"
 	root.SetArgs([]string{"update"})
@@ -1823,29 +1827,30 @@ func TestUpdateUpToDate(t *testing.T) {
 }
 
 func TestUpdateNetworkErrorFails(t *testing.T) {
-	old := latestTag
-	latestTag = func() (string, error) { return "", errors.New("no network") }
-	t.Cleanup(func() { latestTag = old })
+	old := selfUpdate
+	selfUpdate = func(context.Context, string, bool) (standupupdate.Result, error) {
+		return standupupdate.Result{}, errors.New("no network")
+	}
+	t.Cleanup(func() { selfUpdate = old })
 	_, root, _ := newHarness(t, &fakeAssistant{})
 	root.Version = "0.5.0"
 	root.SetArgs([]string{"update"})
 	assert.Error(t, root.Execute())
 }
 
-func TestLatestTagFollowsRedirect(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Location", "https://github.com/x/standup/releases/tag/v0.6.0")
-		w.WriteHeader(http.StatusFound)
-	}))
-	t.Cleanup(srv.Close)
-	oldURL, oldTag := releasesLatestURL, latestTag
-	releasesLatestURL = srv.URL
-	latestTag = func() (string, error) { return latestReleaseTag() }
-	t.Cleanup(func() { releasesLatestURL, latestTag = oldURL, oldTag })
-
-	tag, err := latestTag()
-	require.NoError(t, err)
-	assert.Equal(t, "v0.6.0", tag)
+func TestUpdateInstallsByDefault(t *testing.T) {
+	old := selfUpdate
+	selfUpdate = func(_ context.Context, version string, check bool) (standupupdate.Result, error) {
+		assert.Equal(t, "0.5.0", version)
+		assert.False(t, check)
+		return standupupdate.Result{Current: "v0.5.0", Latest: "v0.6.0", State: standupupdate.UpgradeAvailable, Updated: true}, nil
+	}
+	t.Cleanup(func() { selfUpdate = old })
+	_, root, buf := newHarness(t, &fakeAssistant{})
+	root.Version = "0.5.0"
+	root.SetArgs([]string{"update"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "updated v0.5.0 -> v0.6.0")
 }
 
 func TestSkillInstallWritesBothRoots(t *testing.T) {
