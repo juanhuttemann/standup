@@ -56,10 +56,10 @@ standup config set OPENAI_MODEL my-model
 standup config edit                   # open config.yaml in $EDITOR
 ```
 
-Application settings are stored in the user `config.yaml`
-(`~/.config/standup`, or `%APPDATA%\standup` on Windows). Provider settings
-are stored in its local `.env`, never YAML. `$STANDUP_CONFIG_DIR` changes the
-directory these commands use.
+Application settings are stored in the active `config.yaml`; provider settings
+use that directory's `.env`, never YAML. The active directory is
+`$STANDUP_CONFIG_DIR`, otherwise an existing `./config`, otherwise the user
+config dir (`~/.config/standup`, or `%APPDATA%\standup` on Windows).
 
 You can also run `standup init` to write `config.yaml` + `agent.yaml`, or keep
 a `config/` dir beside the working directory. Resolution order per file is

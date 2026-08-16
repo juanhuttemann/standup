@@ -5,6 +5,16 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-16
+
+### Fixed
+
+- `config set` and `config edit` now target the active `./config` when present,
+  so a higher-precedence project config cannot silently shadow changes written
+  to the user config.
+- Windows interactive `list` no longer panics in promptui's ANSI parser;
+  unsupported truecolor output is disabled on Windows terminals.
+
 ## [0.8.0] - 2026-08-16
 
 ### Added

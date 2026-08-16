@@ -684,6 +684,13 @@ func TestFallbackEditor(t *testing.T) {
 	assert.Equal(t, "vi", fallbackEditor())
 }
 
+func TestTruecolorSupport(t *testing.T) {
+	assert.False(t, truecolorSupported("windows", true, false), "promptui's Windows readline cannot parse truecolor escapes")
+	assert.False(t, truecolorSupported("linux", false, false))
+	assert.False(t, truecolorSupported("linux", true, true))
+	assert.True(t, truecolorSupported("linux", true, false))
+}
+
 func TestGenerateDaysArg(t *testing.T) {
 	assistant := &fakeAssistant{genOut: "## Today"}
 	st, root, _ := newHarness(t, assistant)

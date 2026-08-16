@@ -3,6 +3,7 @@ package cli
 import (
 	"io"
 	"os"
+	"runtime"
 
 	"golang.org/x/term"
 )
@@ -29,7 +30,14 @@ type painter struct{ on bool }
 // (https://no-color.org).
 func newPainter(w io.Writer) painter {
 	f, ok := w.(*os.File)
-	return painter{on: ok && os.Getenv("NO_COLOR") == "" && term.IsTerminal(int(f.Fd()))}
+	terminal := ok && term.IsTerminal(int(f.Fd()))
+	return painter{on: truecolorSupported(runtime.GOOS, terminal, os.Getenv("NO_COLOR") != "")}
+}
+
+// truecolorSupported excludes Windows: promptui's readline ANSI writer
+// panics while parsing 24-bit color sequences used in interactive lists.
+func truecolorSupported(goos string, terminal, noColor bool) bool {
+	return goos != "windows" && terminal && !noColor
 }
 
 func (p painter) wrap(code, s string) string {

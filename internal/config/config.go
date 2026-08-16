@@ -60,11 +60,19 @@ func UserDir() (string, error) {
 	return filepath.Join(base, "standup"), nil
 }
 
-// writeDir is the explicit config directory, or the per-user directory.
-// Commands never modify a repository's ./config implicitly.
+// writeDir returns the directory containing the active config.yaml. An
+// explicit config dir wins; otherwise ./config wins when it has the file,
+// matching Load. With no file yet, commands create the per-user config.
 func writeDir() (string, error) {
 	if dir := os.Getenv("STANDUP_CONFIG_DIR"); dir != "" {
 		return dir, nil
+	}
+	for _, dir := range Dirs() {
+		if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
+			return dir, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
 	}
 	return UserDir()
 }

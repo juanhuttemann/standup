@@ -398,6 +398,25 @@ func TestSetUsesExplicitConfigDir(t *testing.T) {
 	assert.Equal(t, filepath.Join(dir, "config.yaml"), path)
 }
 
+func TestSetUpdatesActiveWorkingDirectoryConfig(t *testing.T) {
+	xdg := isolateDirs(t)
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	write(t, filepath.Join(cwd, "config", "config.yaml"), "offline: false\n")
+
+	path, err := Set("offline", "true")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("config", "config.yaml"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "offline: true")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.True(t, cfg.Offline, "the value written by config set must be the value Load resolves")
+	_, err = os.Stat(filepath.Join(xdg, "standup", "config.yaml"))
+	assert.ErrorIs(t, err, os.ErrNotExist, "a lower-precedence user file must not be written")
+}
+
 func TestSetRejectsInvalidOrUnknownApplicationValue(t *testing.T) {
 	isolateDirs(t)
 	_, err := Set("offline", "sometimes")
