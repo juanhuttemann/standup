@@ -551,6 +551,44 @@ func TestSetProviderValueWritesDotEnv(t *testing.T) {
 	assert.Equal(t, "# local provider\nOPENAI_MODEL=new-model\nKEEP=me\n", string(b))
 }
 
+func TestSetAnthropicProviderValueWritesDotEnv(t *testing.T) {
+	xdg := isolateDirs(t)
+	dir := filepath.Join(xdg, "standup")
+
+	path, err := Set("ANTHROPIC_MODEL", "test-model")
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dir, ".env"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "ANTHROPIC_MODEL=test-model\n", string(b))
+
+	_, err = Set("ANTHROPIC_API_KEY", "secret")
+	require.Error(t, err, "config set echoes values, so it must never accept secrets")
+}
+
+func TestProviderEnv(t *testing.T) {
+	assert.Equal(t, []string{"OPENAI_BASE_URL", "OPENAI_MODEL"}, mustProviderEnv(t, ""))
+	assert.Equal(t, []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"}, mustProviderEnv(t, "anthropic"))
+	_, err := ProviderEnv("mystery")
+	require.Error(t, err)
+}
+
+func TestLoadProviderFromEnvironment(t *testing.T) {
+	isolateDirs(t)
+	t.Setenv("STANDUP_PROVIDER", "anthropic")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "anthropic", cfg.Provider)
+}
+
+func mustProviderEnv(t *testing.T, provider string) []string {
+	t.Helper()
+	got, err := ProviderEnv(provider)
+	require.NoError(t, err)
+	return got
+}
+
 func TestEnsureConfigCreatesEditableFile(t *testing.T) {
 	xdg := isolateDirs(t)
 	path, err := EnsureConfig()

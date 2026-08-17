@@ -390,11 +390,13 @@ func TestLocalSpeakUnavailable(t *testing.T) {
 }
 
 func TestNewTTSRequiresSpeechEnv(t *testing.T) {
+	t.Setenv("OPENAI_BASE_URL", "")
 	t.Setenv("OPENAI_SPEECH_MODEL", "")
 	t.Setenv("OPENAI_SPEECH_VOICE", "")
 	tts := newTTS(openai.NewClient(option.WithBaseURL("http://x/v1")))
 	_, err := tts(context.Background(), "hello")
 	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OPENAI_BASE_URL")
 	assert.Contains(t, err.Error(), "OPENAI_SPEECH_MODEL")
 	assert.Contains(t, err.Error(), "OPENAI_SPEECH_VOICE")
 }
@@ -600,6 +602,65 @@ func TestNewRequiresProviderEnv(t *testing.T) {
 	_, err = New(cfg, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "OPENAI_MODEL")
+}
+
+func TestNewRequiresAnthropicProviderEnv(t *testing.T) {
+	cfg := committedCfg(t)
+	cfg.Provider = "anthropic"
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_MODEL", "")
+
+	_, err := New(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ANTHROPIC_BASE_URL")
+	assert.Contains(t, err.Error(), "ANTHROPIC_API_KEY")
+	assert.Contains(t, err.Error(), "ANTHROPIC_MODEL")
+	assert.NotContains(t, err.Error(), "OPENAI_BASE_URL")
+}
+
+func TestNewRejectsUnknownProvider(t *testing.T) {
+	cfg := committedCfg(t)
+	cfg.Provider = "mystery"
+
+	_, err := New(cfg, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported provider")
+}
+
+func TestAnthropicAddTasksUsesMessagesAPI(t *testing.T) {
+	var gotPath, gotKey, gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		gotPath = r.URL.Path
+		gotKey = r.Header.Get("x-api-key")
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"id":"msg_test","type":"message","role":"assistant","model":"test-model","content":[{"type":"text","text":"{\"tasks\":[{\"task\":\"fixed bug\",\"status\":\"todo\"}]}"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("ANTHROPIC_BASE_URL", srv.URL)
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "must-not-shadow-explicit-api-key")
+	t.Setenv("ANTHROPIC_MODEL", "test-model")
+	cfg := committedCfg(t)
+	cfg.Provider = "anthropic"
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+
+	ass, err := New(cfg, st)
+	require.NoError(t, err)
+	tasks, err := ass.AddTasks(context.Background(), "fix bug")
+	require.NoError(t, err)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, "fixed bug", tasks[0].Text)
+	assert.Equal(t, "/v1/messages", gotPath)
+	assert.Equal(t, "test-key", gotKey)
+	assert.Empty(t, gotAuth, "unrelated SDK environment defaults must not add a second auth method")
 }
 
 func TestNewPreflightsProviderEndpoint(t *testing.T) {

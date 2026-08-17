@@ -46,6 +46,16 @@ standup config set OPENAI_MODEL my-model
 standup doctor
 ```
 
+Or use Anthropic's Messages API directly:
+
+```sh
+standup config set provider anthropic
+standup config set ANTHROPIC_BASE_URL https://api.anthropic.com
+standup config set ANTHROPIC_MODEL your-model
+export ANTHROPIC_API_KEY=your-api-key  # or add it to the active config directory's .env
+standup doctor
+```
+
 Then capture work naturally and generate the report:
 
 ```sh
@@ -135,7 +145,7 @@ standup generate --obsidian         # publish into the configured Obsidian vault
 standup generate --webhook <url>    # POST the report (Slack-compatible JSON)
 standup generate --mail <address>   # email the report (needs smtp_* in config.yaml)
 standup speak                       # print a spoken brief (no speech synthesis)
-standup speak -o standup.wav        # synthesize the brief to audio (needs OPENAI_SPEECH_MODEL/VOICE env)
+standup speak -o standup.wav        # synthesize via the OpenAI-compatible endpoint (needs its speech env)
 
 standup doctor                      # check the setup: data file, git identity, endpoint
 standup init                        # write default config files for editing
@@ -225,10 +235,14 @@ defaults. `STANDUP_*` environment variables override `.env`, which overrides
 YAML.
 
 Online mode needs `OPENAI_BASE_URL` and `OPENAI_MODEL` in the environment or a
-`.env`. The `.env` lookup walks up from the working directory, like Git, before
-checking the config directories. Only online `add`, `generate`, `speak`, and
-`-p` construct the assistant; task management and commit import need no
-provider credentials.
+`.env` by default. Set `provider: anthropic` (or `STANDUP_PROVIDER=anthropic`)
+to use the Anthropic Messages API with `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_API_KEY`, and `ANTHROPIC_MODEL` instead. The `.env` lookup walks up
+from the working directory, like Git, before checking the config directories.
+Only online `add`, `generate`, `speak`, and `-p` construct the assistant; task
+management and commit import need no provider credentials. Speech synthesis
+remains OpenAI-compatible and independently requires `OPENAI_BASE_URL`,
+`OPENAI_SPEECH_MODEL`, and `OPENAI_SPEECH_VOICE` only when `speak -o` runs.
 
 ## Report language
 
@@ -256,7 +270,7 @@ however, is a configuration error and fails fast with a hint — set
 Set `offline: true` in `config.yaml` (or `STANDUP_OFFLINE=true`):
 `add` splits input on blank lines (one paragraph, one task, verbatim) and
 `generate` renders the deterministic day-split template directly. No model
-endpoint needed; the `OPENAI_*` variables become optional.
+endpoint needed; all provider variables become optional.
 
 Tasks live in a JSONL file (`data_file`, default `~/.standup/tasks.jsonl`).
 

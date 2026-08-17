@@ -1474,15 +1474,23 @@ func runDoctor(cmd *cobra.Command, d Deps) error {
 		}
 		return errOr(healthy)
 	}
-	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
+	required, err := config.ProviderEnv(d.Config.Provider)
+	if err != nil {
+		check("provider", err)
+		if werr != nil {
+			return werr
+		}
+		return errOr(healthy)
+	}
+	for _, key := range required {
 		if os.Getenv(key) == "" {
 			check("env "+key, fmt.Errorf("not set (required for add/generate, or set offline: true)"))
 		} else {
 			report("ok   env %s\n", key)
 		}
 	}
-	if base := os.Getenv("OPENAI_BASE_URL"); base != "" {
-		check("endpoint reachable", reachable(base))
+	if base := os.Getenv(required[0]); base != "" {
+		check("endpoint reachable", reachable(base, required[0]))
 	}
 	if werr != nil {
 		return werr
@@ -1514,11 +1522,11 @@ func checkWritable(path string) error {
 }
 
 // reachable reports whether the endpoint answers at all (any HTTP status).
-var reachable = func(base string) error {
+var reachable = func(base, envKey string) error {
 	client := &http.Client{Timeout: 10 * time.Second}
 	resp, err := client.Get(base)
 	if err != nil {
-		return fmt.Errorf("%w (check OPENAI_BASE_URL and network)", err)
+		return fmt.Errorf("%w (check %s and network)", err, envKey)
 	}
 	return resp.Body.Close()
 }

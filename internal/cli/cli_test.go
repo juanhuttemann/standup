@@ -1063,8 +1063,8 @@ func TestDoctorChecks(t *testing.T) {
 
 	live := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(live.Close)
-	assert.NoError(t, reachable(live.URL))
-	assert.Error(t, reachable(srv.URL), "closed endpoint is unreachable")
+	assert.NoError(t, reachable(live.URL, "TEST_BASE_URL"))
+	assert.Error(t, reachable(srv.URL, "TEST_BASE_URL"), "closed endpoint is unreachable")
 }
 
 func TestDoctorOfflineSkipsEndpoint(t *testing.T) {
@@ -1120,6 +1120,37 @@ func TestDoctorFailsOnMissingEnv(t *testing.T) {
 	err := root.Execute()
 	require.Error(t, err, "missing provider env is a failure in online mode")
 	assert.Contains(t, buf.String(), "fail env OPENAI_BASE_URL")
+}
+
+func TestDoctorChecksAnthropicEnv(t *testing.T) {
+	pipeStdin(t, "")
+	st, _, _ := newHarness(t, &fakeAssistant{})
+	oldIdent := gitIdentity
+	gitIdentity = func(string) (string, error) { return "me@example.com", nil }
+	t.Cleanup(func() { gitIdentity = oldIdent })
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_MODEL", "")
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return &fakeAssistant{}, nil },
+			Raw:       &fakeAssistant{},
+			Store:     st,
+			Config: config.Config{
+				MeetingTime: "09:30", DataFile: filepath.Join(t.TempDir(), "tasks.jsonl"), Provider: "anthropic",
+			},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"doctor"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, buf.String(), "fail env ANTHROPIC_BASE_URL")
+	assert.Contains(t, buf.String(), "fail env ANTHROPIC_API_KEY")
+	assert.Contains(t, buf.String(), "fail env ANTHROPIC_MODEL")
+	assert.NotContains(t, buf.String(), "OPENAI_BASE_URL")
 }
 
 func TestGenerateOutputFileUnwritable(t *testing.T) {

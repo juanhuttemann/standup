@@ -5,6 +5,15 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-17
+
+### Added
+
+- Direct Anthropic Messages API support for all text-backed commands through
+  `provider: anthropic` and `ANTHROPIC_BASE_URL`/`ANTHROPIC_API_KEY`/
+  `ANTHROPIC_MODEL`; optional speech synthesis remains on the independently
+  configured OpenAI-compatible endpoint.
+
 ### Changed
 
 - Refocused the README on the AI-assisted quick start, including prominent

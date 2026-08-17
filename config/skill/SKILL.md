@@ -41,7 +41,8 @@ trailing `#word` tokens in task text.
 
 - `<id>` accepts any unambiguous prefix; `list` shows short ids.
 - No model endpoint: `STANDUP_OFFLINE=true` — add splits paragraphs,
-  generate renders deterministically. Online mode needs provider env vars.
+  generate renders deterministically. Online mode defaults to an OpenAI-compatible
+  endpoint; set `STANDUP_PROVIDER=anthropic` for the Anthropic Messages API.
 - Obsidian export is one-way. Configure `obsidian.vault` and optionally
   `obsidian.note` (default `Standups/{date}.md`); `{date}` is the report's
   current date in the configured timezone. Existing notes retain everything

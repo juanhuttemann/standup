@@ -20,6 +20,7 @@ type Config struct {
 	MeetingTime           string
 	DataFile              string
 	Offline               bool
+	Provider              string
 	Language              string
 	Timezone              string
 	SMTPHost              string
@@ -120,7 +121,7 @@ func ValidateFile(path string) error {
 // Set persists application settings in config.yaml and provider deployment
 // facts in the config directory's .env.
 func Set(key, value string) (string, error) {
-	if key == "OPENAI_BASE_URL" || key == "OPENAI_MODEL" {
+	if providerEnvKey(key) {
 		return setEnv(key, value)
 	}
 	path, err := EnsureConfig()
@@ -148,9 +149,33 @@ func Set(key, value string) (string, error) {
 	return path, nil
 }
 
+func providerEnvKey(key string) bool {
+	switch key {
+	case "OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_SPEECH_MODEL", "OPENAI_SPEECH_VOICE",
+		"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL":
+		return true
+	default:
+		return false
+	}
+}
+
+// ProviderEnv returns the environment required by the selected text provider.
+// Empty preserves the original OpenAI-compatible behavior for existing users.
+func ProviderEnv(provider string) ([]string, error) {
+	switch provider {
+	case "", "openai":
+		return []string{"OPENAI_BASE_URL", "OPENAI_MODEL"}, nil
+	case "anthropic":
+		return []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"}, nil
+	default:
+		return nil, fmt.Errorf("unsupported provider %q (use openai or anthropic)", provider)
+	}
+}
+
 func setYAMLValue(doc *yaml.Node, key, value string) error {
 	tags := map[string]string{
 		"meeting_time": "!!str", "data_file": "!!str", "offline": "!!bool",
+		"provider": "!!str",
 		"language": "!!str", "timezone": "!!str", "smtp_host": "!!str",
 		"smtp_port": "!!int", "smtp_user": "!!str", "mail_from": "!!str",
 		"obsidian.vault": "!!str", "obsidian.note": "!!str",
@@ -307,6 +332,7 @@ func Load() (Config, error) {
 	v.SetDefault("meeting_time", "09:30")
 	v.SetDefault("data_file", "~/.standup/tasks.jsonl")
 	v.SetDefault("offline", false)
+	v.SetDefault("provider", "")
 	v.SetDefault("language", "")
 	v.SetDefault("smtp_port", 587)
 	v.SetDefault("obsidian.note", "Standups/{date}.md")
@@ -315,6 +341,7 @@ func Load() (Config, error) {
 		MeetingTime:   v.GetString("meeting_time"),
 		DataFile:      v.GetString("data_file"),
 		Offline:       v.GetBool("offline"),
+		Provider:      v.GetString("provider"),
 		Language:      v.GetString("language"),
 		Timezone:      v.GetString("timezone"),
 		SMTPHost:      v.GetString("smtp_host"),

@@ -6,7 +6,8 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 
 - Minimalism is key: the least code that works, nothing speculative.
 - Prefer existing solutions (viper, cobra, google uuid, etc.) before reinventing the wheel.
-- Never commit references to any specific model or provider.
+- Never commit provider credentials or model/endpoint defaults; isolated provider
+  adapters, selection values, and documented environment-variable names are allowed.
 - Maintain a separation of concerns.
 - Keep configuration centralized in dedicated files.
 - Keep prompts outside the code.
@@ -49,14 +50,14 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   by time, or invents ids.
 - The assistant is lazy: only `add` (online), `generate`, `speak`, and `-p` construct it, so
   read-only commands never require provider credentials. Speech env
-  (`OPENAI_SPEECH_MODEL`/`OPENAI_SPEECH_VOICE`) is checked even later: at `speak -o`
-  synthesis time, so the preview needs only the chat vars.
+  (`OPENAI_BASE_URL`/`OPENAI_SPEECH_MODEL`/`OPENAI_SPEECH_VOICE`) is checked even
+  later: at `speak -o` synthesis time, so the preview needs only the text-provider vars.
 
 ### Config policy
 - Each setting has exactly one home — never duplicate a setting across files:
-  application settings (`meeting_time`, `data_file`, `offline`, `language`) in
-  `config/config.yaml`; provider facts (`OPENAI_BASE_URL`, `OPENAI_MODEL`,
-  `OPENAI_SPEECH_MODEL`, `OPENAI_SPEECH_VOICE`) in local `.env`/env only.
+  application settings (`meeting_time`, `data_file`, `offline`, `provider`, `language`)
+  in `config/config.yaml`; provider facts (`OPENAI_*`, `ANTHROPIC_*`) in local
+  `.env`/env only.
 - `config set` writes application keys to the user `config.yaml` and the
   supported provider keys to its `.env`; `config edit` opens that YAML. Both
   commands target the active config dir (`$STANDUP_CONFIG_DIR`, otherwise an
@@ -68,10 +69,10 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   files stay the single home of every setting). The agent skill follows the
   same rule: `config/skill/SKILL.md` is the single home (embedded for
   `skill install`); the repo's `.agents`/`.claude` entries are symlinks to it.
-- Committed files contain zero provider references: no endpoints, no model
-  names, anywhere. Provider settings are deployment facts — required in local
-  `.env`/env for online mode (checked by `agent.New`, never defaulted), never
-  committed. `--help`/`--version`/`init` never load them.
+- Committed files contain zero provider credentials and zero endpoint/model defaults.
+  Provider settings are deployment facts — required in local `.env`/env for online
+  mode (checked by `agent.New`, never defaulted), never committed with values.
+  `--help`/`--version`/`init` never load them.
 - `.env.example` is a template for one audience: the person installing the tool.
   One short comment per setting. No policy essays, no cross-references to other
   files, no conflicting instructions.
@@ -128,7 +129,8 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 ### Layout (separation of concerns)
 - `cmd/standup` — entrypoint only.
 - `internal/cli` — cobra commands, no business logic.
-- `internal/agent` — sub-agent wiring + orchestration (the only place that knows providers).
+- `internal/agent` — sub-agent wiring + provider client construction; provider setting
+  validation remains centralized in `internal/config`.
 - `internal/store` — Task model + JSONL persistence, injectable clock (`Now` field).
 - `internal/report` — standup split/ordering, day ranges, carry-over, lookback time math.
 - `internal/git` — commit collection (shells out to git, filtered to the repo's user).

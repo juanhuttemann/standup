@@ -14,8 +14,11 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/anthropics/anthropic-sdk-go"
+	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/microsoft/agent-framework-go/agent"
 	"github.com/microsoft/agent-framework-go/message"
+	"github.com/microsoft/agent-framework-go/provider/anthropicprovider"
 	"github.com/microsoft/agent-framework-go/provider/openaiprovider"
 	"github.com/microsoft/agent-framework-go/tool"
 	"github.com/microsoft/agent-framework-go/tool/agenttool"
@@ -37,6 +40,7 @@ type Assistant interface {
 
 type runFunc func(ctx context.Context, prompt string) (string, error)
 type progressRunFunc func(ctx context.Context, prompt string, progress func(string)) (string, error)
+type agentFactory func(name, description, instructions string, tools []tool.Tool) *agent.Agent
 
 // ttsFunc turns a script into audio bytes via the speech endpoint.
 type ttsFunc func(ctx context.Context, input string) ([]byte, error)
@@ -83,8 +87,16 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	if cfg.Offline {
 		return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
 	}
+	provider := cfg.Provider
+	if provider == "" {
+		provider = "openai"
+	}
+	required, err := config.ProviderEnv(provider)
+	if err != nil {
+		return nil, err
+	}
 	var missing []string
-	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
+	for _, key := range required {
 		if os.Getenv(key) == "" {
 			missing = append(missing, key)
 		}
@@ -92,25 +104,16 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s (or run: standup config set offline true)", strings.Join(missing, ", "))
 	}
-	if err := preflightEndpoint(os.Getenv("OPENAI_BASE_URL")); err != nil {
+	baseURL := os.Getenv(required[0])
+	if err := preflightEndpoint(baseURL, required[0]); err != nil {
 		return nil, err
 	}
-	client := openai.NewClient(
-		option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
-		option.WithHTTPClient(&http.Client{Timeout: modelTimeout}),
-	)
-	newAgent := func(name, description, instructions string, tools []tool.Tool) *agent.Agent {
-		return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
-			Model:        os.Getenv("OPENAI_MODEL"),
-			Instructions: instructions,
-			Config:       agent.Config{Name: name, Description: description, Tools: tools},
-		})
-	}
+	newAgent, textHint := newAgentFactory(provider)
 	newRun := func(a *agent.Agent) runFunc {
 		return func(ctx context.Context, prompt string) (string, error) {
 			out, err := a.RunText(ctx, prompt).Collect()
 			if err != nil {
-				return "", fmt.Errorf("endpoint call failed — check OPENAI_BASE_URL and network: %w", err)
+				return "", fmt.Errorf("endpoint call failed — check %s and network: %w", textHint, err)
 			}
 			return out.String(), nil
 		}
@@ -121,7 +124,7 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 			seen := make(map[string]bool)
 			for update, runErr := range a.RunText(ctx, prompt) {
 				if runErr != nil {
-					return "", fmt.Errorf("endpoint call failed — check OPENAI_BASE_URL and network: %w", runErr)
+					return "", fmt.Errorf("endpoint call failed — check %s and network: %w", textHint, runErr)
 				}
 				if progress != nil {
 					reportToolCalls(update, seen, progress)
@@ -140,11 +143,14 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		agenttool.New(deleter, agenttool.Config{}),
 	})
 	return &impl{
-		editor:              newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
-		reporter:            newRun(newAgent("reporter", "Rephrases report entries.", cfg.ReporterInstructions, nil)),
-		speaker:             newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
-		planner:             newProgressRun(planner),
-		tts:                 newTTS(client),
+		editor:   newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
+		reporter: newRun(newAgent("reporter", "Rephrases report entries.", cfg.ReporterInstructions, nil)),
+		speaker:  newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
+		planner:  newProgressRun(planner),
+		tts: newTTS(openai.NewClient(
+			option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
+			option.WithHTTPClient(&http.Client{Timeout: modelTimeout}),
+		)),
 		instructions:        cfg.ReporterInstructions,
 		speakerInstructions: cfg.SpeakerInstructions,
 		plannerInstructions: cfg.PlannerInstructions,
@@ -153,6 +159,36 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		genTpl:              genTpl,
 		daysTpl:             daysTpl,
 	}, nil
+}
+
+func newAgentFactory(provider string) (agentFactory, string) {
+	httpClient := &http.Client{Timeout: modelTimeout}
+	if provider == "anthropic" {
+		client := anthropic.NewClient(
+			anthropicoption.WithoutEnvironmentDefaults(),
+			anthropicoption.WithAPIKey(os.Getenv("ANTHROPIC_API_KEY")),
+			anthropicoption.WithBaseURL(os.Getenv("ANTHROPIC_BASE_URL")),
+			anthropicoption.WithHTTPClient(httpClient),
+		)
+		return func(name, description, instructions string, tools []tool.Tool) *agent.Agent {
+			return anthropicprovider.NewAgent(client, anthropicprovider.AgentConfig{
+				Model:        os.Getenv("ANTHROPIC_MODEL"),
+				Instructions: instructions,
+				Config:       agent.Config{Name: name, Description: description, Tools: tools},
+			})
+		}, "ANTHROPIC_BASE_URL"
+	}
+	client := openai.NewClient(
+		option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
+		option.WithHTTPClient(httpClient),
+	)
+	return func(name, description, instructions string, tools []tool.Tool) *agent.Agent {
+		return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
+			Model:        os.Getenv("OPENAI_MODEL"),
+			Instructions: instructions,
+			Config:       agent.Config{Name: name, Description: description, Tools: tools},
+		})
+	}, "OPENAI_BASE_URL"
 }
 
 func reportToolCalls(update *agent.ResponseUpdate, seen map[string]bool, progress func(string)) {
@@ -177,19 +213,19 @@ func specialistTool(name string) bool {
 	}
 }
 
-func preflightEndpoint(rawURL string) error {
+func preflightEndpoint(rawURL, envKey string) error {
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, rawURL, nil)
 	if err != nil {
-		return errors.New("endpoint unavailable: OPENAI_BASE_URL is invalid")
+		return fmt.Errorf("endpoint unavailable: %s is invalid", envKey)
 	}
 	client := &http.Client{Timeout: endpointPreflightTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		var netErr interface{ Timeout() bool }
 		if errors.As(err, &netErr) && netErr.Timeout() {
-			return fmt.Errorf("endpoint unavailable at %s: timed out after %s; check OPENAI_BASE_URL or start the server", endpointDisplay(rawURL), endpointPreflightTimeout)
+			return fmt.Errorf("endpoint unavailable at %s: timed out after %s; check %s or start the server", endpointDisplay(rawURL), endpointPreflightTimeout, envKey)
 		}
-		return fmt.Errorf("endpoint unavailable at %s: %w; check OPENAI_BASE_URL or start the server", endpointDisplay(rawURL), endpointErrorCause(err))
+		return fmt.Errorf("endpoint unavailable at %s: %w; check %s or start the server", endpointDisplay(rawURL), endpointErrorCause(err), envKey)
 	}
 	if err := resp.Body.Close(); err != nil {
 		return fmt.Errorf("endpoint unavailable at %s: close preflight response: %w", endpointDisplay(rawURL), err)
@@ -220,7 +256,7 @@ func endpointDisplay(rawURL string) string {
 // it means the speaker agent misbehaved, so fail closed.
 const maxSpeechInput = 4096
 
-// newTTS builds the speech call on the shared client: a streaming chat
+// newTTS builds the speech call on its OpenAI-compatible client: a streaming chat
 // completion with the audio modality (the audio-output shape OpenAI-
 // compatible endpoints implement; audio requires streaming). The speech
 // model and voice are deployment facts (env, never config); they are
@@ -228,7 +264,7 @@ const maxSpeechInput = 4096
 func newTTS(client openai.Client) ttsFunc {
 	return func(ctx context.Context, input string) (audio []byte, err error) {
 		var missing []string
-		for _, key := range []string{"OPENAI_SPEECH_MODEL", "OPENAI_SPEECH_VOICE"} {
+		for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_SPEECH_MODEL", "OPENAI_SPEECH_VOICE"} {
 			if os.Getenv(key) == "" {
 				missing = append(missing, key)
 			}
