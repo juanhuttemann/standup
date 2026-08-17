@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,8 +48,8 @@ var gitLogAll = git.LogAll
 // assistant itself is lazy on top: read-only commands (list, done, rm,
 // status, edit, commits) never require provider credentials.
 type Deps struct {
-	// Assistant builds the model-backed assistant on first use (add and
-	// generate online; nil for commands that never call a model).
+	// Assistant builds the model-backed assistant on first use (online add,
+	// generate, speak, and prompt; nil for commands that never call a model).
 	Assistant func() (agent.Assistant, error)
 	// Raw is the deterministic assistant used by `add --raw`.
 	Raw    agent.Assistant
@@ -56,48 +57,21 @@ type Deps struct {
 	Config config.Config
 }
 
+type progressPlanner interface {
+	PlanWithProgress(context.Context, string, []store.Task, time.Time, func(string)) ([]store.BatchOperation, error)
+}
+
 func New(load func() (Deps, error)) *cobra.Command {
 	root := &cobra.Command{
 		Use:          "standup",
 		Short:        "AI-assisted standup CLI",
+		Args:         rootArgs,
 		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			text, err := cmd.Flags().GetString("add")
-			if err != nil {
-				return err
-			}
-			list, err := cmd.Flags().GetBool("list")
-			if err != nil {
-				return err
-			}
-			gen, err := cmd.Flags().GetBool("generate")
-			if err != nil {
-				return err
-			}
-			switch {
-			case cmd.Flags().Changed("add"):
-				d, err := load()
-				if err != nil {
-					return err
-				}
-				return runAdd(cmd, d, []string{text})
-			case list:
-				d, err := load()
-				if err != nil {
-					return err
-				}
-				return runList(cmd, d)
-			case gen:
-				d, err := load()
-				if err != nil {
-					return err
-				}
-				return runGenerate(cmd, d, args)
-			}
-			return cmd.Help()
-		},
+		RunE:         func(cmd *cobra.Command, args []string) error { return runRoot(cmd, args, load) },
 	}
 	root.Flags().StringP("add", "a", "", "task text")
+	root.Flags().StringP("prompt", "p", "", "apply task changes from a natural-language prompt (use - to read stdin)")
+	root.Flags().Bool("verbose", false, "show specialist tool calls for -p")
 	root.Flags().BoolP("list", "l", false, "list today's tasks")
 	root.Flags().BoolP("generate", "g", false, "generate the standup report")
 
@@ -258,6 +232,51 @@ func New(load func() (Deps, error)) *cobra.Command {
 
 	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd)
 	return root
+}
+
+func rootArgs(cmd *cobra.Command, args []string) error {
+	if cmd.Flags().Changed("prompt") || flagBool(cmd, "generate") {
+		return nil
+	}
+	return cobra.NoArgs(cmd, args)
+}
+
+func runRoot(cmd *cobra.Command, args []string, load func() (Deps, error)) error {
+	prompt := cmd.Flags().Changed("prompt")
+	actions := 0
+	for _, enabled := range []bool{prompt, cmd.Flags().Changed("add"), flagBool(cmd, "list"), flagBool(cmd, "generate")} {
+		if enabled {
+			actions++
+		}
+	}
+	if actions > 1 {
+		return errors.New("only one of --prompt, --add, --list, or --generate may be used")
+	}
+	if flagBool(cmd, "verbose") && !prompt {
+		return errors.New("--verbose requires --prompt")
+	}
+	if prompt && len(args) > 0 {
+		return errors.New("--prompt does not accept positional arguments")
+	}
+	for _, action := range []struct {
+		enabled bool
+		run     func(*cobra.Command, Deps) error
+	}{
+		{cmd.Flags().Changed("prompt"), func(c *cobra.Command, d Deps) error { return runPrompt(c, d, flagString(c, "prompt")) }},
+		{cmd.Flags().Changed("add"), func(c *cobra.Command, d Deps) error { return runAdd(c, d, []string{flagString(c, "add")}) }},
+		{flagBool(cmd, "list"), runList},
+		{flagBool(cmd, "generate"), func(c *cobra.Command, d Deps) error { return runGenerate(c, d, args) }},
+	} {
+		if !action.enabled {
+			continue
+		}
+		d, err := load()
+		if err != nil {
+			return err
+		}
+		return action.run(cmd, d)
+	}
+	return cmd.Help()
 }
 
 func newConfigCmd() *cobra.Command {
@@ -617,6 +636,90 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 		}
 	}
 	return nil
+}
+
+func runPrompt(cmd *cobra.Command, d Deps, prompt string) error {
+	if prompt == "-" {
+		input, err := io.ReadAll(cmd.InOrStdin())
+		if err != nil {
+			return err
+		}
+		prompt = strings.TrimSpace(strings.ReplaceAll(string(input), "\r\n", "\n"))
+	}
+	if prompt == "" {
+		return fmt.Errorf("usage: %s -p \"prompt\" (or pipe a prompt to %s -p -)", cmd.Root().Name(), cmd.Root().Name())
+	}
+	now, err := nowIn(d)
+	if err != nil {
+		return err
+	}
+	tasks, err := d.Store.List()
+	if err != nil {
+		return err
+	}
+	assist, err := d.Assistant()
+	if err != nil {
+		return err
+	}
+	var operations []store.BatchOperation
+	var planErr error
+	if flagBool(cmd, "verbose") {
+		operations, planErr = planWithProgress(cmd, assist, prompt, tasks, now)
+	} else if err := spin("planning changes", func() error {
+		operations, planErr = assist.Plan(cmd.Context(), prompt, tasks, now)
+		return nil
+	}); err != nil {
+		return err
+	}
+	if planErr != nil {
+		return planErr
+	}
+	changes, err := d.Store.ApplyBatch(operations)
+	if err != nil {
+		return err
+	}
+	for _, change := range changes {
+		if err := echoChange(cmd, change); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func planWithProgress(cmd *cobra.Command, assist agent.Assistant, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+	planner, ok := assist.(progressPlanner)
+	if !ok {
+		return assist.Plan(cmd.Context(), prompt, tasks, now)
+	}
+	var writeErr error
+	operations, err := planner.PlanWithProgress(cmd.Context(), prompt, tasks, now, func(message string) {
+		if writeErr == nil {
+			_, writeErr = fmt.Fprintln(cmd.ErrOrStderr(), message)
+		}
+	})
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	return operations, err
+}
+
+func echoChange(cmd *cobra.Command, change store.Change) error {
+	switch change.Kind {
+	case store.OperationCreate:
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "created %s [%s] %s\n", shortID(change.After.ID), change.After.Status, change.After.Text)
+		return err
+	case store.OperationEdit:
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "edited %s %s -> %s\n", shortID(change.After.ID), change.Before.Text, change.After.Text)
+		return err
+	case store.OperationStatus:
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "status %s %s -> %s: %s\n", shortID(change.After.ID), change.Before.Status, change.After.Status, change.After.Text)
+		return err
+	case store.OperationDelete:
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "deleted %s [%s] %s\n", shortID(change.Before.ID), change.Before.Status, change.Before.Text)
+		return err
+	default:
+		return fmt.Errorf("unknown change kind %q", change.Kind)
+	}
 }
 
 // nowIn returns the store clock in the configured timezone (empty = local).

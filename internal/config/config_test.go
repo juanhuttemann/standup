@@ -21,6 +21,18 @@ reporter_instructions: |
 speaker_instructions: |
   Speak things.
 
+planner_instructions: |
+  Plan things.
+
+creator_instructions: |
+  Create things.
+
+updater_instructions: |
+  Update things.
+
+deleter_instructions: |
+  Delete things.
+
 generate_input_template: |
   {{range .Yesterday}}- {{.Text}}
   {{range .Today}}- {{.Text}}
@@ -166,6 +178,45 @@ func TestLoadDefaults(t *testing.T) {
 	assert.Empty(t, cfg.Timezone, "empty timezone = local")
 	assert.Empty(t, cfg.ObsidianVault, "Obsidian export is opt-in")
 	assert.Equal(t, "Standups/{date}.md", cfg.ObsidianNote)
+}
+
+func TestLoadLegacyAgentConfigUsesEmbeddedPlannerPrompts(t *testing.T) {
+	dir := isolateDirs(t)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	legacy := `
+editor_instructions: Edit things.
+reporter_instructions: Report things.
+speaker_instructions: Speak things.
+generate_input_template: '{{range .Today}}{{.Text}}{{end}}'
+generate_input_template_days: '{{range .Days}}{{.Heading}}{{end}}'
+`
+	write(t, filepath.Join(dir, "agent.yaml"), legacy)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.NotEmpty(t, cfg.PlannerInstructions)
+	assert.NotEmpty(t, cfg.CreatorInstructions)
+	assert.NotEmpty(t, cfg.UpdaterInstructions)
+	assert.NotEmpty(t, cfg.DeleterInstructions)
+	assert.Equal(t, "Edit things.", cfg.EditorInstructions, "legacy custom prompts remain active")
+}
+
+func TestLoadRejectsPartialPlannerConfig(t *testing.T) {
+	dir := isolateDirs(t)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	partial := `
+editor_instructions: Edit things.
+reporter_instructions: Report things.
+speaker_instructions: Speak things.
+planner_instructions: Plan things.
+generate_input_template: x
+generate_input_template_days: x
+`
+	write(t, filepath.Join(dir, "agent.yaml"), partial)
+
+	_, err := Load()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "creator_instructions")
 }
 
 func TestEmbeddedFallbackWhenNoConfigAnywhere(t *testing.T) {

@@ -2,10 +2,13 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -349,4 +352,155 @@ func TestUpdateText(t *testing.T) {
 	assert.ErrorContains(t, err, "empty task text")
 	_, err = s.UpdateText("no-such-id", "x")
 	assert.ErrorContains(t, err, "unknown id")
+}
+
+func TestApplyBatchCommitsMixedOperationsOnce(t *testing.T) {
+	s := seedStore(t, "edit-id", "status-id", "delete-id")
+	now := time.Date(2026, 8, 17, 11, 30, 0, 0, time.UTC)
+	s.Now = fixedClock(now)
+
+	changes, err := s.ApplyBatch([]BatchOperation{
+		{Kind: OperationCreate, Text: "new task", Status: "blocked"},
+		{Kind: OperationEdit, ID: "edit-id", Text: "edited task"},
+		{Kind: OperationStatus, ID: "status-id", Status: "done"},
+		{Kind: OperationDelete, ID: "delete-id"},
+	})
+	require.NoError(t, err)
+	require.Len(t, changes, 4)
+
+	assert.Nil(t, changes[0].Before)
+	require.NotNil(t, changes[0].After)
+	assert.Equal(t, "new task", changes[0].After.Text)
+	assert.Equal(t, "blocked", changes[0].After.Status)
+	assert.True(t, changes[0].After.Timestamp.Equal(now))
+	assert.Equal(t, "task 0", changes[1].Before.Text)
+	assert.Equal(t, "edited task", changes[1].After.Text)
+	assert.Equal(t, "todo", changes[2].Before.Status)
+	assert.Equal(t, "done", changes[2].After.Status)
+	assert.Equal(t, "task 2", changes[3].Before.Text)
+	assert.Nil(t, changes[3].After)
+
+	tasks, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 3)
+	assert.Equal(t, "edited task", tasks[0].Text)
+	assert.Equal(t, "done", tasks[1].Status)
+	assert.Equal(t, "new task", tasks[2].Text)
+}
+
+func TestApplyBatchIsAtomic(t *testing.T) {
+	s := seedStore(t, "existing-id")
+	rawBefore, err := os.ReadFile(s.Path)
+	require.NoError(t, err)
+
+	tests := map[string][]BatchOperation{
+		"empty create":   {{Kind: OperationCreate, Text: "  "}},
+		"invalid status": {{Kind: OperationStatus, ID: "existing-id", Status: "invalid"}},
+		"empty edit":     {{Kind: OperationEdit, ID: "existing-id", Text: "  "}},
+		"unknown id":     {{Kind: OperationDelete, ID: "missing-id"}},
+		"unknown kind":   {{Kind: OperationKind("archive"), ID: "existing-id"}},
+	}
+	for name, invalid := range tests {
+		t.Run(name, func(t *testing.T) {
+			operations := append([]BatchOperation{{Kind: OperationEdit, ID: "existing-id", Text: "would change"}}, invalid...)
+			_, err := s.ApplyBatch(operations)
+			require.Error(t, err)
+			rawAfter, readErr := os.ReadFile(s.Path)
+			require.NoError(t, readErr)
+			assert.Equal(t, rawBefore, rawAfter, "failed batch must leave the file unchanged")
+		})
+	}
+}
+
+func TestApplyBatchOperationsObservePriorOperations(t *testing.T) {
+	s := seedStore(t, "existing-id")
+
+	changes, err := s.ApplyBatch([]BatchOperation{
+		{Kind: OperationEdit, ID: "existing-id", Text: "renamed"},
+		{Kind: OperationStatus, ID: "existing-id", Status: "done"},
+	})
+	require.NoError(t, err)
+	require.Len(t, changes, 2)
+	assert.Equal(t, "renamed", changes[1].Before.Text)
+	assert.Equal(t, "done", changes[1].After.Status)
+}
+
+func TestApplyBatchEmptyIsNoOp(t *testing.T) {
+	s := seedStore(t, "existing-id")
+	rawBefore, err := os.ReadFile(s.Path)
+	require.NoError(t, err)
+
+	changes, err := s.ApplyBatch(nil)
+	require.NoError(t, err)
+	assert.Empty(t, changes)
+	rawAfter, err := os.ReadFile(s.Path)
+	require.NoError(t, err)
+	assert.Equal(t, rawBefore, rawAfter)
+}
+
+func TestApplyBatchReplacementFailurePreservesOriginal(t *testing.T) {
+	s := seedStore(t, "existing-id")
+	rawBefore, err := os.ReadFile(s.Path)
+	require.NoError(t, err)
+	s.replace = func(_, _ string) error { return errors.New("replace failed") }
+
+	_, err = s.ApplyBatch([]BatchOperation{{Kind: OperationEdit, ID: "existing-id", Text: "changed"}})
+	require.ErrorContains(t, err, "replace failed")
+	rawAfter, readErr := os.ReadFile(s.Path)
+	require.NoError(t, readErr)
+	assert.Equal(t, rawBefore, rawAfter)
+	matches, globErr := filepath.Glob(filepath.Join(filepath.Dir(s.Path), ".tasks.jsonl-*"))
+	require.NoError(t, globErr)
+	assert.Empty(t, matches, "failed replacements must clean up temporary files")
+}
+
+func TestApplyBatchPreservesStorePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not expose Unix permission bits")
+	}
+	s := seedStore(t, "existing-id")
+	require.NoError(t, os.Chmod(s.Path, 0o600))
+
+	_, err := s.ApplyBatch([]BatchOperation{{Kind: OperationEdit, ID: "existing-id", Text: "changed"}})
+	require.NoError(t, err)
+	info, err := os.Stat(s.Path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+}
+
+func TestApplyBatchRejectsDuplicateStoredIDs(t *testing.T) {
+	s := seedStore(t, "duplicate-id", "duplicate-id")
+	rawBefore, err := os.ReadFile(s.Path)
+	require.NoError(t, err)
+
+	_, err = s.ApplyBatch([]BatchOperation{{Kind: OperationDelete, ID: "duplicate-id"}})
+	require.ErrorContains(t, err, "duplicate id")
+	rawAfter, readErr := os.ReadFile(s.Path)
+	require.NoError(t, readErr)
+	assert.Equal(t, rawBefore, rawAfter)
+}
+
+func TestConcurrentMutationsDoNotLoseUpdates(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+
+	const count = 32
+	errs := make(chan error, count)
+	var wg sync.WaitGroup
+	for i := range count {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, addErr := s.AddAt(fmt.Sprintf("task %d", i), "todo", time.Date(2026, 8, 17, 9, i, 0, 0, time.UTC))
+			errs <- addErr
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for addErr := range errs {
+		require.NoError(t, addErr)
+	}
+	tasks, err := s.List()
+	require.NoError(t, err)
+	assert.Len(t, tasks, count)
 }

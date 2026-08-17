@@ -96,6 +96,9 @@ standup done <id>                   # mark done, no model involved
 standup status <id> in-progress     # set status: todo, in-progress, blocked, done
 standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
 standup rm <id>                     # delete, no model involved
+standup -p "add this today and mark yesterday done"  # apply mixed CRUD atomically
+standup -p "add this today" --verbose  # show coordinator → specialist tool calls
+printf '%s\n' "delete the obsolete task" | standup -p -  # read the prompt from stdin
 
 standup generate --clip             # copy the report to the clipboard
 standup generate --obsidian         # publish into the configured Obsidian vault
@@ -118,6 +121,10 @@ standup update --check              # check without installing
 
 - Statuses are `todo`, `in-progress`, `blocked`, and `done`.
 - Commands that change a task print the updated row.
+- `-p` delegates interpretation to CRUD specialists, validates their complete
+  plan, and applies it in one write; missing or ambiguous targets change nothing.
+- Online commands preflight endpoint connectivity for two seconds before the
+  first model call, so stale local endpoints fail quickly.
 - Task IDs accept any unambiguous prefix; `list` displays the first 8 characters.
 - Unfinished tasks from yesterday carry over into Today.
 - Blocked tasks appear under `## Blockers` until resolved.

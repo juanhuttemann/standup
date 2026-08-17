@@ -34,6 +34,10 @@ type Config struct {
 	EditorInstructions    string
 	ReporterInstructions  string
 	SpeakerInstructions   string
+	PlannerInstructions   string
+	CreatorInstructions   string
+	UpdaterInstructions   string
+	DeleterInstructions   string
 	GenerateInputTemplate string
 	DaysTemplate          string
 }
@@ -345,6 +349,10 @@ func Load() (Config, error) {
 	if err := a.ReadConfig(strings.NewReader(agentYAML)); err != nil {
 		return Config{}, fmt.Errorf("read agent.yaml: %w", err)
 	}
+	plannerKeys, embeddedAgent, plannerConfigured, err := plannerPromptDefaults(a)
+	if err != nil {
+		return Config{}, err
+	}
 	for _, in := range []struct {
 		key string
 		dst *string
@@ -354,14 +362,38 @@ func Load() (Config, error) {
 		{"generate_input_template", &cfg.GenerateInputTemplate},
 		{"generate_input_template_days", &cfg.DaysTemplate},
 		{"speaker_instructions", &cfg.SpeakerInstructions},
+		{"planner_instructions", &cfg.PlannerInstructions},
+		{"creator_instructions", &cfg.CreatorInstructions},
+		{"updater_instructions", &cfg.UpdaterInstructions},
+		{"deleter_instructions", &cfg.DeleterInstructions},
 	} {
 		s := strings.TrimRight(a.GetString(in.key), " \t\r\n")
+		if s == "" && plannerKeys[in.key] && !plannerConfigured {
+			s = strings.TrimRight(embeddedAgent.GetString(in.key), " \t\r\n")
+		}
 		if s == "" {
 			return Config{}, fmt.Errorf("agent.yaml: missing required key %s", in.key)
 		}
 		*in.dst = s
 	}
 	return cfg, nil
+}
+
+func plannerPromptDefaults(configured *viper.Viper) (map[string]bool, *viper.Viper, bool, error) {
+	keys := map[string]bool{
+		"planner_instructions": true, "creator_instructions": true,
+		"updater_instructions": true, "deleter_instructions": true,
+	}
+	present := false
+	for key := range keys {
+		present = present || strings.TrimSpace(configured.GetString(key)) != ""
+	}
+	embedded := viper.New()
+	embedded.SetConfigType("yaml")
+	if err := embedded.ReadConfig(strings.NewReader(defaults.AgentYAML)); err != nil {
+		return nil, nil, false, fmt.Errorf("read embedded agent.yaml: %w", err)
+	}
+	return keys, embedded, present, nil
 }
 
 // readFile returns the first name found in the dir chain, else the embedded

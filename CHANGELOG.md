@@ -5,6 +5,33 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-17
+
+### Added
+
+- `standup -p "prompt"` delegates natural-language create, edit, status, and
+  delete requests to specialized agents, validates their typed plan, applies
+  all changes atomically in Go, and prints the committed changes. `-p -` reads
+  the prompt from stdin; `--verbose` shows coordinator-to-specialist tool calls;
+  ambiguous or invalid plans make no changes.
+
+### Fixed
+
+- `standup -p` now distinguishes an empty plan from malformed model output:
+  missing or ambiguous targets produce an actionable, bounded explanation,
+  while contract failures suggest simplifying the prompt.
+- Online commands now preflight the configured model endpoint for two seconds,
+  reporting stale or unreachable endpoints before the longer model timeout.
+- Store rewrites now use a synced temporary file and atomic replacement,
+  preserve existing permissions, serialize in-process mutations, and reject
+  duplicate task ids instead of selecting an arbitrary record.
+- Endpoint and verbose-tool errors no longer expose credential-bearing URLs or
+  model-supplied terminal control text; tool calls without ids remain visible.
+- Root action flags now reject conflicts and stray prompt arguments, and
+  `--verbose` is accepted only with `--prompt`.
+- Existing agent configs from earlier releases inherit the embedded planner
+  prompt group; partially configured planner groups still fail closed.
+
 ## [0.10.0] - 2026-08-16
 
 ### Added

@@ -30,8 +30,8 @@ func main() {
 			return cli.Deps{}, err
 		}
 		return cli.Deps{
-			// Only add and generate (online) need credentials; the check
-			// stays in agent.New and runs on first use, not at startup.
+			// Only online add, generate, speak, and prompt need credentials;
+			// the check stays in agent.New and runs on first use, not at startup.
 			Assistant: sync.OnceValues(func() (agent.Assistant, error) {
 				return agent.New(cfg, st)
 			}),

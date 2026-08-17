@@ -30,6 +30,10 @@ trailing `#word` tokens in task text.
   configured Obsidian vault.
 - Status changes: `standup done <id>`, `standup status <id> blocked` (or
   `todo`, `in-progress`).
+- Mixed natural-language changes: `standup -p "add this today and mark
+  yesterday's tasks done"`; use `standup -p -` to read the prompt from stdin.
+  The whole CRUD plan succeeds or fails together, and ambiguous targets fail
+  without writes. Add `--verbose` to show specialist tool calls.
 - Review: `standup list` (interactive), `standup list --days 5`, `--date
   YYYY-MM-DD`, `--tag <token>`.
 

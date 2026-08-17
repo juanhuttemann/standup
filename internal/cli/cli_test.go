@@ -31,22 +31,52 @@ import (
 )
 
 type fakeAssistant struct {
-	added       []string
-	addResult   []store.Task
-	addErr      error
-	genCalls    int
-	genSec      *report.Section
-	genSecs     []report.Section
-	genOut      string
-	genErr      error
-	scriptCalls int
-	scriptRep   string
-	scriptOut   string
-	scriptErr   error
-	synthCalls  int
-	synthScript string
-	synthAudio  []byte
-	synthErr    error
+	added            []string
+	addResult        []store.Task
+	addErr           error
+	genCalls         int
+	genSec           *report.Section
+	genSecs          []report.Section
+	genOut           string
+	genErr           error
+	scriptCalls      int
+	scriptRep        string
+	scriptOut        string
+	scriptErr        error
+	synthCalls       int
+	synthScript      string
+	synthAudio       []byte
+	synthErr         error
+	planCalls        int
+	planPrompt       string
+	planTasks        []store.Task
+	planNow          time.Time
+	planResult       []store.BatchOperation
+	planErr          error
+	planProgress     []string
+	planVerboseCalls int
+}
+
+func (f *fakeAssistant) Plan(ctx context.Context, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+	f.planCalls++
+	f.planPrompt = prompt
+	f.planTasks = append([]store.Task(nil), tasks...)
+	f.planNow = now
+	return f.planResult, f.planErr
+}
+
+// PlanWithProgress is the minimal opt-in API needed by prompt --verbose. The
+// regular Assistant interface remains unchanged; CLI can type-assert this
+// capability only when verbose output was requested.
+func (f *fakeAssistant) PlanWithProgress(ctx context.Context, prompt string, tasks []store.Task, now time.Time, progress func(string)) ([]store.BatchOperation, error) {
+	f.planVerboseCalls++
+	f.planPrompt = prompt
+	f.planTasks = append([]store.Task(nil), tasks...)
+	f.planNow = now
+	for _, message := range f.planProgress {
+		progress(message)
+	}
+	return f.planResult, f.planErr
 }
 
 func (f *fakeAssistant) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {
@@ -1636,6 +1666,213 @@ func TestStatusUsage(t *testing.T) {
 	}
 }
 
+func TestPromptFlagPlansAgainstStoreSnapshot(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
+	now := time.Date(2026, 8, 17, 10, 15, 0, 0, time.Local)
+	st.Now = func() time.Time { return now }
+	existing, err := st.Add("yesterday's task")
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"-p", "mark yesterday's task done"})
+	require.NoError(t, root.Execute())
+
+	assert.Equal(t, 1, assistant.planCalls)
+	assert.Equal(t, "mark yesterday's task done", assistant.planPrompt)
+	assert.Equal(t, now, assistant.planNow)
+	require.Len(t, assistant.planTasks, 1)
+	assert.Equal(t, existing.ID, assistant.planTasks[0].ID)
+}
+
+func TestPromptLongFlagReadsStdin(t *testing.T) {
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
+	root.SetIn(strings.NewReader("add first task\nthen add second\n"))
+	root.SetArgs([]string{"--prompt", "-"})
+
+	require.NoError(t, root.Execute())
+	assert.Equal(t, 1, assistant.planCalls)
+	assert.Equal(t, "add first task\nthen add second", assistant.planPrompt)
+}
+
+func TestPromptAppliesMixedOperationsAndPrintsChanges(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, buf := newHarness(t, assistant)
+	editTask, err := st.Add("old text")
+	require.NoError(t, err)
+	deleteTask, err := st.Add("remove me")
+	require.NoError(t, err)
+	assistant.planResult = []store.BatchOperation{
+		{Kind: store.OperationCreate, Text: "new task", Status: "todo"},
+		{Kind: store.OperationEdit, ID: editTask.ID, Text: "new text"},
+		{Kind: store.OperationStatus, ID: editTask.ID, Status: "done"},
+		{Kind: store.OperationDelete, ID: deleteTask.ID},
+	}
+
+	root.SetArgs([]string{"--prompt", "apply several changes"})
+	require.NoError(t, root.Execute())
+
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	byText := make(map[string]store.Task, len(tasks))
+	for _, task := range tasks {
+		byText[task.Text] = task
+	}
+	assert.Equal(t, "done", byText["new text"].Status)
+	assert.Equal(t, "todo", byText["new task"].Status)
+	for _, want := range []string{"new task", "new text", "done", "remove me"} {
+		assert.Contains(t, buf.String(), want)
+	}
+}
+
+func TestPromptDefaultHidesPlannerToolCalls(t *testing.T) {
+	assistant := &fakeAssistant{
+		planProgress: []string{
+			"tool create: interpreting new task",
+			"tool create: proposed 1 operation",
+		},
+		planResult: []store.BatchOperation{{Kind: store.OperationCreate, Text: "clean server disks", Status: "todo"}},
+	}
+	_, root, buf := newHarness(t, assistant)
+	root.SetArgs([]string{"-p", "add cleanup server disks"})
+
+	require.NoError(t, root.Execute())
+	assert.Equal(t, 1, assistant.planCalls)
+	assert.Zero(t, assistant.planVerboseCalls)
+	assert.NotContains(t, buf.String(), "tool create")
+	assert.Contains(t, buf.String(), "created")
+}
+
+func TestPromptVerboseShowsPlannerToolCalls(t *testing.T) {
+	assistant := &fakeAssistant{
+		planProgress: []string{
+			"tool create: interpreting new task",
+			"tool create: proposed 1 operation",
+		},
+		planResult: []store.BatchOperation{{Kind: store.OperationCreate, Text: "clean server disks", Status: "todo"}},
+	}
+	_, root, buf := newHarness(t, assistant)
+	root.SetArgs([]string{"-p", "add cleanup server disks", "--verbose"})
+
+	require.NoError(t, root.Execute())
+	assert.Zero(t, assistant.planCalls)
+	assert.Equal(t, 1, assistant.planVerboseCalls)
+	assert.Contains(t, buf.String(), "tool create: interpreting new task")
+	assert.Contains(t, buf.String(), "tool create: proposed 1 operation")
+	assert.Contains(t, buf.String(), "created")
+}
+
+func TestPromptVerboseSeparatesProgressFromChanges(t *testing.T) {
+	assistant := &fakeAssistant{
+		planProgress: []string{"tool creator"},
+		planResult:   []store.BatchOperation{{Kind: store.OperationCreate, Text: "clean server disks", Status: "todo"}},
+	}
+	_, root, _ := newHarness(t, assistant)
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"-p", "add cleanup server disks", "--verbose"})
+
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "tool creator\n", stderr.String())
+	assert.NotContains(t, stdout.String(), "tool creator")
+	assert.Contains(t, stdout.String(), "created")
+}
+
+func TestRootActionFlagsAreMutuallyExclusive(t *testing.T) {
+	for _, args := range [][]string{
+		{"-p", "add one", "-a", "add two"},
+		{"-p", "add one", "-l"},
+		{"-a", "add one", "-g"},
+	} {
+		assistant := &fakeAssistant{}
+		_, root, _ := newHarness(t, assistant)
+		root.SetArgs(args)
+
+		err := root.Execute()
+		require.ErrorContains(t, err, "only one of")
+		assert.Zero(t, assistant.planCalls)
+	}
+}
+
+func TestPromptRejectsPositionalArgs(t *testing.T) {
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
+	root.SetArgs([]string{"-p", "add one", "ignored"})
+
+	err := root.Execute()
+	require.ErrorContains(t, err, "does not accept positional arguments")
+	assert.Zero(t, assistant.planCalls)
+}
+
+func TestVerboseRequiresPrompt(t *testing.T) {
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
+	root.SetArgs([]string{"--verbose"})
+
+	err := root.Execute()
+	require.ErrorContains(t, err, "--verbose requires --prompt")
+}
+
+func TestRootGenerateFlagStillAcceptsDays(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
+	_, err := st.Add("today")
+	require.NoError(t, err)
+	root.SetArgs([]string{"-g", "3"})
+
+	require.NoError(t, root.Execute())
+}
+
+func TestPromptPlanErrorLeavesStoreUnchanged(t *testing.T) {
+	assistant := &fakeAssistant{planErr: errors.New("invalid agent plan")}
+	st, root, _ := newHarness(t, assistant)
+	existing, err := st.Add("keep me")
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"-p", "do everything"})
+	err = root.Execute()
+	require.ErrorContains(t, err, "invalid agent plan")
+	tasks, listErr := st.List()
+	require.NoError(t, listErr)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, existing.ID, tasks[0].ID)
+	assert.Equal(t, existing.Text, tasks[0].Text)
+	assert.Equal(t, existing.Status, tasks[0].Status)
+}
+
+func TestPromptInvalidBatchLeavesStoreUnchanged(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
+	existing, err := st.Add("keep me")
+	require.NoError(t, err)
+	assistant.planResult = []store.BatchOperation{
+		{Kind: store.OperationEdit, ID: existing.ID, Text: "must roll back"},
+		{Kind: store.OperationDelete, ID: "invented-id"},
+	}
+
+	root.SetArgs([]string{"-p", "bad plan"})
+	require.Error(t, root.Execute())
+	tasks, listErr := st.List()
+	require.NoError(t, listErr)
+	require.Len(t, tasks, 1)
+	assert.Equal(t, existing.ID, tasks[0].ID)
+	assert.Equal(t, existing.Text, tasks[0].Text)
+	assert.Equal(t, existing.Status, tasks[0].Status)
+}
+
+func TestPromptEmptyStdinFailsBeforeAssistant(t *testing.T) {
+	assistant := &fakeAssistant{}
+	_, root, _ := newHarness(t, assistant)
+	root.SetIn(strings.NewReader(" \n\t"))
+	root.SetArgs([]string{"-p", "-"})
+
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Equal(t, 0, assistant.planCalls)
+}
+
 // rawAss fails if the model path is taken; the deterministic assistant must
 // be used instead.
 type rawAss struct{ called *bool }
@@ -1655,6 +1892,11 @@ func (r *rawAss) Script(ctx context.Context, report string) (string, error) {
 
 func (r *rawAss) Synthesize(ctx context.Context, script string) ([]byte, error) {
 	return nil, nil
+}
+
+func (r *rawAss) Plan(ctx context.Context, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+	*r.called = true
+	return nil, errors.New("model must not be called through raw assistant")
 }
 
 var _ agent.Assistant = (*rawAss)(nil)

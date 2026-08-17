@@ -30,6 +30,12 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Models read; Go writes. A model never mutates the store: extracted editor output is
   persisted deterministically in Go (a model-driven tool loop was observed to execute
   the same write repeatedly). Store mutations happen in `store`/`cli` only.
+- Natural-language CRUD uses Agent Framework agents-as-tools: one coordinator delegates
+  to create, update, and delete specialists. They return a typed operation plan; Go
+  validates and applies the complete batch atomically, then formats the committed changes.
+  `-p --verbose` surfaces framework function-call names only; arguments repeat the task
+  snapshot and stay hidden. Online construction preflights endpoint connectivity for two
+  seconds before entering the longer per-model-call timeout.
 - Models phrase; Go formats. Report layout (sections, `[status]`, times) is rendered
   from the template in Go; the reporter only rephrases task texts over a count-checked
   JSON contract and any failure falls back to verbatim texts. The speaker rewrites the
@@ -41,7 +47,7 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   cutoff live in `internal/report`. Commit ingestion is deterministic end to end (author
   dates, dedupe, `done` status) — a model never touches it. A model never sorts, filters
   by time, or invents ids.
-- The assistant is lazy: only `add` (online), `generate`, and `speak` construct it, so
+- The assistant is lazy: only `add` (online), `generate`, `speak`, and `-p` construct it, so
   read-only commands never require provider credentials. Speech env
   (`OPENAI_SPEECH_MODEL`/`OPENAI_SPEECH_VOICE`) is checked even later: at `speak -o`
   synthesis time, so the preview needs only the chat vars.

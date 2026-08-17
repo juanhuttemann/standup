@@ -8,13 +8,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/template"
 	"time"
 
 	"github.com/microsoft/agent-framework-go/agent"
+	"github.com/microsoft/agent-framework-go/message"
 	"github.com/microsoft/agent-framework-go/provider/openaiprovider"
+	"github.com/microsoft/agent-framework-go/tool"
+	"github.com/microsoft/agent-framework-go/tool/agenttool"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 
@@ -25,12 +29,14 @@ import (
 
 type Assistant interface {
 	AddTasks(ctx context.Context, rawText string) ([]store.Task, error)
+	Plan(ctx context.Context, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error)
 	Generate(ctx context.Context, sec report.Section) (string, error)
 	Script(ctx context.Context, report string) (string, error)
 	Synthesize(ctx context.Context, script string) ([]byte, error)
 }
 
 type runFunc func(ctx context.Context, prompt string) (string, error)
+type progressRunFunc func(ctx context.Context, prompt string, progress func(string)) (string, error)
 
 // ttsFunc turns a script into audio bytes via the speech endpoint.
 type ttsFunc func(ctx context.Context, input string) ([]byte, error)
@@ -39,9 +45,11 @@ type impl struct {
 	editor              runFunc
 	reporter            runFunc
 	speaker             runFunc
+	planner             progressRunFunc
 	tts                 ttsFunc
 	instructions        string // reporter prompt
 	speakerInstructions string
+	plannerInstructions string
 	lang                string // optional output language
 	st                  *store.Store
 	genTpl              *template.Template
@@ -63,6 +71,10 @@ var _ Assistant = (*local)(nil)
 // the SDK default (~10 min). Var, not config: nobody asked to tune it.
 var modelTimeout = 60 * time.Second
 
+// endpointPreflightTimeout keeps stale local endpoints from consuming the
+// much longer model-call timeout before the first useful request.
+var endpointPreflightTimeout = 2 * time.Second
+
 func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	genTpl, daysTpl, err := parseTemplates(cfg)
 	if err != nil {
@@ -80,16 +92,21 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %s (or run: standup config set offline true)", strings.Join(missing, ", "))
 	}
+	if err := preflightEndpoint(os.Getenv("OPENAI_BASE_URL")); err != nil {
+		return nil, err
+	}
 	client := openai.NewClient(
 		option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
 		option.WithHTTPClient(&http.Client{Timeout: modelTimeout}),
 	)
-	newRun := func(name, instructions string) runFunc {
-		a := openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
+	newAgent := func(name, description, instructions string, tools []tool.Tool) *agent.Agent {
+		return openaiprovider.NewChatCompletionsAgent(client, openaiprovider.AgentConfig{
 			Model:        os.Getenv("OPENAI_MODEL"),
 			Instructions: instructions,
-			Config:       agent.Config{Name: name},
+			Config:       agent.Config{Name: name, Description: description, Tools: tools},
 		})
+	}
+	newRun := func(a *agent.Agent) runFunc {
 		return func(ctx context.Context, prompt string) (string, error) {
 			out, err := a.RunText(ctx, prompt).Collect()
 			if err != nil {
@@ -98,18 +115,105 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 			return out.String(), nil
 		}
 	}
+	newProgressRun := func(a *agent.Agent) progressRunFunc {
+		return func(ctx context.Context, prompt string, progress func(string)) (string, error) {
+			response := &agent.Response{}
+			seen := make(map[string]bool)
+			for update, runErr := range a.RunText(ctx, prompt) {
+				if runErr != nil {
+					return "", fmt.Errorf("endpoint call failed — check OPENAI_BASE_URL and network: %w", runErr)
+				}
+				if progress != nil {
+					reportToolCalls(update, seen, progress)
+				}
+				response.Update(update)
+			}
+			return response.String(), nil
+		}
+	}
+	creator := newAgent("creator", "Plans task creation operations only.", cfg.CreatorInstructions, nil)
+	updater := newAgent("updater", "Plans task text and status updates only.", cfg.UpdaterInstructions, nil)
+	deleter := newAgent("deleter", "Plans task deletion operations only.", cfg.DeleterInstructions, nil)
+	planner := newAgent("planner", "Coordinates standup CRUD planning.", cfg.PlannerInstructions, []tool.Tool{
+		agenttool.New(creator, agenttool.Config{}),
+		agenttool.New(updater, agenttool.Config{}),
+		agenttool.New(deleter, agenttool.Config{}),
+	})
 	return &impl{
-		editor:              newRun("editor", cfg.EditorInstructions),
-		reporter:            newRun("reporter", cfg.ReporterInstructions),
-		speaker:             newRun("speaker", cfg.SpeakerInstructions),
+		editor:              newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
+		reporter:            newRun(newAgent("reporter", "Rephrases report entries.", cfg.ReporterInstructions, nil)),
+		speaker:             newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
+		planner:             newProgressRun(planner),
 		tts:                 newTTS(client),
 		instructions:        cfg.ReporterInstructions,
 		speakerInstructions: cfg.SpeakerInstructions,
+		plannerInstructions: cfg.PlannerInstructions,
 		lang:                cfg.Language,
 		st:                  st,
 		genTpl:              genTpl,
 		daysTpl:             daysTpl,
 	}, nil
+}
+
+func reportToolCalls(update *agent.ResponseUpdate, seen map[string]bool, progress func(string)) {
+	for _, content := range update.Contents {
+		call, ok := content.(*message.FunctionCallContent)
+		if !ok || !specialistTool(call.Name) || call.CallID != "" && seen[call.CallID] {
+			continue
+		}
+		if call.CallID != "" {
+			seen[call.CallID] = true
+		}
+		progress("tool " + call.Name)
+	}
+}
+
+func specialistTool(name string) bool {
+	switch name {
+	case "creator", "updater", "deleter":
+		return true
+	default:
+		return false
+	}
+}
+
+func preflightEndpoint(rawURL string) error {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodHead, rawURL, nil)
+	if err != nil {
+		return errors.New("endpoint unavailable: OPENAI_BASE_URL is invalid")
+	}
+	client := &http.Client{Timeout: endpointPreflightTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		var netErr interface{ Timeout() bool }
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			return fmt.Errorf("endpoint unavailable at %s: timed out after %s; check OPENAI_BASE_URL or start the server", endpointDisplay(rawURL), endpointPreflightTimeout)
+		}
+		return fmt.Errorf("endpoint unavailable at %s: %w; check OPENAI_BASE_URL or start the server", endpointDisplay(rawURL), endpointErrorCause(err))
+	}
+	if err := resp.Body.Close(); err != nil {
+		return fmt.Errorf("endpoint unavailable at %s: close preflight response: %w", endpointDisplay(rawURL), err)
+	}
+	return nil
+}
+
+func endpointErrorCause(err error) error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return urlErr.Err
+	}
+	return err
+}
+
+func endpointDisplay(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "configured URL"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // maxSpeechInput bounds the script sent to synthesis; a standup brief past
@@ -247,6 +351,62 @@ func (a *impl) AddTasks(ctx context.Context, rawText string) ([]store.Task, erro
 	return persist(a.st, parsed)
 }
 
+// Plan delegates one natural-language request to CRUD specialists and returns
+// their proposed operations. It never mutates the store; ApplyBatch in Go is
+// the sole write boundary.
+func (a *impl) Plan(ctx context.Context, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+	return a.PlanWithProgress(ctx, prompt, tasks, now, nil)
+}
+
+// PlanWithProgress reports framework agent-tool calls as they happen. Tool
+// arguments are intentionally omitted because they repeat the user's task
+// snapshot and may contain sensitive work details.
+func (a *impl) PlanWithProgress(ctx context.Context, prompt string, tasks []store.Task, now time.Time, progress func(string)) ([]store.BatchOperation, error) {
+	type plannerTask struct {
+		ID        string `json:"id"`
+		Text      string `json:"task"`
+		Status    string `json:"status"`
+		Timestamp string `json:"timestamp"`
+		Date      string `json:"date"`
+		Relative  string `json:"relative_date,omitempty"`
+	}
+	snapshot := make([]plannerTask, 0, len(tasks))
+	for _, task := range tasks {
+		local := task.Timestamp.In(now.Location())
+		snapshot = append(snapshot, plannerTask{
+			ID: task.ID, Text: task.Text, Status: task.Status,
+			Timestamp: local.Format(time.RFC3339), Date: local.Format("2006-01-02"),
+			Relative: relativeDate(local, now),
+		})
+	}
+	input, err := json.Marshal(struct {
+		Now    string        `json:"now"`
+		Prompt string        `json:"prompt"`
+		Tasks  []plannerTask `json:"tasks"`
+	}{Now: now.Format(time.RFC3339), Prompt: prompt, Tasks: snapshot})
+	if err != nil {
+		return nil, fmt.Errorf("agent: encode planner input: %w", err)
+	}
+	out, err := a.planner(ctx, a.plannerInstructions+"\nInput:\n"+string(input), progress)
+	if err != nil {
+		return nil, err
+	}
+	return extractOperations(out, now)
+}
+
+func relativeDate(task, now time.Time) string {
+	taskDate := time.Date(task.Year(), task.Month(), task.Day(), 0, 0, 0, 0, now.Location())
+	nowDate := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	switch taskDate {
+	case nowDate:
+		return "today"
+	case nowDate.AddDate(0, 0, -1):
+		return "yesterday"
+	default:
+		return ""
+	}
+}
+
 // Generate renders the report deterministically in Go; online mode first
 // rephrases the task texts through the reporter (formatting never depends on
 // the model). Any rephrase failure falls back to the original texts.
@@ -337,6 +497,10 @@ func (l *local) AddTasks(_ context.Context, rawText string) ([]store.Task, error
 	return persist(l.st, parsed)
 }
 
+func (l *local) Plan(context.Context, string, []store.Task, time.Time) ([]store.BatchOperation, error) {
+	return nil, errors.New("agent: prompt requires a model endpoint (offline mode)")
+}
+
 func (l *local) Generate(_ context.Context, sec report.Section) (string, error) {
 	var b strings.Builder
 	if err := tplFor(sec, l.genTpl, l.daysTpl).Execute(&b, sec); err != nil {
@@ -412,6 +576,80 @@ func extractStrings(s string) ([]string, error) {
 		}
 	}
 	return nil, errors.New("agent: no tasks found in reporter output")
+}
+
+// extractOperations accepts only the planner's bounded CRUD contract. Store
+// validation remains authoritative for IDs, statuses, and empty text.
+func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) {
+	type operation struct {
+		Kind   store.OperationKind `json:"kind"`
+		ID     string              `json:"id"`
+		Text   string              `json:"text"`
+		Status string              `json:"status"`
+		When   string              `json:"when"`
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] != '{' {
+			continue
+		}
+		var plan struct {
+			Operations *[]operation `json:"operations"`
+			Message    string       `json:"message"`
+		}
+		dec := json.NewDecoder(strings.NewReader(s[i:]))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&plan); err != nil || plan.Operations == nil {
+			continue
+		}
+		if len(*plan.Operations) == 0 {
+			return nil, noApplicableChanges(plan.Message)
+		}
+		operations := make([]store.BatchOperation, 0, len(*plan.Operations))
+		valid := true
+		for _, proposed := range *plan.Operations {
+			op := store.BatchOperation{Kind: proposed.Kind, ID: proposed.ID, Text: proposed.Text, Status: proposed.Status}
+			if proposed.When != "" {
+				parsed, parseErr := operationTime(proposed.When, now)
+				if parseErr != nil {
+					valid = false
+					break
+				}
+				op.Timestamp = parsed
+			}
+			operations = append(operations, op)
+		}
+		if valid {
+			return operations, nil
+		}
+	}
+	return nil, errors.New("agent: planner returned an invalid operation plan; try a simpler prompt")
+}
+
+func noApplicableChanges(message string) error {
+	const maxRunes = 160
+	reason := strings.Join(strings.Fields(message), " ")
+	if reason == "" {
+		reason = "a requested task may be missing or ambiguous"
+	}
+	runes := []rune(reason)
+	if len(runes) > maxRunes {
+		reason = string(runes[:maxRunes]) + "…"
+	}
+	return fmt.Errorf("agent: no applicable changes: %s", reason)
+}
+
+func operationTime(when string, now time.Time) (time.Time, error) {
+	switch when {
+	case "today":
+		return now, nil
+	case "yesterday":
+		return now.AddDate(0, 0, -1), nil
+	}
+	date, err := time.ParseInLocation("2006-01-02", when, now.Location())
+	if err != nil {
+		return time.Time{}, err
+	}
+	return time.Date(date.Year(), date.Month(), date.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond(), now.Location()), nil
 }
 
 func persist(st *store.Store, parsed []extracted) ([]store.Task, error) {

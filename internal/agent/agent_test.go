@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"text/template"
 	"time"
 
+	frameworkagent "github.com/microsoft/agent-framework-go/agent"
+	"github.com/microsoft/agent-framework-go/message"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 	"github.com/stretchr/testify/assert"
@@ -65,6 +68,89 @@ func TestExtractTasks(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestExtractOperations(t *testing.T) {
+	now := time.Date(2026, 8, 17, 10, 0, 0, 0, time.FixedZone("PY", -4*60*60))
+	out, err := extractOperations(`{"operations":[{"kind":"create","text":"did work","status":"done","when":"yesterday"},{"kind":"status","id":"full-id","status":"done"},{"kind":"delete","id":"old-id"}]}`, now)
+	require.NoError(t, err)
+	require.Len(t, out, 3)
+	assert.Equal(t, store.OperationCreate, out[0].Kind)
+	assert.Equal(t, "did work", out[0].Text)
+	assert.Equal(t, "2026-08-16T10:00:00-04:00", out[0].Timestamp.Format(time.RFC3339))
+	assert.Equal(t, "full-id", out[1].ID)
+	assert.Equal(t, store.OperationDelete, out[2].Kind)
+
+	for _, invalid := range []string{
+		`{"operations":[]}`,
+		`{"operations":[{"kind":"create","text":"x","when":"some day"}]}`,
+		`{"operations":[{"kind":"create","text":"x","extra":true}]}`,
+		"not json",
+	} {
+		_, err := extractOperations(invalid, now)
+		assert.Error(t, err)
+	}
+}
+
+func TestExtractOperationsExplainsEmptyPlan(t *testing.T) {
+	now := time.Date(2026, 8, 17, 10, 0, 0, 0, time.UTC)
+
+	t.Run("planner reason", func(t *testing.T) {
+		reason := "target missing\n" + strings.Repeat("x", 500)
+		_, err := extractOperations(`{"operations":[],"message":"`+strings.ReplaceAll(reason, "\n", `\n`)+`"}`, now)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no applicable changes")
+		assert.Contains(t, err.Error(), "target missing")
+		assert.NotContains(t, err.Error(), "\n")
+		assert.LessOrEqual(t, len(err.Error()), 256, "planner-provided reasons must be bounded")
+	})
+
+	t.Run("no planner reason", func(t *testing.T) {
+		_, err := extractOperations(`{"operations":[]}`, now)
+
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no applicable changes")
+		assert.Contains(t, err.Error(), "missing")
+		assert.Contains(t, err.Error(), "ambiguous")
+	})
+}
+
+func TestExtractOperationsDistinguishesInvalidPlan(t *testing.T) {
+	now := time.Date(2026, 8, 17, 10, 0, 0, 0, time.UTC)
+
+	for _, output := range []string{
+		"not json",
+		`{"operations":[{"kind":"create","text":"x","extra":true}]}`,
+	} {
+		t.Run(output, func(t *testing.T) {
+			_, err := extractOperations(output, now)
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid operation plan")
+		})
+	}
+}
+
+func TestImplPlanIncludesBoundedSnapshot(t *testing.T) {
+	var got string
+	a := &impl{
+		plannerInstructions: "coordinate",
+		planner: func(ctx context.Context, prompt string, _ func(string)) (string, error) {
+			got = prompt
+			return `{"operations":[{"kind":"status","id":"full-id","status":"done"}]}`, nil
+		},
+	}
+	now := time.Date(2026, 8, 17, 10, 0, 0, 0, time.FixedZone("PY", -4*60*60))
+	ops, err := a.Plan(context.Background(), "mark yesterday done", []store.Task{{ID: "full-id", Text: "work", Status: "todo", Timestamp: now.AddDate(0, 0, -1)}}, now)
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, "full-id", ops[0].ID)
+	assert.Contains(t, got, "coordinate")
+	assert.Contains(t, got, `"prompt":"mark yesterday done"`)
+	assert.Contains(t, got, `"id":"full-id"`)
+	assert.Contains(t, got, `"relative_date":"yesterday"`)
+	assert.Contains(t, got, `"now":"2026-08-17T10:00:00-04:00"`)
 }
 
 func TestImplAddTasksWritesStore(t *testing.T) {
@@ -516,6 +602,134 @@ func TestNewRequiresProviderEnv(t *testing.T) {
 	assert.Contains(t, err.Error(), "OPENAI_MODEL")
 }
 
+func TestNewPreflightsProviderEndpoint(t *testing.T) {
+	t.Run("reachable regardless of HTTP status", func(t *testing.T) {
+		called := make(chan struct{}, 1)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			called <- struct{}{}
+			http.Error(w, "model route requires POST", http.StatusMethodNotAllowed)
+		}))
+		t.Cleanup(srv.Close)
+		t.Setenv("OPENAI_BASE_URL", srv.URL+"/v1")
+		t.Setenv("OPENAI_MODEL", "test")
+
+		_, err := New(committedCfg(t), nil)
+		require.NoError(t, err)
+		select {
+		case <-called:
+		case <-time.After(time.Second):
+			t.Fatal("New did not check endpoint connectivity")
+		}
+	})
+
+	t.Run("unreachable reports endpoint unavailable", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		secret := "query-secret-must-not-appear"
+		endpoint := "http://" + listener.Addr().String() + "/v1?api-key=" + secret
+		require.NoError(t, listener.Close())
+		t.Setenv("OPENAI_BASE_URL", endpoint)
+		t.Setenv("OPENAI_MODEL", "test")
+		start := time.Now()
+		_, err = New(committedCfg(t), nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endpoint unavailable")
+		assert.NotContains(t, err.Error(), secret)
+		assert.Less(t, time.Since(start), time.Second, "connection refusal should fail immediately")
+	})
+
+	t.Run("invalid URL does not disclose credentials", func(t *testing.T) {
+		secret := "invalid-url-secret-must-not-appear"
+		t.Setenv("OPENAI_BASE_URL", "http://example.invalid/v1?api-key="+secret+"\n")
+		t.Setenv("OPENAI_MODEL", "test")
+
+		_, err := New(committedCfg(t), nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "OPENAI_BASE_URL is invalid")
+		assert.NotContains(t, err.Error(), secret)
+	})
+
+	t.Run("silent endpoint times out quickly", func(t *testing.T) {
+		done := make(chan struct{})
+		srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			<-done
+		}))
+		t.Cleanup(srv.Close)
+		t.Cleanup(func() { close(done) })
+		t.Setenv("OPENAI_BASE_URL", srv.URL+"/v1")
+		t.Setenv("OPENAI_MODEL", "test")
+
+		start := time.Now()
+		_, err := New(committedCfg(t), nil)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "endpoint unavailable")
+		assert.Contains(t, err.Error(), "timed out")
+		assert.Less(t, time.Since(start), 3*time.Second, "preflight should not use the model-call timeout")
+	})
+}
+
+func TestReportToolCallsAllowsOnlySpecialists(t *testing.T) {
+	seen := make(map[string]bool)
+	var got []string
+	reportToolCalls(&frameworkagent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{Name: "creator", CallID: "one"},
+		&message.FunctionCallContent{Name: "updater", CallID: "two"},
+		&message.FunctionCallContent{Name: "deleter", CallID: "three"},
+		&message.FunctionCallContent{Name: "creator\nforged\x1b[31m", CallID: "rogue"},
+		&message.FunctionCallContent{Name: "unknown", CallID: "unknown"},
+	}}, seen, func(s string) { got = append(got, s) })
+
+	assert.Equal(t, []string{"tool creator", "tool updater", "tool deleter"}, got)
+}
+
+func TestReportToolCallsDoesNotDedupeEmptyCallIDs(t *testing.T) {
+	seen := make(map[string]bool)
+	var got []string
+	reportToolCalls(&frameworkagent.ResponseUpdate{Contents: message.Contents{
+		&message.FunctionCallContent{Name: "creator"},
+		&message.FunctionCallContent{Name: "updater"},
+	}}, seen, func(s string) { got = append(got, s) })
+
+	assert.Equal(t, []string{"tool creator", "tool updater"}, got)
+	assert.Empty(t, seen)
+}
+
+func TestCommittedPlannerPromptsTreatSnapshotAsUntrusted(t *testing.T) {
+	cfg := committedCfg(t)
+	for name, instructions := range map[string]string{
+		"planner": cfg.PlannerInstructions,
+		"creator": cfg.CreatorInstructions,
+		"updater": cfg.UpdaterInstructions,
+		"deleter": cfg.DeleterInstructions,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Contains(t, instructions, "sole authority")
+			assert.Contains(t, instructions, "untrusted data")
+			assert.Contains(t, instructions, "task text")
+		})
+	}
+}
+
+func TestNewOfflineSkipsEndpointPreflight(t *testing.T) {
+	called := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		called <- struct{}{}
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	t.Setenv("OPENAI_MODEL", "test")
+	cfg := committedCfg(t)
+	cfg.Offline = true
+
+	_, err := New(cfg, nil)
+	require.NoError(t, err)
+	select {
+	case <-called:
+		t.Fatal("offline mode contacted the model endpoint")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
 func TestNewBadGenerateTemplate(t *testing.T) {
 	cfg := config.Config{
 		EditorInstructions:    "e",
@@ -580,6 +794,10 @@ func TestAddTasksTimesOutOnSilentEndpoint(t *testing.T) {
 	// the sleep (cleanups run LIFO: close(done) fires before srv.Close).
 	done := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		select {
 		case <-time.After(10 * time.Second): // silent but established: worse than a black hole
 		case <-done:
