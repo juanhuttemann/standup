@@ -11,7 +11,12 @@
 
 </div>
 
-AI-assisted standup CLI. Requires Go 1.26+.
+AI-assisted standups from rough notes, tasks, and Git history.
+
+Write what you worked on in your own words. `standup` turns it into clean task
+entries, lets you manage them with one natural-language request, and rephrases
+the result into a consistent daily update. Task state, report structure, time
+windows, and writes stay deterministic.
 
 ![demo](demo.gif)
 
@@ -29,53 +34,78 @@ Windows (native, PowerShell):
 iex (irm https://raw.githubusercontent.com/juanhuttemann/standup/main/scripts/install.ps1)
 ```
 
-Both fetch the latest release binaries; see [releases](https://github.com/juanhuttemann/standup/releases). To build from source: `go build -o standup ./cmd/standup`.
+Both fetch the latest release binaries; see [releases](https://github.com/juanhuttemann/standup/releases).
 
-`standup update` securely downloads, verifies, and installs the latest release
-in place; `standup update --check` only reports whether one is available.
-Uninstall: delete the binary
-(`rm ~/.local/bin/standup`; root installs live in `/usr/local/bin`; Windows:
-delete `%LOCALAPPDATA%\standup` and remove it from PATH).
+## Quick start
 
-## Setup
+Point `standup` at an OpenAI-compatible endpoint and its served model:
 
-The binary embeds working defaults, so read-only commands work immediately.
-Before model-assisted `add`, `generate`, or `speak`, configure a provider or
-enable offline mode:
+```sh
+standup config set OPENAI_BASE_URL http://localhost:8080/v1
+standup config set OPENAI_MODEL my-model
+standup doctor
+```
+
+Then capture work naturally and generate the report:
+
+```sh
+standup add "fixed the login redirect and reviewed the release"
+standup generate
+```
+
+The assistant cleans and splits the note into tasks, then rephrases their text
+for the standup. The binary—not the model—decides what belongs in Yesterday,
+Today, and Blockers, carries unfinished work forward, and validates every
+change before writing it.
+
+Manage several tasks in one request with `-p`:
+
+```sh
+standup -p "mark the login work done, block the release review, and add API docs for today"
+```
+
+The coordinator delegates creates, edits, status changes, and deletions to
+specialists, validates their complete operation plan, and applies the batch
+atomically. If a target is missing or ambiguous, nothing is written. Add
+`--verbose` to see the specialist tool calls.
+
+Already have the work in Git? Import it as completed tasks before generating:
+
+```sh
+standup commits
+standup generate
+```
+
+Repeated imports are deduplicated. The default window is the last working day,
+so a Monday standup finds Friday's commits.
+
+### No model endpoint?
+
+The full task and reporting loop also works locally, without credentials:
 
 ```sh
 standup config set offline true
+standup add "fixed the login redirect"
+standup commits
+standup generate
 ```
 
-## Configuration
+Offline `add` stores one task per blank-line-separated paragraph, verbatim.
+Offline `generate` uses the same deterministic report layout. Tasks stay in a
+local JSONL file in either mode.
 
-```sh
-standup config set offline true       # use without a model endpoint
-standup config set meeting_time 09:30
-standup config set obsidian.vault /path/to/vault
-standup config set obsidian.note 'Standups/{date}.md'
-standup config set OPENAI_BASE_URL http://localhost:8080/v1
-standup config set OPENAI_MODEL my-model
-standup config edit                   # open config.yaml in $EDITOR
-```
+## What the AI helps with
 
-Application settings are stored in the active `config.yaml`; provider settings
-use that directory's `.env`, never YAML. The active directory is
-`$STANDUP_CONFIG_DIR`, otherwise an existing `./config`, otherwise the user
-config dir (`~/.config/standup`, or `%APPDATA%\standup` on Windows).
+- Cleans up rough notes and splits multi-task input while preserving tags.
+- Rephrases task text into a concise standup without controlling its structure.
+- Coordinates natural-language create, edit, status, and delete requests with
+  specialized agents, then applies the validated plan as one atomic batch.
+- Turns the rendered report into a spoken brief, with optional WAV synthesis.
 
-You can also run `standup init` to write `config.yaml` + `agent.yaml`, or keep
-a `config/` dir beside the working directory. Resolution order per file is
-`$STANDUP_CONFIG_DIR` → `./config` → the user config dir → embedded defaults.
-`STANDUP_*` environment variables override YAML.
+AI is an enhancement, not the source of truth: models read and phrase; Go owns
+task IDs, statuses, ordering, time math, storage, and report formatting.
 
-Online mode needs `OPENAI_BASE_URL` (OpenAI-compatible endpoint) and
-`OPENAI_MODEL` (served model name) in the environment or a `.env` — looked
-up in the working directory or any parent (like git resolves its config),
-then the config dirs. Only `add`, `generate`, and `speak` use a model; every
-other command runs without credentials. Skip both for offline mode (below).
-
-## Use
+## Command guide
 
 ```sh
 standup add "fixed login bug"       # or: standup -a "fixed login bug"
@@ -104,13 +134,13 @@ standup generate --clip             # copy the report to the clipboard
 standup generate --obsidian         # publish into the configured Obsidian vault
 standup generate --webhook <url>    # POST the report (Slack-compatible JSON)
 standup generate --mail <address>   # email the report (needs smtp_* in config.yaml)
-standup speak                       # print the standup as a spoken brief (free preview, no audio)
+standup speak                       # print a spoken brief (no speech synthesis)
 standup speak -o standup.wav        # synthesize the brief to audio (needs OPENAI_SPEECH_MODEL/VOICE env)
 
 standup doctor                      # check the setup: data file, git identity, endpoint
 standup init                        # write default config files for editing
 standup config set KEY VALUE        # set an app or provider value
-standup config edit                 # open the user config.yaml
+standup config edit                 # open the active config.yaml
 standup skill install               # teach your AI agent the standup workflow (this repo)
 standup skill install --global      # same, for every repo (~/.agents, ~/.claude)
 standup update                      # securely update to the latest release
@@ -174,6 +204,32 @@ Goose. Then ask your agent:
 
 > Run `standup commits` to log your work, then `standup generate`.
 
+## Configuration
+
+```sh
+standup config set meeting_time 09:30
+standup config set obsidian.vault /path/to/vault
+standup config set obsidian.note 'Standups/{date}.md'
+standup config edit
+```
+
+Application settings are stored in the active `config.yaml`; provider settings
+use that directory's `.env`, never YAML. The active directory is
+`$STANDUP_CONFIG_DIR`, otherwise an existing `./config`, otherwise the user
+config directory (`~/.config/standup`, or `%APPDATA%\standup` on Windows).
+
+You can also run `standup init` to write `config.yaml` and `agent.yaml` without
+replacing existing files. Resolution order per file is
+`$STANDUP_CONFIG_DIR` → `./config` → the user config directory → embedded
+defaults. `STANDUP_*` environment variables override `.env`, which overrides
+YAML.
+
+Online mode needs `OPENAI_BASE_URL` and `OPENAI_MODEL` in the environment or a
+`.env`. The `.env` lookup walks up from the working directory, like Git, before
+checking the config directories. Only online `add`, `generate`, `speak`, and
+`-p` construct the assistant; task management and commit import need no
+provider credentials.
+
 ## Report language
 
 Set `language:` in `config.yaml` (or `STANDUP_LANGUAGE`) — the model
@@ -235,6 +291,21 @@ jobs:
 
 The store is ephemeral in CI: every run re-imports the last working day's
 commits into a fresh file and posts the rendered report.
+
+## Install notes
+
+`standup update` securely downloads, verifies, and installs the latest release
+in place; `standup update --check` only reports whether one is available.
+
+To build from source, install Go 1.26+ and run:
+
+```sh
+go build -o standup ./cmd/standup
+```
+
+To uninstall, delete the binary (`rm ~/.local/bin/standup`; root installs live
+in `/usr/local/bin`; Windows: delete `%LOCALAPPDATA%\standup` and remove it from
+PATH).
 
 ## Tests
 

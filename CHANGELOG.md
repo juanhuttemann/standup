@@ -5,6 +5,12 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Refocused the README on the AI-assisted quick start, including prominent
+  natural-language `-p` orchestration, while keeping the offline workflow and
+  complete command and configuration guide.
+
 ## [0.11.0] - 2026-08-17
 
 ### Added
