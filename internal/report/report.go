@@ -72,7 +72,7 @@ func assign(sec *Section, tasks []store.Task, now, cutoff time.Time, dates []tim
 			if !sameDay(local, d) {
 				continue
 			}
-			if i == last && today && !t.Timestamp.Before(cutoff) {
+			if i == last && today && t.Timestamp.After(cutoff) {
 				continue
 			}
 			sec.Days[i].Tasks = append(sec.Days[i].Tasks, t)

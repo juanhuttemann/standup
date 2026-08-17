@@ -173,6 +173,15 @@ func TestBuildRangeSingleDay(t *testing.T) {
 	assert.Equal(t, []string{t1.ID}, ids(sec.Days[0].Tasks), "single day covers today only, no carry")
 }
 
+func TestBuildIncludesTaskExactlyAtMeetingCutoff(t *testing.T) {
+	now := d(9, 0, 0)
+	atCutoff := task(time.Date(2026, 8, 15, 9, 30, 0, 0, loc), "todo")
+
+	sec, err := Build([]store.Task{atCutoff}, now, "09:30", Trailing(now, 1))
+	require.NoError(t, err)
+	assert.Equal(t, []string{atCutoff.ID}, ids(sec.Days[0].Tasks))
+}
+
 func TestBuildWeekendDefaultWindow(t *testing.T) {
 	now := time.Date(2026, 8, 17, 9, 0, 0, 0, loc) // Monday
 	fri := task(time.Date(2026, 8, 14, 16, 0, 0, 0, loc), "done")

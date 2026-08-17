@@ -3,6 +3,8 @@ meeting_time: "09:30"
 data_file: "~/.standup/tasks.jsonl"
 # true: no model endpoint — add splits paragraphs, generate renders deterministically.
 offline: false
+# Maximum duration of one model request (for example 30s or 2m).
+model_call_timeout: "60s"
 # text provider: openai or anthropic (empty keeps the OpenAI-compatible default).
 provider: ""
 # report language for the model's rephrasing (empty: keep the input language).

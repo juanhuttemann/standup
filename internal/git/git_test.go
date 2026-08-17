@@ -68,6 +68,37 @@ func TestLogOneLinePerCommit(t *testing.T) {
 	assert.Equal(t, "write tests", commits[1].Subject)
 }
 
+func TestParseLogUsesNULFields(t *testing.T) {
+	adversarial := strings.Repeat("a", 40) + "\x1fnot a record"
+	out := strings.Join([]string{
+		strings.Repeat("b", 40),
+		"2026-08-14T10:00:00+02:00",
+		meEmail,
+		"subject\n\n" + adversarial,
+		"",
+	}, "\x00")
+
+	entries, err := parseLog(out)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Contains(t, entries[0].raw, adversarial)
+}
+
+func TestParseLogAcceptsSHA256ObjectIDs(t *testing.T) {
+	hash := strings.Repeat("c", 64)
+	out := strings.Join([]string{hash, "2026-08-14T10:00:00Z", meEmail, "subject", ""}, "\x00")
+
+	entries, err := parseLog(out)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	assert.Equal(t, hash, entries[0].hash)
+}
+
+func TestParseLogRejectsIncompleteRecord(t *testing.T) {
+	_, err := parseLog(strings.Repeat("d", 40) + "\x00date")
+	assert.Error(t, err)
+}
+
 func TestLogFullBodyWithoutTrailers(t *testing.T) {
 	dir := scratchRepo(t)
 	msg := "fix login bug\n\nThe token was expired.\n\nSigned-off-by: Me <me@example.com>\nCo-authored-by: Someone <someone@example.com>"

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/spf13/viper"
@@ -17,30 +18,32 @@ import (
 )
 
 type Config struct {
-	MeetingTime           string
-	DataFile              string
-	Offline               bool
-	Provider              string
-	Language              string
-	Timezone              string
-	SMTPHost              string
-	SMTPPort              int
-	SMTPUser              string
-	SMTPPassword          string
-	MailFrom              string
-	ReposInclude          []string
-	ReposExclude          []string
-	ObsidianVault         string
-	ObsidianNote          string
-	EditorInstructions    string
-	ReporterInstructions  string
-	SpeakerInstructions   string
-	PlannerInstructions   string
-	CreatorInstructions   string
-	UpdaterInstructions   string
-	DeleterInstructions   string
-	GenerateInputTemplate string
-	DaysTemplate          string
+	MeetingTime                 string
+	DataFile                    string
+	Offline                     bool
+	Provider                    string
+	Language                    string
+	Timezone                    string
+	SMTPHost                    string
+	SMTPPort                    int
+	SMTPUser                    string
+	SMTPPassword                string
+	MailFrom                    string
+	ReposInclude                []string
+	ReposExclude                []string
+	ObsidianVault               string
+	ObsidianNote                string
+	EditorInstructions          string
+	ReporterInstructions        string
+	SpeakerInstructions         string
+	PlannerInstructions         string
+	PlannerFallbackInstructions string
+	CreatorInstructions         string
+	UpdaterInstructions         string
+	DeleterInstructions         string
+	GenerateInputTemplate       string
+	DaysTemplate                string
+	ModelCallTimeout            time.Duration
 }
 
 // Dirs returns the config directory chain: $STANDUP_CONFIG_DIR if set,
@@ -121,6 +124,9 @@ func ValidateFile(path string) error {
 // Set persists application settings in config.yaml and provider deployment
 // facts in the config directory's .env.
 func Set(key, value string) (string, error) {
+	if key == "OPENAI_API_KEY" || key == "ANTHROPIC_API_KEY" {
+		return "", fmt.Errorf("%s is a secret; set it in the environment or the active config directory's .env file", key)
+	}
 	if providerEnvKey(key) {
 		return setEnv(key, value)
 	}
@@ -175,8 +181,9 @@ func ProviderEnv(provider string) ([]string, error) {
 func setYAMLValue(doc *yaml.Node, key, value string) error {
 	tags := map[string]string{
 		"meeting_time": "!!str", "data_file": "!!str", "offline": "!!bool",
-		"provider": "!!str",
-		"language": "!!str", "timezone": "!!str", "smtp_host": "!!str",
+		"model_call_timeout": "!!str",
+		"provider":           "!!str",
+		"language":           "!!str", "timezone": "!!str", "smtp_host": "!!str",
 		"smtp_port": "!!int", "smtp_user": "!!str", "mail_from": "!!str",
 		"obsidian.vault": "!!str", "obsidian.note": "!!str",
 	}
@@ -194,6 +201,12 @@ func setYAMLValue(doc *yaml.Node, key, value string) error {
 	case "!!int":
 		if _, err := strconv.Atoi(value); err != nil {
 			return fmt.Errorf("%s must be an integer: %w", key, err)
+		}
+	}
+	if key == "model_call_timeout" {
+		d, err := time.ParseDuration(value)
+		if err != nil || d <= 0 {
+			return fmt.Errorf("model_call_timeout must be a positive duration")
 		}
 	}
 	if len(doc.Content) == 0 {
@@ -336,23 +349,49 @@ func Load() (Config, error) {
 	v.SetDefault("language", "")
 	v.SetDefault("smtp_port", 587)
 	v.SetDefault("obsidian.note", "Standups/{date}.md")
+	v.SetDefault("model_call_timeout", "60s")
 
+	cfg, err := applicationConfig(v)
+	if err != nil {
+		return Config{}, err
+	}
+
+	agentYAML, err := readFile(dirs, "agent.yaml", defaults.AgentYAML)
+	if err != nil {
+		return Config{}, err
+	}
+	a := viper.New()
+	a.SetConfigType("yaml")
+	if err := a.ReadConfig(strings.NewReader(agentYAML)); err != nil {
+		return Config{}, fmt.Errorf("read agent.yaml: %w", err)
+	}
+	if err := loadAgentConfig(&cfg, a); err != nil {
+		return Config{}, err
+	}
+	return cfg, nil
+}
+
+func applicationConfig(v *viper.Viper) (Config, error) {
 	cfg := Config{
-		MeetingTime:   v.GetString("meeting_time"),
-		DataFile:      v.GetString("data_file"),
-		Offline:       v.GetBool("offline"),
-		Provider:      v.GetString("provider"),
-		Language:      v.GetString("language"),
-		Timezone:      v.GetString("timezone"),
-		SMTPHost:      v.GetString("smtp_host"),
-		SMTPPort:      v.GetInt("smtp_port"),
-		SMTPUser:      v.GetString("smtp_user"),
-		SMTPPassword:  v.GetString("smtp_password"),
-		MailFrom:      v.GetString("mail_from"),
-		ReposInclude:  v.GetStringSlice("repos.include"),
-		ReposExclude:  v.GetStringSlice("repos.exclude"),
-		ObsidianVault: v.GetString("obsidian.vault"),
-		ObsidianNote:  v.GetString("obsidian.note"),
+		MeetingTime:      v.GetString("meeting_time"),
+		DataFile:         v.GetString("data_file"),
+		Offline:          v.GetBool("offline"),
+		Provider:         v.GetString("provider"),
+		Language:         v.GetString("language"),
+		Timezone:         v.GetString("timezone"),
+		SMTPHost:         v.GetString("smtp_host"),
+		SMTPPort:         v.GetInt("smtp_port"),
+		SMTPUser:         v.GetString("smtp_user"),
+		SMTPPassword:     v.GetString("smtp_password"),
+		MailFrom:         v.GetString("mail_from"),
+		ReposInclude:     v.GetStringSlice("repos.include"),
+		ReposExclude:     v.GetStringSlice("repos.exclude"),
+		ObsidianVault:    v.GetString("obsidian.vault"),
+		ObsidianNote:     v.GetString("obsidian.note"),
+		ModelCallTimeout: v.GetDuration("model_call_timeout"),
+	}
+	if cfg.ModelCallTimeout <= 0 {
+		return Config{}, errors.New("model_call_timeout must be a positive duration")
 	}
 
 	dataFile, err := expandHome(cfg.DataFile)
@@ -366,19 +405,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("expand ~ in obsidian vault: %w", err)
 		}
 	}
+	return cfg, nil
+}
 
-	agentYAML, err := readFile(dirs, "agent.yaml", defaults.AgentYAML)
-	if err != nil {
-		return Config{}, err
-	}
-	a := viper.New()
-	a.SetConfigType("yaml")
-	if err := a.ReadConfig(strings.NewReader(agentYAML)); err != nil {
-		return Config{}, fmt.Errorf("read agent.yaml: %w", err)
-	}
+func loadAgentConfig(cfg *Config, a *viper.Viper) error {
 	plannerKeys, embeddedAgent, plannerConfigured, err := plannerPromptDefaults(a)
 	if err != nil {
-		return Config{}, err
+		return err
 	}
 	for _, in := range []struct {
 		key string
@@ -393,17 +426,21 @@ func Load() (Config, error) {
 		{"creator_instructions", &cfg.CreatorInstructions},
 		{"updater_instructions", &cfg.UpdaterInstructions},
 		{"deleter_instructions", &cfg.DeleterInstructions},
+		{"planner_fallback_instructions", &cfg.PlannerFallbackInstructions},
 	} {
 		s := strings.TrimRight(a.GetString(in.key), " \t\r\n")
+		if s == "" && in.key == "planner_fallback_instructions" {
+			s = strings.TrimRight(embeddedAgent.GetString(in.key), " \t\r\n")
+		}
 		if s == "" && plannerKeys[in.key] && !plannerConfigured {
 			s = strings.TrimRight(embeddedAgent.GetString(in.key), " \t\r\n")
 		}
 		if s == "" {
-			return Config{}, fmt.Errorf("agent.yaml: missing required key %s", in.key)
+			return fmt.Errorf("agent.yaml: missing required key %s", in.key)
 		}
 		*in.dst = s
 	}
-	return cfg, nil
+	return nil
 }
 
 func plannerPromptDefaults(configured *viper.Viper) (map[string]bool, *viper.Viper, bool, error) {

@@ -132,10 +132,15 @@ func TestExtractOperationsDistinguishesInvalidPlan(t *testing.T) {
 	}
 }
 
+func TestSafeDiagnosticIsBoundedAndRemovesControls(t *testing.T) {
+	got := safeDiagnostic("bad\x1b[31m\n" + strings.Repeat("x", 300))
+	assert.NotContains(t, got, "\x1b")
+	assert.LessOrEqual(t, len([]rune(got)), 161)
+}
+
 func TestImplPlanIncludesBoundedSnapshot(t *testing.T) {
 	var got string
 	a := &impl{
-		plannerInstructions: "coordinate",
 		planner: func(ctx context.Context, prompt string, _ func(string)) (string, error) {
 			got = prompt
 			return `{"operations":[{"kind":"status","id":"full-id","status":"done"}]}`, nil
@@ -146,7 +151,7 @@ func TestImplPlanIncludesBoundedSnapshot(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, "full-id", ops[0].ID)
-	assert.Contains(t, got, "coordinate")
+	assert.NotContains(t, got, "coordinate", "agent instructions must not be duplicated in user input")
 	assert.Contains(t, got, `"prompt":"mark yesterday done"`)
 	assert.Contains(t, got, `"id":"full-id"`)
 	assert.Contains(t, got, `"relative_date":"yesterday"`)
@@ -184,6 +189,35 @@ func TestImplAddTasksEditorError(t *testing.T) {
 	assert.ErrorIs(t, err, assert.AnError)
 }
 
+func TestImplAddTasksIsAtomicOnInvalidLaterTask(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	a := &impl{editor: func(context.Context, string) (string, error) {
+		return `{"tasks":[{"task":"valid"},{"task":"invalid","status":"invented"}]}`, nil
+	}, st: st}
+	_, err = a.AddTasks(context.Background(), "raw")
+	require.Error(t, err)
+	tasks, listErr := st.List()
+	require.NoError(t, listErr)
+	assert.Empty(t, tasks)
+}
+
+func TestImplPlanFallsBackWithoutTools(t *testing.T) {
+	var fallbackPrompt string
+	a := &impl{
+		planner: func(context.Context, string, func(string)) (string, error) { return "not json", nil },
+		plannerFallback: func(_ context.Context, prompt string) (string, error) {
+			fallbackPrompt = prompt
+			return `{"operations":[{"kind":"create","text":"ship"}]}`, nil
+		},
+	}
+	ops, err := a.Plan(context.Background(), "add ship", nil, time.Now())
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, store.OperationCreate, ops[0].Kind)
+	assert.Contains(t, fallbackPrompt, `"prompt":"add ship"`)
+}
+
 func TestImplGenerateRephrasesViaReporter(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
@@ -191,9 +225,8 @@ func TestImplGenerateRephrasesViaReporter(t *testing.T) {
 			gotPrompt = prompt
 			return `{"tasks": ["Fixed login bug", "Ship the release"]}`, nil
 		},
-		instructions: "rephrase",
-		genTpl:       mustTpl(genTplText),
-		daysTpl:      mustTpl(daysTplText),
+		genTpl:  mustTpl(genTplText),
+		daysTpl: mustTpl(daysTplText),
 	}
 	sec := report.Section{
 		Days: []report.Day{
@@ -205,7 +238,7 @@ func TestImplGenerateRephrasesViaReporter(t *testing.T) {
 	}
 	out, err := a.Generate(context.Background(), sec)
 	require.NoError(t, err)
-	assert.Contains(t, gotPrompt, "rephrase")
+	assert.NotContains(t, gotPrompt, "rephrase", "agent instructions must not be duplicated in user input")
 	assert.Contains(t, gotPrompt, "- fix login bug")
 	assert.Contains(t, gotPrompt, "- ship release")
 	assert.Contains(t, out, "## Yesterday")
@@ -217,11 +250,10 @@ func TestImplGenerateRephrasesViaReporter(t *testing.T) {
 func TestImplGenerateLanguageInPrompt(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
-		reporter:     func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "no json", nil },
-		instructions: "rephrase",
-		lang:         "German",
-		genTpl:       mustTpl(genTplText),
-		daysTpl:      mustTpl(daysTplText),
+		reporter: func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "no json", nil },
+		lang:     "German",
+		genTpl:   mustTpl(genTplText),
+		daysTpl:  mustTpl(daysTplText),
 	}
 	sec := report.Section{
 		Days:  []report.Day{{Heading: "Yesterday"}, {Heading: "Today", Tasks: []store.Task{{Text: "x", Status: "todo", Timestamp: time.Now()}}}},
@@ -317,11 +349,10 @@ func TestImplScriptReturnsTrimmedScript(t *testing.T) {
 			gotPrompt = prompt
 			return "  Yesterday I fixed the login bug. Today I ship the release. \n", nil
 		},
-		speakerInstructions: "speak plainly",
 	}
 	script, err := a.Script(context.Background(), "## Yesterday\n- [done] fix login bug")
 	require.NoError(t, err)
-	assert.Contains(t, gotPrompt, "speak plainly", "instructions steer the speaker agent")
+	assert.NotContains(t, gotPrompt, "speak plainly", "agent instructions must not be duplicated in user input")
 	assert.Contains(t, gotPrompt, "## Yesterday\n- [done] fix login bug", "the rendered report is the speaker input")
 	assert.Equal(t, "Yesterday I fixed the login bug. Today I ship the release.", script, "script is trimmed")
 }
@@ -329,9 +360,8 @@ func TestImplScriptReturnsTrimmedScript(t *testing.T) {
 func TestImplScriptLanguageInPrompt(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
-		speaker:             func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "x", nil },
-		speakerInstructions: "speak",
-		lang:                "German",
+		speaker: func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "x", nil },
+		lang:    "German",
 	}
 	_, err := a.Script(context.Background(), "report")
 	require.NoError(t, err)
@@ -760,10 +790,11 @@ func TestReportToolCallsDoesNotDedupeEmptyCallIDs(t *testing.T) {
 func TestCommittedPlannerPromptsTreatSnapshotAsUntrusted(t *testing.T) {
 	cfg := committedCfg(t)
 	for name, instructions := range map[string]string{
-		"planner": cfg.PlannerInstructions,
-		"creator": cfg.CreatorInstructions,
-		"updater": cfg.UpdaterInstructions,
-		"deleter": cfg.DeleterInstructions,
+		"planner":          cfg.PlannerInstructions,
+		"planner fallback": cfg.PlannerFallbackInstructions,
+		"creator":          cfg.CreatorInstructions,
+		"updater":          cfg.UpdaterInstructions,
+		"deleter":          cfg.DeleterInstructions,
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert.Contains(t, instructions, "sole authority")
@@ -849,10 +880,6 @@ func TestCommittedTemplatesSkipEmptySections(t *testing.T) {
 }
 
 func TestAddTasksTimesOutOnSilentEndpoint(t *testing.T) {
-	old := modelTimeout
-	modelTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { modelTimeout = old })
-
 	// done unblocks the handler at cleanup so srv.Close does not wait out
 	// the sleep (cleanups run LIFO: close(done) fires before srv.Close).
 	done := make(chan struct{})
@@ -873,7 +900,9 @@ func TestAddTasksTimesOutOnSilentEndpoint(t *testing.T) {
 
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
-	ass, err := New(committedCfg(t), st)
+	cfg := committedCfg(t)
+	cfg.ModelCallTimeout = 100 * time.Millisecond
+	ass, err := New(cfg, st)
 	require.NoError(t, err)
 
 	start := time.Now()

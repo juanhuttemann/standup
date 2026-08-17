@@ -13,6 +13,7 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"unicode"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	anthropicoption "github.com/anthropics/anthropic-sdk-go/option"
@@ -46,18 +47,16 @@ type agentFactory func(name, description, instructions string, tools []tool.Tool
 type ttsFunc func(ctx context.Context, input string) ([]byte, error)
 
 type impl struct {
-	editor              runFunc
-	reporter            runFunc
-	speaker             runFunc
-	planner             progressRunFunc
-	tts                 ttsFunc
-	instructions        string // reporter prompt
-	speakerInstructions string
-	plannerInstructions string
-	lang                string // optional output language
-	st                  *store.Store
-	genTpl              *template.Template
-	daysTpl             *template.Template
+	editor          runFunc
+	reporter        runFunc
+	speaker         runFunc
+	planner         progressRunFunc
+	plannerFallback runFunc
+	tts             ttsFunc
+	lang            string // optional output language
+	st              *store.Store
+	genTpl          *template.Template
+	daysTpl         *template.Template
 }
 
 var _ Assistant = (*impl)(nil)
@@ -108,7 +107,11 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	if err := preflightEndpoint(baseURL, required[0]); err != nil {
 		return nil, err
 	}
-	newAgent, textHint := newAgentFactory(provider)
+	timeout := cfg.ModelCallTimeout
+	if timeout <= 0 {
+		timeout = modelTimeout
+	}
+	newAgent, textHint := newAgentFactory(provider, timeout)
 	newRun := func(a *agent.Agent) runFunc {
 		return func(ctx context.Context, prompt string) (string, error) {
 			out, err := a.RunText(ctx, prompt).Collect()
@@ -142,27 +145,26 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		agenttool.New(updater, agenttool.Config{}),
 		agenttool.New(deleter, agenttool.Config{}),
 	})
+	plannerFallback := newAgent("planner-fallback", "Plans standup CRUD directly when tool delegation is unavailable.", cfg.PlannerFallbackInstructions, nil)
 	return &impl{
-		editor:   newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
-		reporter: newRun(newAgent("reporter", "Rephrases report entries.", cfg.ReporterInstructions, nil)),
-		speaker:  newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
-		planner:  newProgressRun(planner),
+		editor:          newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
+		reporter:        newRun(newAgent("reporter", "Rephrases report entries.", cfg.ReporterInstructions, nil)),
+		speaker:         newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
+		planner:         newProgressRun(planner),
+		plannerFallback: newRun(plannerFallback),
 		tts: newTTS(openai.NewClient(
 			option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
-			option.WithHTTPClient(&http.Client{Timeout: modelTimeout}),
+			option.WithHTTPClient(&http.Client{Timeout: timeout}),
 		)),
-		instructions:        cfg.ReporterInstructions,
-		speakerInstructions: cfg.SpeakerInstructions,
-		plannerInstructions: cfg.PlannerInstructions,
-		lang:                cfg.Language,
-		st:                  st,
-		genTpl:              genTpl,
-		daysTpl:             daysTpl,
+		lang:    cfg.Language,
+		st:      st,
+		genTpl:  genTpl,
+		daysTpl: daysTpl,
 	}, nil
 }
 
-func newAgentFactory(provider string) (agentFactory, string) {
-	httpClient := &http.Client{Timeout: modelTimeout}
+func newAgentFactory(provider string, timeout time.Duration) (agentFactory, string) {
+	httpClient := &http.Client{Timeout: timeout}
 	if provider == "anthropic" {
 		client := anthropic.NewClient(
 			anthropicoption.WithoutEnvironmentDefaults(),
@@ -423,11 +425,26 @@ func (a *impl) PlanWithProgress(ctx context.Context, prompt string, tasks []stor
 	if err != nil {
 		return nil, fmt.Errorf("agent: encode planner input: %w", err)
 	}
-	out, err := a.planner(ctx, a.plannerInstructions+"\nInput:\n"+string(input), progress)
+	out, err := a.planner(ctx, "Input:\n"+string(input), progress)
 	if err != nil {
 		return nil, err
 	}
-	return extractOperations(out, now)
+	operations, parseErr := extractOperations(out, now)
+	if parseErr == nil || !errors.Is(parseErr, errInvalidOperationPlan) || a.plannerFallback == nil {
+		return operations, parseErr
+	}
+	if progress != nil {
+		progress("fallback planner")
+	}
+	fallbackOut, fallbackErr := a.plannerFallback(ctx, "Input:\n"+string(input))
+	if fallbackErr != nil {
+		return nil, fallbackErr
+	}
+	operations, fallbackParseErr := extractOperations(fallbackOut, now)
+	if fallbackParseErr != nil && errors.Is(fallbackParseErr, errInvalidOperationPlan) {
+		return nil, fmt.Errorf("%w; primary output: %q; fallback output: %q", fallbackParseErr, safeDiagnostic(out), safeDiagnostic(fallbackOut))
+	}
+	return operations, fallbackParseErr
 }
 
 func relativeDate(task, now time.Time) string {
@@ -464,9 +481,8 @@ func (a *impl) Generate(ctx context.Context, sec report.Section) (string, error)
 // the reporter agent's JSON contract.
 func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, bool) {
 	var prompt strings.Builder
-	prompt.WriteString(a.instructions)
 	if a.lang != "" {
-		fmt.Fprintf(&prompt, " Write the entries in %s.", a.lang)
+		fmt.Fprintf(&prompt, "Write the entries in %s.\n", a.lang)
 	}
 	prompt.WriteString("\nTasks:")
 	for _, t := range texts {
@@ -492,9 +508,8 @@ func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, bool) {
 // agent; the brief is printed before any speech call so users can preview it.
 func (a *impl) Script(ctx context.Context, report string) (string, error) {
 	var prompt strings.Builder
-	prompt.WriteString(a.speakerInstructions)
 	if a.lang != "" {
-		fmt.Fprintf(&prompt, " Write the brief in %s.", a.lang)
+		fmt.Fprintf(&prompt, "Write the brief in %s.\n", a.lang)
 	}
 	prompt.WriteString("\nReport:\n" + report)
 	out, err := a.speaker(ctx, prompt.String())
@@ -616,6 +631,26 @@ func extractStrings(s string) ([]string, error) {
 
 // extractOperations accepts only the planner's bounded CRUD contract. Store
 // validation remains authoritative for IDs, statuses, and empty text.
+var errInvalidOperationPlan = errors.New("agent: planner returned an invalid operation plan; try a simpler prompt")
+
+func safeDiagnostic(s string) string {
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, s)
+	clean = strings.Join(strings.Fields(clean), " ")
+	runes := []rune(clean)
+	if len(runes) > 160 {
+		clean = string(runes[:160]) + "…"
+	}
+	if clean == "" {
+		return "empty"
+	}
+	return clean
+}
+
 func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) {
 	type operation struct {
 		Kind   store.OperationKind `json:"kind"`
@@ -658,7 +693,7 @@ func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) 
 			return operations, nil
 		}
 	}
-	return nil, errors.New("agent: planner returned an invalid operation plan; try a simpler prompt")
+	return nil, errInvalidOperationPlan
 }
 
 func noApplicableChanges(message string) error {
@@ -689,13 +724,17 @@ func operationTime(when string, now time.Time) (time.Time, error) {
 }
 
 func persist(st *store.Store, parsed []extracted) ([]store.Task, error) {
-	var added []store.Task
+	operations := make([]store.BatchOperation, 0, len(parsed))
 	for _, p := range parsed {
-		t, err := st.AddWithStatus(p.text, p.status)
-		if err != nil {
-			return added, fmt.Errorf("agent: store task %q: %w", p.text, err)
-		}
-		added = append(added, t)
+		operations = append(operations, store.BatchOperation{Kind: store.OperationCreate, Text: p.text, Status: p.status})
+	}
+	changes, err := st.ApplyBatch(operations)
+	if err != nil {
+		return nil, fmt.Errorf("agent: store tasks: %w", err)
+	}
+	added := make([]store.Task, 0, len(changes))
+	for _, change := range changes {
+		added = append(added, *change.After)
 	}
 	return added, nil
 }

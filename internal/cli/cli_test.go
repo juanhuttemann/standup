@@ -964,6 +964,26 @@ func TestGenerateWebhookFailureSurfaces(t *testing.T) {
 	err = root.Execute()
 	require.Error(t, err, "webhook failure surfaces")
 	assert.Contains(t, err.Error(), "webhook")
+	assert.Contains(t, root.ErrOrStderr().(*bytes.Buffer).String(), "webhook: failed")
+}
+
+func TestDeliverReportAttemptsEverySinkAndReportsResults(t *testing.T) {
+	oldPost, oldCopy := postWebhook, copyToClipboard
+	postWebhook = func(string, string) error { return errors.New("boom") }
+	copyToClipboard = func(string) error { return nil }
+	t.Cleanup(func() { postWebhook, copyToClipboard = oldPost, oldCopy })
+
+	root := New(func() (Deps, error) { return Deps{}, nil })
+	buf := &bytes.Buffer{}
+	gen, _, err := root.Find([]string{"generate"})
+	require.NoError(t, err)
+	gen.SetErr(buf)
+	require.NoError(t, gen.Flags().Set("webhook", "https://example.invalid"))
+	require.NoError(t, gen.Flags().Set("clip", "true"))
+	err = deliverReport(gen, config.Config{}, "report")
+	require.Error(t, err)
+	assert.Contains(t, buf.String(), "webhook: failed: boom")
+	assert.Contains(t, buf.String(), "clipboard: delivered")
 }
 
 // mailHarness is newHarness plus SMTP config — mail needs smtp_* settings.
@@ -1051,6 +1071,13 @@ func TestGenerateMailRequiresSMTPHost(t *testing.T) {
 	assert.Contains(t, err.Error(), "smtp_host")
 }
 
+func TestMailRejectsHeaderNewlines(t *testing.T) {
+	cfg := config.Config{SMTPHost: "smtp.example.com", SMTPPort: 587, MailFrom: "standup@example.com"}
+	err := mailReport(cfg, "team@example.com\r\nBcc: attacker@example.com", "report")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "newline")
+}
+
 func TestDoctorChecks(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	t.Cleanup(srv.Close)
@@ -1105,6 +1132,7 @@ func TestDoctorFailsOnMissingEnv(t *testing.T) {
 	t.Cleanup(func() { gitIdentity = oldIdent })
 	t.Setenv("OPENAI_BASE_URL", "")
 	t.Setenv("OPENAI_MODEL", "")
+	t.Setenv("OPENAI_API_KEY", "")
 	buf := &bytes.Buffer{}
 	root := New(func() (Deps, error) {
 		return Deps{
@@ -1120,6 +1148,7 @@ func TestDoctorFailsOnMissingEnv(t *testing.T) {
 	err := root.Execute()
 	require.Error(t, err, "missing provider env is a failure in online mode")
 	assert.Contains(t, buf.String(), "fail env OPENAI_BASE_URL")
+	assert.Contains(t, buf.String(), "OPENAI_API_KEY not set (optional")
 }
 
 func TestDoctorChecksAnthropicEnv(t *testing.T) {
@@ -1589,6 +1618,9 @@ func TestEditMissingIDUsage(t *testing.T) {
 }
 
 func TestEditViaEditor(t *testing.T) {
+	oldInteractive := editorInteractive
+	editorInteractive = func() bool { return true }
+	t.Cleanup(func() { editorInteractive = oldInteractive })
 	assistant := &fakeAssistant{}
 	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
@@ -1609,6 +1641,9 @@ func TestEditViaEditor(t *testing.T) {
 }
 
 func TestEditEditorFailure(t *testing.T) {
+	oldInteractive := editorInteractive
+	editorInteractive = func() bool { return true }
+	t.Cleanup(func() { editorInteractive = oldInteractive })
 	assistant := &fakeAssistant{}
 	st, root, _ := newHarness(t, assistant)
 	st.Now = today(8, 0)
@@ -1628,6 +1663,20 @@ func TestEditEditorFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, tasks, 1)
 	assert.Equal(t, "keep me", tasks[0].Text, "failed editor leaves text untouched")
+}
+
+func TestEditWithoutTextRefusesNonInteractiveEditor(t *testing.T) {
+	oldInteractive := editorInteractive
+	editorInteractive = func() bool { return false }
+	t.Cleanup(func() { editorInteractive = oldInteractive })
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
+	added, err := st.Add("keep me")
+	require.NoError(t, err)
+	root.SetArgs([]string{"edit", added.ID})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "non-interactive")
 }
 
 func TestDoneEchoesRow(t *testing.T) {
@@ -1977,6 +2026,32 @@ func TestAddRawBypassesModel(t *testing.T) {
 	assert.Equal(t, "verbatim two", tasks[1].Text)
 }
 
+func TestAddWarnsOnExactDuplicateWithoutBlocking(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	raw, err := agent.Local(config.Config{
+		GenerateInputTemplate: "x",
+		DaysTemplate:          "x",
+	}, st)
+	require.NoError(t, err)
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{Raw: raw, Store: st, Config: config.Config{MeetingTime: "09:30"}}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+
+	root.SetArgs([]string{"add", "--raw", "same task"})
+	require.NoError(t, root.Execute())
+	root.SetArgs([]string{"add", "--raw", "same task"})
+	require.NoError(t, root.Execute(), "duplicates warn but remain allowed")
+
+	tasks, err := st.List()
+	require.NoError(t, err)
+	assert.Len(t, tasks, 2)
+	assert.Contains(t, buf.String(), "warning: exact duplicate task")
+}
+
 func TestReadOnlyCommandsSkipAssistant(t *testing.T) {
 	old := gitLog
 	gitLog = func(dir string, since time.Time) ([]git.Commit, error) { return nil, nil }
@@ -2167,6 +2242,21 @@ func TestUpdateInstallsByDefault(t *testing.T) {
 	assert.Contains(t, buf.String(), "updated v0.5.0 -> v0.6.0")
 }
 
+func TestUpdateDevelopmentBuildFailsBeforeNetwork(t *testing.T) {
+	old := selfUpdate
+	selfUpdate = func(context.Context, string, bool) (standupupdate.Result, error) {
+		t.Fatal("development build must not check the network")
+		return standupupdate.Result{}, nil
+	}
+	t.Cleanup(func() { selfUpdate = old })
+	_, root, _ := newHarness(t, &fakeAssistant{})
+	root.Version = "dev"
+	root.SetArgs([]string{"update", "--check"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "development build")
+}
+
 func TestSkillInstallWritesBothRoots(t *testing.T) {
 	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
 	repo := t.TempDir()
@@ -2189,6 +2279,36 @@ func TestSkillInstallWritesBothRoots(t *testing.T) {
 	assert.Contains(t, buf.String(), filepath.Join(".agents", "skills", "standup", "SKILL.md"))
 
 	require.NoError(t, root.Execute(), "second install refreshes in place (idempotent)")
+}
+
+func TestSkillInstallReplacesWindowsSymlinkPlaceholders(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	for _, root := range []string{".agents", ".claude"} {
+		dir := filepath.Join(root, "skills")
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "standup"), []byte("../../config/skill"), 0o644))
+	}
+	cmd := New(func() (Deps, error) { return Deps{}, errors.New("deps must not load") })
+	cmd.SetArgs([]string{"skill", "install"})
+	require.NoError(t, cmd.Execute())
+	for _, root := range []string{".agents", ".claude"} {
+		b, err := os.ReadFile(filepath.Join(root, "skills", "standup", "SKILL.md"))
+		require.NoError(t, err)
+		assert.Equal(t, defaults.SkillMD, string(b))
+	}
+}
+
+func TestSkillInstallPreflightsConflictsBeforeWriting(t *testing.T) {
+	repo := t.TempDir()
+	t.Chdir(repo)
+	require.NoError(t, os.MkdirAll(filepath.Join(".claude", "skills"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(".claude", "skills", "standup"), []byte("user data"), 0o644))
+	cmd := New(func() (Deps, error) { return Deps{}, nil })
+	cmd.SetArgs([]string{"skill", "install"})
+	require.Error(t, cmd.Execute())
+	_, err := os.Stat(filepath.Join(".agents", "skills", "standup", "SKILL.md"))
+	assert.ErrorIs(t, err, os.ErrNotExist)
 }
 
 func TestSkillInstallGlobalUsesHome(t *testing.T) {

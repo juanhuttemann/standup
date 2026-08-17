@@ -331,6 +331,9 @@ var selfUpdate = standupupdate.Run
 // runUpdate updates the running binary without loading application or model
 // dependencies. --check preserves a read-only path for automation.
 func runUpdate(cmd *cobra.Command) error {
+	if strings.EqualFold(strings.TrimSpace(cmd.Root().Version), "dev") {
+		return errors.New("update: cannot check updates for a development build; install a released binary first")
+	}
 	result, err := selfUpdate(cmd.Context(), cmd.Root().Version, flagBool(cmd, "check"))
 	if err != nil {
 		return fmt.Errorf("update: %w", err)
@@ -371,7 +374,18 @@ func runSkillInstall(cmd *cobra.Command, global bool) error {
 		{filepath.Join(base, ".agents", "skills", "standup"), "Codex, Cursor, OpenCode, Amp, Copilot, Gemini CLI, Goose"},
 		{filepath.Join(base, ".claude", "skills", "standup"), "Claude Code"},
 	}
+	// Preflight every target before changing either one. Windows checkouts can
+	// materialize the repository symlinks as small files containing their target;
+	// those known placeholders are safe to replace, arbitrary files are not.
 	for _, r := range roots {
+		if err := validateSkillTarget(r.dir); err != nil {
+			return err
+		}
+	}
+	for _, r := range roots {
+		if err := removeSkillPlaceholder(r.dir); err != nil {
+			return err
+		}
 		if err := os.MkdirAll(r.dir, 0o755); err != nil {
 			return err
 		}
@@ -381,6 +395,41 @@ func runSkillInstall(cmd *cobra.Command, global bool) error {
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "skill: %s (%s)\n", filepath.Join(r.dir, "SKILL.md"), r.who); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func validateSkillTarget(dir string) error {
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return nil
+	}
+	b, err := os.ReadFile(dir)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(b)) != "../../config/skill" {
+		return fmt.Errorf("skill target %s exists and is not a directory", dir)
+	}
+	return nil
+}
+
+func removeSkillPlaceholder(dir string) error {
+	info, err := os.Stat(dir)
+	if errors.Is(err, os.ErrNotExist) || err == nil && info.IsDir() {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(dir); err != nil {
+		return fmt.Errorf("replace skill placeholder %s: %w", dir, err)
 	}
 	return nil
 }
@@ -413,6 +462,9 @@ func runEdit(cmd *cobra.Command, d Deps, args []string) error {
 	}
 	text := strings.Join(args[1:], " ")
 	if len(args) == 1 {
+		if !editorInteractive() {
+			return fmt.Errorf("edit: cannot open an editor in a non-interactive session; provide replacement text after the task id")
+		}
 		text, err = editInEditor(task.Text)
 		if err != nil {
 			return err
@@ -611,6 +663,10 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("usage: %s add \"task text\" (or pipe text to %s add)", cmd.Root().Name(), cmd.Root().Name())
 	}
+	existing, err := d.Store.List()
+	if err != nil {
+		return err
+	}
 	a := d.Raw
 	if !flagBool(cmd, "raw") {
 		assist, err := d.Assistant()
@@ -630,7 +686,17 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 	if addErr != nil {
 		return addErr
 	}
+	seen := make(map[string]struct{}, len(existing)+len(tasks))
+	for _, task := range existing {
+		seen[task.Text] = struct{}{}
+	}
 	for _, t := range tasks {
+		if _, duplicate := seen[t.Text]; duplicate {
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: exact duplicate task: %s\n", flat(t.Text)); err != nil {
+				return err
+			}
+		}
+		seen[t.Text] = struct{}{}
 		if err := echoTask(cmd, t); err != nil {
 			return err
 		}
@@ -965,6 +1031,8 @@ func interactive() bool {
 	return term.IsTerminal(int(os.Stdin.Fd()))
 }
 
+var editorInteractive = interactive
+
 func runList(cmd *cobra.Command, d Deps) error {
 	st := d.Store
 	now, err := nowIn(d)
@@ -1234,22 +1302,30 @@ func renderReport(cmd *cobra.Command, d Deps, tasks []store.Task, now time.Time,
 // deliverReport fans the rendered report out to the requested sinks:
 // webhook POST, email, clipboard.
 func deliverReport(cmd *cobra.Command, cfg config.Config, out string) error {
-	if u := flagString(cmd, "webhook"); u != "" {
-		if err := postWebhook(u, out); err != nil {
-			return err
+	var errs []error
+	deliver := func(name string, fn func() error) {
+		if err := fn(); err != nil {
+			errs = append(errs, err)
+			detail := strings.TrimPrefix(err.Error(), name+": ")
+			if _, writeErr := fmt.Fprintf(cmd.ErrOrStderr(), "%s: failed: %s\n", name, detail); writeErr != nil {
+				errs = append(errs, writeErr)
+			}
+			return
 		}
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "%s: delivered\n", name); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if u := flagString(cmd, "webhook"); u != "" {
+		deliver("webhook", func() error { return postWebhook(u, out) })
 	}
 	if addr := flagString(cmd, "mail"); addr != "" {
-		if err := mailReport(cfg, addr, out); err != nil {
-			return err
-		}
+		deliver("mail", func() error { return mailReport(cfg, addr, out) })
 	}
 	if flagBool(cmd, "clip") {
-		if err := copyToClipboard(out); err != nil {
-			return err
-		}
+		deliver("clipboard", func() error { return copyToClipboard(out) })
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // runSpeak renders the report and rewrites it as a spoken brief. The script
@@ -1377,6 +1453,9 @@ func mailReport(cfg config.Config, to, text string) error {
 	if from == "" {
 		from = cfg.SMTPUser
 	}
+	if strings.ContainsAny(to, "\r\n") || strings.ContainsAny(from, "\r\n") {
+		return errors.New("mail: address contains a newline")
+	}
 	var auth smtp.Auth
 	if cfg.SMTPUser != "" {
 		auth = smtp.PlainAuth("", cfg.SMTPUser, cfg.SMTPPassword, cfg.SMTPHost)
@@ -1489,6 +1568,7 @@ func runDoctor(cmd *cobra.Command, d Deps) error {
 			report("ok   env %s\n", key)
 		}
 	}
+	reportOptionalOpenAIKey(d.Config.Provider, report)
 	if base := os.Getenv(required[0]); base != "" {
 		check("endpoint reachable", reachable(base, required[0]))
 	}
@@ -1496,6 +1576,12 @@ func runDoctor(cmd *cobra.Command, d Deps) error {
 		return werr
 	}
 	return errOr(healthy)
+}
+
+func reportOptionalOpenAIKey(provider string, report func(string, ...any)) {
+	if (provider == "" || provider == "openai") && os.Getenv("OPENAI_API_KEY") == "" {
+		report("note env OPENAI_API_KEY not set (optional for OpenAI-compatible endpoints)\n")
+	}
 }
 
 func errOr(healthy bool) error {

@@ -43,6 +43,7 @@ Point `standup` at an OpenAI-compatible endpoint and its served model:
 ```sh
 standup config set OPENAI_BASE_URL http://localhost:8080/v1
 standup config set OPENAI_MODEL my-model
+# For hosted endpoints, put OPENAI_API_KEY in your environment or the active .env.
 standup doctor
 ```
 
@@ -120,7 +121,7 @@ task IDs, statuses, ordering, time math, storage, and report formatting.
 ```sh
 standup add "fixed login bug"       # or: standup -a "fixed login bug"
 standup add --raw "verbatim text"   # skip the model, one paragraph = one task
-cat notes.txt | standup add         # piped text becomes tasks
+cat notes.txt | standup add         # blank-line-separated paragraphs become tasks
 standup commits [days] [paths...]   # git commits become done tasks (default: last working day)
 
 standup generate                    # or: standup -g  (last working day + today before meeting time)
@@ -235,7 +236,9 @@ defaults. `STANDUP_*` environment variables override `.env`, which overrides
 YAML.
 
 Online mode needs `OPENAI_BASE_URL` and `OPENAI_MODEL` in the environment or a
-`.env` by default. Set `provider: anthropic` (or `STANDUP_PROVIDER=anthropic`)
+`.env` by default. Hosted endpoints may additionally require `OPENAI_API_KEY`;
+because `config set` echoes values, put secrets directly in the environment or
+the active `.env`. Set `provider: anthropic` (or `STANDUP_PROVIDER=anthropic`)
 to use the Anthropic Messages API with `ANTHROPIC_BASE_URL`,
 `ANTHROPIC_API_KEY`, and `ANTHROPIC_MODEL` instead. The `.env` lookup walks up
 from the working directory, like Git, before checking the config directories.

@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -23,6 +24,9 @@ speaker_instructions: |
 
 planner_instructions: |
   Plan things.
+
+planner_fallback_instructions: |
+  Plan things directly.
 
 creator_instructions: |
   Create things.
@@ -536,6 +540,9 @@ func TestSetRejectsInvalidOrUnknownApplicationValue(t *testing.T) {
 	_, err = Set("mystery", "value")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown config key")
+	_, err = Set("model_call_timeout", "forever")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "positive duration")
 }
 
 func TestSetProviderValueWritesDotEnv(t *testing.T) {
@@ -571,6 +578,24 @@ func TestProviderEnv(t *testing.T) {
 	assert.Equal(t, []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL"}, mustProviderEnv(t, "anthropic"))
 	_, err := ProviderEnv("mystery")
 	require.Error(t, err)
+}
+
+func TestSetRejectsOpenAISecretWithGuidance(t *testing.T) {
+	isolateDirs(t)
+	_, err := Set("OPENAI_API_KEY", "secret")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "active config directory's .env")
+}
+
+func TestLoadModelCallTimeout(t *testing.T) {
+	isolateDirs(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "model_call_timeout: 7s\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, 7*time.Second, cfg.ModelCallTimeout)
 }
 
 func TestLoadProviderFromEnvironment(t *testing.T) {

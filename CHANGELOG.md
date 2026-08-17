@@ -5,6 +5,39 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-17
+
+### Added
+
+- A configurable `model_call_timeout` bounds each model request, and natural-
+  language planning retries malformed tool-based plans through a direct planner.
+
+### Changed
+
+- Report delivery now prints an explicit result for each requested webhook,
+  email, and clipboard sink, and attempts every sink before returning combined
+  failures; `doctor` also calls out a missing `OPENAI_API_KEY` as optional for
+  OpenAI-compatible endpoints.
+- Exact duplicate task text now produces a warning without blocking the add,
+  and the command guide clarifies that piped input splits on blank lines.
+
+### Fixed
+
+- Agent instructions are no longer duplicated in user messages, multi-task adds
+  commit atomically, and secret `config set` attempts now point to the active
+  `.env` without echoing or storing credentials.
+- Local skill installation replaces Windows checkout placeholders safely and
+  preflights both skill roots before writing, ID-only edits refuse to launch an
+  editor without an interactive terminal, and source builds explain that
+  self-update requires a released binary without making a network request.
+- Email delivery rejects newline-bearing sender and recipient values so they
+  cannot inject message headers.
+- Store reads now reject persisted tasks with missing ids, blank text, invalid
+  statuses, or zero timestamps, and identify the invalid JSONL line.
+- Reports include tasks timestamped exactly at the meeting cutoff.
+- Git commit parsing now uses NUL-delimited fields so commit bodies cannot be
+  mistaken for records, and supports both SHA-1 and SHA-256 object ids.
+
 ## [0.12.0] - 2026-08-17
 
 ### Added

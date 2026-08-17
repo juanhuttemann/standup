@@ -155,6 +155,39 @@ func TestEmptyAndMissingFile(t *testing.T) {
 	assert.Empty(t, got)
 }
 
+func TestListRejectsInvalidPersistedRecords(t *testing.T) {
+	tests := map[string]Task{
+		"empty id":       {Text: "task", Status: "todo", Timestamp: time.Now()},
+		"empty text":     {ID: "id", Text: "  ", Status: "todo", Timestamp: time.Now()},
+		"invalid status": {ID: "id", Text: "task", Status: "invalid", Timestamp: time.Now()},
+		"zero timestamp": {ID: "id", Text: "task", Status: "todo"},
+	}
+	for name, task := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "tasks.jsonl")
+			raw, err := json.Marshal(task)
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(path, append(raw, '\n'), 0o644))
+			s, err := Open(path)
+			require.NoError(t, err)
+
+			_, err = s.List()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "line 1")
+		})
+	}
+}
+
+func TestListReportsPhysicalLineForInvalidRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte("\n\n{}\n"), 0o644))
+	s, err := Open(path)
+	require.NoError(t, err)
+
+	_, err = s.List()
+	assert.ErrorContains(t, err, "line 3")
+}
+
 func TestListDay(t *testing.T) {
 	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)

@@ -82,13 +82,16 @@ func (s *Store) load() ([]Task, error) {
 	}
 	var tasks []Task
 	ids := make(map[string]struct{})
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
-		if line == "" {
+	for i, line := range strings.Split(string(raw), "\n") {
+		if strings.TrimSpace(line) == "" {
 			continue
 		}
 		var t Task
 		if err := json.Unmarshal([]byte(line), &t); err != nil {
-			return nil, fmt.Errorf("store: parse line: %w", err)
+			return nil, fmt.Errorf("store: parse line %d: %w", i+1, err)
+		}
+		if err := validateTask(t); err != nil {
+			return nil, fmt.Errorf("store: line %d: %w", i+1, err)
 		}
 		if _, exists := ids[t.ID]; exists {
 			return nil, fmt.Errorf("store: duplicate id %q", t.ID)
@@ -98,6 +101,22 @@ func (s *Store) load() ([]Task, error) {
 	}
 	sort.Slice(tasks, func(i, j int) bool { return tasks[i].Timestamp.Before(tasks[j].Timestamp) })
 	return tasks, nil
+}
+
+func validateTask(t Task) error {
+	if strings.TrimSpace(t.ID) == "" {
+		return errors.New("empty task id")
+	}
+	if strings.TrimSpace(t.Text) == "" {
+		return errors.New("empty task text")
+	}
+	if !validStatus(t.Status) {
+		return errInvalidStatus(t.Status)
+	}
+	if t.Timestamp.IsZero() {
+		return errors.New("zero task timestamp")
+	}
+	return nil
 }
 
 func (s *Store) save(tasks []Task) (err error) {

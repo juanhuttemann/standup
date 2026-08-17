@@ -69,12 +69,16 @@ func logCommits(dir string, since time.Time, allAuthors bool) ([]Commit, error) 
 	}
 	out, err := run(dir, "log", "--no-merges",
 		"--since="+since.Format(time.RFC3339),
-		"--pretty=format:%H%x1f%aI%x1f%ae%x1f%B")
+		"--pretty=format:%H%x00%aI%x00%ae%x00%B%x00")
 	if err != nil {
 		return nil, err
 	}
 	var commits []Commit
-	for _, e := range parseLog(out) {
+	entries, err := parseLog(out)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
 		if !allAuthors && !strings.EqualFold(e.author, email) && !coAuthored(e.raw, email) {
 			continue
 		}
@@ -118,35 +122,40 @@ func nameRev(dir string, commits []Commit) map[string]string {
 	return names
 }
 
-// entry is one raw log record; body lines are reattached by parseLog.
+// entry is one raw log record.
 type entry struct {
 	hash, when, author, raw string
 }
 
-// parseLog splits the \x1f-fielded, newline-separated log output. A new
-// record starts at a line beginning with a 40-hex commit hash.
-// ponytail: body lines containing \x1f would merge into the previous record;
-// real commit messages don't.
-func parseLog(out string) []entry {
-	var entries []entry
-	for _, line := range strings.Split(out, "\n") {
-		if !isHashLine(line) {
-			if len(entries) > 0 {
-				entries[len(entries)-1].raw += "\n" + line
-			}
-			continue
-		}
-		parts := strings.SplitN(line, "\x1f", 4)
-		entries = append(entries, entry{hash: parts[0], when: parts[1], author: parts[2], raw: parts[3]})
+// parseLog splits NUL-delimited fields. Git commit messages cannot contain
+// NUL bytes, so message contents cannot be mistaken for record boundaries.
+func parseLog(out string) ([]entry, error) {
+	if out == "" {
+		return nil, nil
 	}
-	return entries
+	fields := strings.Split(out, "\x00")
+	if fields[len(fields)-1] == "" {
+		fields = fields[:len(fields)-1]
+	}
+	if len(fields)%4 != 0 {
+		return nil, fmt.Errorf("git: malformed log output: got %d fields", len(fields))
+	}
+	entries := make([]entry, 0, len(fields)/4)
+	for i := 0; i < len(fields); i += 4 {
+		hash := strings.TrimLeft(fields[i], "\r\n")
+		if !isObjectID(hash) {
+			return nil, fmt.Errorf("git: malformed object id %q", hash)
+		}
+		entries = append(entries, entry{hash: hash, when: fields[i+1], author: fields[i+2], raw: fields[i+3]})
+	}
+	return entries, nil
 }
 
-func isHashLine(line string) bool {
-	if len(line) < 41 || line[40] != '\x1f' {
+func isObjectID(value string) bool {
+	if len(value) != 40 && len(value) != 64 {
 		return false
 	}
-	for _, r := range line[:40] {
+	for _, r := range value {
 		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
 			return false
 		}
