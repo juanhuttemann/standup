@@ -420,6 +420,7 @@ func TestNewTTSStreamsScriptAndReturnsAudio(t *testing.T) {
 		}
 	}))
 	t.Cleanup(srv.Close)
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	t.Setenv("OPENAI_SPEECH_MODEL", "test-tts")
 	t.Setenv("OPENAI_SPEECH_VOICE", "test-voice")
 
@@ -462,6 +463,7 @@ func TestNewTTSFailsClosedOnMissingAudio(t *testing.T) {
 		assert.NoError(t, err)
 	}))
 	t.Cleanup(srv.Close)
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
 	t.Setenv("OPENAI_SPEECH_MODEL", "test-tts")
 	t.Setenv("OPENAI_SPEECH_VOICE", "test-voice")
 
