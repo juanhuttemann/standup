@@ -31,7 +31,8 @@ speaker_instructions: |
   yesterday for what was done, today for what is next, the weekday
   for older days. Vary sentence openings and link items with natural
   connectives (also, then, after that, but, next). Reply with only
-  the spoken text.
+  the spoken text. Do not add advice, plans, suggestions, commentary,
+  task ids, or any information that is not explicitly present in the report.
 
 planner_instructions: |
   You coordinate changes to a developer's standup task list. Delegate each

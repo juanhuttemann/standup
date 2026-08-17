@@ -368,20 +368,21 @@ func TestSpeakSynthesizeErrorWritesNothing(t *testing.T) {
 	root.SetArgs([]string{"speak", "-o", out})
 	err = root.Execute()
 	assert.ErrorIs(t, err, assert.AnError)
+	assert.Contains(t, err.Error(), "script was printed above")
 	_, statErr := os.Stat(out)
 	assert.ErrorIs(t, statErr, os.ErrNotExist, "a failed speech call leaves no partial file")
 }
 
-func TestSpeakWindowFlags(t *testing.T) {
+func TestSpeakSingleDateFlag(t *testing.T) {
 	assistant := &fakeAssistant{genOut: "x", scriptOut: "x", synthAudio: []byte("A")}
 	st, root, _ := newHarness(t, assistant)
-	st.Now = today(8, 0)
+	st.Now = func() time.Time { return time.Date(2026, 8, 14, 8, 0, 0, 0, time.Local) }
 	_, err := st.Add("x")
 	require.NoError(t, err)
+	st.Now = today(8, 0)
 	root.SetArgs([]string{"speak", "--from", "2026-08-14"})
-	err = root.Execute()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "--from and --to are both required")
+	require.NoError(t, root.Execute())
+	require.Len(t, assistant.genSec.Days, 1)
 }
 
 func TestListFlagShorthand(t *testing.T) {
@@ -567,7 +568,7 @@ func TestRm(t *testing.T) {
 	st, root, buf := newHarness(t, assistant)
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
-	root.SetArgs([]string{"rm", added.ID})
+	root.SetArgs([]string{"rm", "--force", added.ID})
 	require.NoError(t, root.Execute())
 	tasks, err := st.List()
 	require.NoError(t, err)
@@ -575,11 +576,25 @@ func TestRm(t *testing.T) {
 	assert.Contains(t, buf.String(), "- removed: ship it")
 }
 
+func TestRmRequiresForceAndShowsTarget(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	added, err := st.Add("keep this task")
+	require.NoError(t, err)
+	root.SetArgs([]string{"rm", added.ID[:8]})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "keep this task")
+	assert.Contains(t, err.Error(), "--force")
+	tasks, listErr := st.List()
+	require.NoError(t, listErr)
+	assert.Len(t, tasks, 1)
+}
+
 func TestRmEchoFoldsMultilineTaskText(t *testing.T) {
 	st, root, buf := newHarness(t, &fakeAssistant{})
 	added, err := st.AddAt("feat: big thing\n\nbody line", "done", time.Date(2026, 8, 15, 12, 0, 0, 0, time.Local))
 	require.NoError(t, err)
-	root.SetArgs([]string{"rm", added.ID})
+	root.SetArgs([]string{"rm", "--force", added.ID})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, buf.String(), "- removed: feat: big thing body line",
 		"rm echoes one row like every other command, so multi-line text can be verified before deletion")
@@ -858,10 +873,23 @@ func TestGenerateFromToWindow(t *testing.T) {
 	assert.Nil(t, assistant.genSec.Yesterday)
 }
 
-func TestGenerateFromToUsage(t *testing.T) {
+func TestGenerateSingleExplicitDate(t *testing.T) {
 	for _, args := range [][]string{
 		{"generate", "--from", "2026-08-13"},
-		{"generate", "--to", "2026-08-14"},
+		{"generate", "--to", "2026-08-13"},
+	} {
+		assistant := &fakeAssistant{genOut: "x"}
+		st, root, _ := newHarness(t, assistant)
+		seedDays(t, st)
+		root.SetArgs(args)
+		require.NoError(t, root.Execute())
+		require.Len(t, assistant.genSec.Days, 1)
+		assert.Equal(t, "Thu 2026-08-13", assistant.genSec.Days[0].Heading)
+	}
+}
+
+func TestGenerateFromToUsage(t *testing.T) {
+	for _, args := range [][]string{
 		{"generate", "--from", "bogus", "--to", "2026-08-14"},
 		{"generate", "--from", "2026-08-14", "--to", "2026-08-13"},
 		{"generate", "3", "--from", "2026-08-13", "--to", "2026-08-14"},
@@ -1692,7 +1720,7 @@ func TestRmEchoesRow(t *testing.T) {
 	st, root, buf := newHarness(t, &fakeAssistant{})
 	added, err := st.Add("ship it")
 	require.NoError(t, err)
-	root.SetArgs([]string{"rm", added.ID})
+	root.SetArgs([]string{"rm", "--force", added.ID})
 	require.NoError(t, root.Execute())
 	assert.Contains(t, buf.String(), "- removed: ship it")
 }
@@ -2026,6 +2054,22 @@ func TestAddRawBypassesModel(t *testing.T) {
 	assert.Equal(t, "verbatim two", tasks[1].Text)
 }
 
+func TestAddRawDashReadsCommandStdin(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	raw, err := agent.Local(config.Config{GenerateInputTemplate: "x", DaysTemplate: "x"}, st)
+	require.NoError(t, err)
+	root := New(func() (Deps, error) { return Deps{Raw: raw, Store: st}, nil })
+	root.SetIn(strings.NewReader("first\n\nsecond"))
+	root.SetArgs([]string{"add", "--raw", "-"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	assert.Equal(t, "first", tasks[0].Text)
+	assert.Equal(t, "second", tasks[1].Text)
+}
+
 func TestAddWarnsOnExactDuplicateWithoutBlocking(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
@@ -2060,7 +2104,7 @@ func TestReadOnlyCommandsSkipAssistant(t *testing.T) {
 	for name, args := range map[string][]string{
 		"list":    {"list"},
 		"done":    {"done", "%s"},
-		"rm":      {"rm", "%s"},
+		"rm":      {"rm", "--force", "%s"},
 		"status":  {"status", "%s", "done"},
 		"edit":    {"edit", "%s", "new text"},
 		"commits": {"commits"},
@@ -2106,7 +2150,7 @@ func TestAddUsesAssistant(t *testing.T) {
 }
 
 func TestHelpAndVersionNeverLoadConfig(t *testing.T) {
-	for _, args := range [][]string{{"--help"}, {"--version"}, {}, {"help"}} {
+	for _, args := range [][]string{{"--help"}, {"--version"}, {"version"}, {}, {"help"}} {
 		root := New(func() (Deps, error) { return Deps{}, errors.New("config must not load") })
 		root.Version = "test"
 		buf := &bytes.Buffer{}
@@ -2115,6 +2159,16 @@ func TestHelpAndVersionNeverLoadConfig(t *testing.T) {
 		root.SetArgs(args)
 		require.NoError(t, root.Execute(), "args %v must not touch config", args)
 	}
+}
+
+func TestVersionCommandAddsContext(t *testing.T) {
+	root := New(func() (Deps, error) { return Deps{}, errors.New("must not load") })
+	root.Version = "1.2.3"
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetArgs([]string{"version"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "standup version 1.2.3\n", buf.String())
 }
 
 func TestInitCmdWritesDefaults(t *testing.T) {
@@ -2163,11 +2217,16 @@ func TestConfigEditOpensConfigFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf 'offline: true\n' > \"$1\"\n"), 0o755))
 	t.Setenv("EDITOR", script)
 	root := New(func() (Deps, error) { return Deps{}, errors.New("deps must not load") })
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
 	root.SetArgs([]string{"config", "edit"})
 	require.NoError(t, root.Execute())
 	b, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
 	require.NoError(t, err)
 	assert.Contains(t, string(b), "offline: true")
+	assert.Contains(t, buf.String(), "opening "+filepath.Join(dir, "config.yaml"))
+	assert.Contains(t, buf.String(), script)
 }
 
 func TestConfigEditRestoresInvalidYAML(t *testing.T) {

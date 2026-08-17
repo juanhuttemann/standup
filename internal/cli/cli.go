@@ -70,7 +70,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 		RunE:         func(cmd *cobra.Command, args []string) error { return runRoot(cmd, args, load) },
 	}
 	root.Flags().StringP("add", "a", "", "task text")
-	root.Flags().StringP("prompt", "p", "", "apply task changes from a natural-language prompt (use - to read stdin)")
+	root.Flags().StringP("prompt", "p", "", "apply task changes from a natural-language prompt (use - for stdin; weak models may need a longer model_call_timeout)")
 	root.Flags().Bool("verbose", false, "show specialist tool calls for -p")
 	root.Flags().BoolP("list", "l", false, "list today's tasks")
 	root.Flags().BoolP("generate", "g", false, "generate the standup report")
@@ -178,6 +178,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 		},
 		SilenceUsage: true,
 	}
+	rmCmd.Flags().BoolP("force", "f", false, "delete without further confirmation")
 
 	statusCmd := &cobra.Command{
 		Use:   "status <id> <status>",
@@ -214,6 +215,16 @@ func New(load func() (Deps, error)) *cobra.Command {
 	}
 	updateCmd.Flags().Bool("check", false, "check for an update without installing it")
 
+	versionCmd := &cobra.Command{
+		Use:   "version",
+		Short: "print the standup version",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s version %s\n", cmd.Root().Name(), cmd.Root().Version)
+			return err
+		},
+	}
+
 	skillCmd := &cobra.Command{
 		Use:   "skill install",
 		Short: "install the standup agent skill into the current repo (--global: your home dir)",
@@ -230,7 +241,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 	}
 	skillCmd.Flags().BoolP("global", "g", false, "install to ~/.agents and ~/.claude instead of the repo")
 
-	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd)
+	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd, versionCmd)
 	return root
 }
 
@@ -307,6 +318,9 @@ func newConfigCmd() *cobra.Command {
 			}
 			before, err := os.ReadFile(file)
 			if err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "opening %s in %s\n", file, editorName()); err != nil {
 				return err
 			}
 			if err := runEditor(file); err != nil {
@@ -482,6 +496,9 @@ func runRm(cmd *cobra.Command, d Deps, args []string) error {
 	if err != nil {
 		return err
 	}
+	if !flagBool(cmd, "force") {
+		return fmt.Errorf("refusing to remove %s (%s) without --force", shortID(task.ID), flat(task.Text))
+	}
 	if err := d.Store.Delete(task.ID); err != nil {
 		return err
 	}
@@ -508,6 +525,13 @@ func fallbackEditor() string {
 		return "notepad"
 	}
 	return "vi"
+}
+
+func editorName() string {
+	if editor := os.Getenv("EDITOR"); editor != "" {
+		return editor
+	}
+	return fallbackEditor()
 }
 
 // flat collapses a task text to one row: multi-line entries (commit bodies)
@@ -651,14 +675,9 @@ func spin(msg string, fn func() error) error {
 }
 
 func runAdd(cmd *cobra.Command, d Deps, args []string) error {
-	text := strings.Join(args, " ")
-	if strings.TrimSpace(text) == "" && !interactive() {
-		b, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			return err
-		}
-		// Windows pipes carry CRLF; normalize so \r never reaches the store.
-		text = strings.ReplaceAll(string(b), "\r\n", "\n")
+	text, err := addText(cmd, args)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(text) == "" {
 		return fmt.Errorf("usage: %s add \"task text\" (or pipe text to %s add)", cmd.Root().Name(), cmd.Root().Name())
@@ -702,6 +721,23 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 		}
 	}
 	return nil
+}
+
+func addText(cmd *cobra.Command, args []string) (string, error) {
+	text := strings.Join(args, " ")
+	if len(args) == 1 && args[0] == "-" {
+		b, err := io.ReadAll(cmd.InOrStdin())
+		return strings.ReplaceAll(string(b), "\r\n", "\n"), err
+	}
+	if strings.TrimSpace(text) != "" || interactive() {
+		return text, nil
+	}
+	b, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return "", err
+	}
+	// Windows pipes carry CRLF; normalize so \r never reaches the store.
+	return strings.ReplaceAll(string(b), "\r\n", "\n"), nil
 }
 
 func runPrompt(cmd *cobra.Command, d Deps, prompt string) error {
@@ -1383,7 +1419,7 @@ func runSpeak(cmd *cobra.Command, d Deps, args []string) error {
 		return err
 	}
 	if synthErr != nil {
-		return synthErr
+		return fmt.Errorf("audio synthesis failed (the script was printed above): %w", synthErr)
 	}
 	if err := os.WriteFile(filepath.Clean(path), audio, 0o644); err != nil {
 		return err
@@ -1397,8 +1433,11 @@ func runSpeak(cmd *cobra.Command, d Deps, args []string) error {
 func generateDates(cmd *cobra.Command, args []string, now time.Time) ([]time.Time, error) {
 	from, to := flagString(cmd, "from"), flagString(cmd, "to")
 	if from != "" || to != "" {
-		if from == "" || to == "" {
-			return nil, fmt.Errorf("usage: %s generate --from and --to are both required (YYYY-MM-DD)", cmd.Root().Name())
+		if from == "" {
+			from = to
+		}
+		if to == "" {
+			to = from
 		}
 		if len(args) > 0 {
 			return nil, fmt.Errorf("usage: %s generate: [days] and --from/--to are mutually exclusive", cmd.Root().Name())
@@ -1540,7 +1579,7 @@ func runDoctor(cmd *cobra.Command, d Deps) error {
 		}
 		report("ok   %s\n", name)
 	}
-	check("data file writable", checkWritable(d.Config.DataFile))
+	check("data file writable ("+d.Config.DataFile+")", checkWritable(d.Config.DataFile))
 	if email, err := gitIdentity("."); err != nil {
 		check("git identity", err)
 	} else {

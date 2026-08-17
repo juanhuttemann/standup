@@ -181,6 +181,21 @@ func TestImplAddTasksWritesStore(t *testing.T) {
 	assert.Equal(t, "blocked", tasks[1].Status)
 }
 
+func TestImplAddTasksRestoresSingleTaskTags(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	a := &impl{
+		st: st,
+		editor: func(context.Context, string) (string, error) {
+			return `{"tasks":[{"task":"Fix login","status":"todo"}]}`, nil
+		},
+	}
+	got, err := a.AddTasks(context.Background(), "fix login #backend")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "Fix login #backend", got[0].Text)
+}
+
 func TestImplAddTasksEditorError(t *testing.T) {
 	a := &impl{
 		editor: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
@@ -354,7 +369,27 @@ func TestImplScriptReturnsTrimmedScript(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, gotPrompt, "speak plainly", "agent instructions must not be duplicated in user input")
 	assert.Contains(t, gotPrompt, "## Yesterday\n- [done] fix login bug", "the rendered report is the speaker input")
-	assert.Equal(t, "Yesterday I fixed the login bug. Today I ship the release.", script, "script is trimmed")
+	assert.Equal(t, "Yesterday: fix login bug.", script, "invented release work falls back to the report")
+}
+
+func TestImplScriptFallsBackWhenSpeakerIsUngrounded(t *testing.T) {
+	a := &impl{speaker: func(context.Context, string) (string, error) {
+		return "User Safety: safe", nil
+	}}
+	reportText := "## Today\n- [todo] Fix login redirect #backend (09:00)\n- [done] Review deployment #ops (10:00)"
+	script, err := a.Script(context.Background(), reportText)
+	require.NoError(t, err)
+	assert.Equal(t, "Today: Fix login redirect #backend. Today: Review deployment #ops.", script)
+}
+
+func TestImplScriptFallsBackOnInventedAdvice(t *testing.T) {
+	a := &impl{speaker: func(context.Context, string) (string, error) {
+		return "I fixed login and should make sure deployment works.", nil
+	}}
+	reportText := "## Today\n- [done] Fixed login (09:00)"
+	script, err := a.Script(context.Background(), reportText)
+	require.NoError(t, err)
+	assert.Equal(t, "Today: Fixed login.", script)
 }
 
 func TestImplScriptLanguageInPrompt(t *testing.T) {
@@ -440,8 +475,8 @@ func TestNewTTSStreamsScriptAndReturnsAudio(t *testing.T) {
 		assert.Equal(t, "/chat/completions", r.URL.Path)
 		w.Header().Set("Content-Type", "text/event-stream")
 		chunks := []string{
-			"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"id\":\"a1\",\"data\":\"TVAz\"}}}]}\n\n",
-			"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"QllURVM=\",\"transcript\":\"hi\"}},\"finish_reason\":\"stop\"}]}\n\n",
+			"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"id\":\"a1\",\"data\":\"TVAz\",\"transcript\":\"hello \"}}}]}\n\n",
+			"data: {\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"audio\":{\"data\":\"QllURVM=\",\"transcript\":\"standup\"}},\"finish_reason\":\"stop\"}]}\n\n",
 			"data: [DONE]\n\n",
 		}
 		for _, c := range chunks {
@@ -465,7 +500,26 @@ func TestNewTTSStreamsScriptAndReturnsAudio(t *testing.T) {
 	assert.Contains(t, body, `"format":"pcm16"`, "endpoints stream raw pcm16 only")
 	assert.Contains(t, body, `"model":"test-tts"`)
 	assert.Contains(t, body, `"voice":"test-voice"`)
-	assert.Contains(t, body, `"content":"hello standup"`)
+	assert.Contains(t, body, `"role":"system"`)
+	assert.Contains(t, body, "Read the supplied script verbatim")
+	assert.Contains(t, body, "SCRIPT TO READ VERBATIM")
+	assert.Contains(t, body, "hello standup")
+}
+
+func TestNewTTSRejectsAudioThatAnswersInsteadOfNarrating(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err := w.Write([]byte("data: {\"choices\":[{\"delta\":{\"audio\":{\"data\":\"QUJDRA==\",\"transcript\":\"Here is my answer\"}},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(srv.Close)
+	t.Setenv("OPENAI_BASE_URL", srv.URL)
+	t.Setenv("OPENAI_SPEECH_MODEL", "test-tts")
+	t.Setenv("OPENAI_SPEECH_VOICE", "test-voice")
+	tts := newTTS(openai.NewClient(option.WithBaseURL(srv.URL)))
+	_, err := tts(context.Background(), "Today I fixed login.")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "did not narrate")
 }
 
 func TestWavWrap(t *testing.T) {

@@ -5,6 +5,30 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-17
+
+### Added
+
+- `standup version` prints a discoverable contextual version, `add --raw -`
+  reads stdin explicitly, and a single `--from` or `--to` selects one report day.
+
+### Changed
+
+- `rm` now identifies the matched task and requires `--force`; `config edit`
+  prints the file and editor before launching, while `doctor` prints the resolved
+  data-file path.
+- Speech documentation names compatible streaming chat-completions audio models,
+  planner help sets free-model timeout expectations, and speaker instructions
+  explicitly forbid additions beyond the report.
+
+### Fixed
+
+- Online single-task adds deterministically restore any `#tags` stripped by the
+  editor model; ungrounded or advice-bearing speaker output falls back to a
+  deterministic report-derived script, and speech failures explain that the
+  printed script was preserved. Speech synthesis now uses an explicit verbatim
+  boundary and rejects audio whose streamed transcript answers or alters the script.
+
 ## [0.13.0] - 2026-08-17
 
 ### Added

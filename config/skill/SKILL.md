@@ -30,6 +30,8 @@ trailing `#word` tokens in task text.
   configured Obsidian vault.
 - Status changes: `standup done <id>`, `standup status <id> blocked` (or
   `todo`, `in-progress`).
+- Deletion: inspect the target reported by `standup rm <id>`, then confirm it
+  with `standup rm --force <id>`.
 - Mixed natural-language changes: `standup -p "add this today and mark
   yesterday's tasks done"`; use `standup -p -` to read the prompt from stdin.
   The whole CRUD plan succeeds or fails together, and ambiguous targets fail
@@ -40,6 +42,7 @@ trailing `#word` tokens in task text.
 ## Notes
 
 - `<id>` accepts any unambiguous prefix; `list` shows short ids.
+- `standup add --raw -` reads verbatim paragraphs from stdin.
 - No model endpoint: `STANDUP_OFFLINE=true` — add splits paragraphs,
   generate renders deterministically. Online mode defaults to an OpenAI-compatible
   endpoint; set `STANDUP_PROVIDER=anthropic` for the Anthropic Messages API.

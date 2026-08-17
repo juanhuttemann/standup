@@ -121,6 +121,7 @@ task IDs, statuses, ordering, time math, storage, and report formatting.
 ```sh
 standup add "fixed login bug"       # or: standup -a "fixed login bug"
 standup add --raw "verbatim text"   # skip the model, one paragraph = one task
+printf 'verbatim text' | standup add --raw -  # explicit stdin marker
 cat notes.txt | standup add         # blank-line-separated paragraphs become tasks
 standup commits [days] [paths...]   # git commits become done tasks (default: last working day)
 
@@ -136,7 +137,7 @@ standup list --tag api              # only tasks carrying the literal #api token
 standup done <id>                   # mark done, no model involved
 standup status <id> in-progress     # set status: todo, in-progress, blocked, done
 standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
-standup rm <id>                     # delete, no model involved
+standup rm --force <id>             # delete after verifying the target shown without --force
 standup -p "add this today and mark yesterday done"  # apply mixed CRUD atomically
 standup -p "add this today" --verbose  # show coordinator → specialist tool calls
 printf '%s\n' "delete the obsolete task" | standup -p -  # read the prompt from stdin
@@ -146,7 +147,7 @@ standup generate --obsidian         # publish into the configured Obsidian vault
 standup generate --webhook <url>    # POST the report (Slack-compatible JSON)
 standup generate --mail <address>   # email the report (needs smtp_* in config.yaml)
 standup speak                       # print a spoken brief (no speech synthesis)
-standup speak -o standup.wav        # synthesize via the OpenAI-compatible endpoint (needs its speech env)
+standup speak -o standup.wav        # synthesize via a chat-completions audio-output model
 
 standup doctor                      # check the setup: data file, git identity, endpoint
 standup init                        # write default config files for editing
@@ -156,6 +157,7 @@ standup skill install               # teach your AI agent the standup workflow (
 standup skill install --global      # same, for every repo (~/.agents, ~/.claude)
 standup update                      # securely update to the latest release
 standup update --check              # check without installing
+standup version                     # print the version with context
 ```
 
 ### Tasks and reports
@@ -166,6 +168,9 @@ standup update --check              # check without installing
   plan, and applies it in one write; missing or ambiguous targets change nothing.
 - Online commands preflight endpoint connectivity for two seconds before the
   first model call, so stale local endpoints fail quickly.
+- Agent coordination can require several model round trips. Increase
+  `model_call_timeout` (for example, `standup config set model_call_timeout 2m`)
+  for slow free-tier models.
 - Task IDs accept any unambiguous prefix; `list` displays the first 8 characters.
 - Unfinished tasks from yesterday carry over into Today.
 - Blocked tasks appear under `## Blockers` until resolved.
@@ -246,6 +251,11 @@ Only online `add`, `generate`, `speak`, and `-p` construct the assistant; task
 management and commit import need no provider credentials. Speech synthesis
 remains OpenAI-compatible and independently requires `OPENAI_BASE_URL`,
 `OPENAI_SPEECH_MODEL`, and `OPENAI_SPEECH_VOICE` only when `speak -o` runs.
+The speech model must produce audio through streaming chat completions; classic
+`tts-1`-style `/audio/speech` models are not compatible. On OpenRouter, current
+examples are `openai/gpt-audio-mini` and `openai/gpt-audio`. The script is
+printed before synthesis, and synthesis errors explicitly identify it as the
+preserved preview.
 
 ## Report language
 
@@ -276,6 +286,8 @@ Set `offline: true` in `config.yaml` (or `STANDUP_OFFLINE=true`):
 endpoint needed; all provider variables become optional.
 
 Tasks live in a JSONL file (`data_file`, default `~/.standup/tasks.jsonl`).
+The binary expands `~` with the operating system user-home API, including on
+Windows; `standup doctor` prints the resolved path it checks.
 
 ## Run it on a schedule (GitHub Actions)
 

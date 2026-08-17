@@ -44,6 +44,12 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   prints the script (a free preview) and `-o` synthesizes it via a streaming chat
   completion with the audio modality; the pcm16 bytes are WAV-wrapped in Go and the
   audio model never sees the store.
+- Speaker prompts explicitly forbid advice, plans, task ids, and information
+  absent from the rendered report; synthesis failures identify the already
+  printed script as the preserved preview. Go rejects ungrounded briefs or
+  invented advice and deterministically derives a faithful script from the report.
+  The audio request is explicitly verbatim, and Go rejects returned audio when
+  the streamed transcript does not match the script's normalized word sequence.
 - Deterministic work stays deterministic: time math, day split, ordering, and the meeting
   cutoff live in `internal/report`. Commit ingestion is deterministic end to end (author
   dates, dedupe, `done` status) — a model never touches it. A model never sorts, filters
@@ -141,3 +147,5 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 
 ### Statuses
 - `todo` | `in-progress` | `blocked` | `done` — validated at the store boundary.
+- Destructive `rm` requires `--force` after the refusal message identifies the
+  matched task; `add --raw -` is the explicit stdin form.
