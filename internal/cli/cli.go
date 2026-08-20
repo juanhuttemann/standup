@@ -31,6 +31,7 @@ import (
 	"standup/internal/obsidian"
 	"standup/internal/report"
 	"standup/internal/store"
+	"standup/internal/sync"
 	standupupdate "standup/internal/update"
 )
 
@@ -42,6 +43,9 @@ var gitSubmodules = git.Submodules
 
 // gitLogAll is swappable so CLI tests never depend on a real repository.
 var gitLogAll = git.LogAll
+
+// syncRun is swappable so CLI tests never depend on a running server.
+var syncRun = sync.Run
 
 // Deps carries everything a command needs; it is built lazily so help,
 // version, and init never touch config, store, or provider settings. The
@@ -241,7 +245,16 @@ func New(load func() (Deps, error)) *cobra.Command {
 	}
 	skillCmd.Flags().BoolP("global", "g", false, "install to ~/.agents and ~/.claude instead of the repo")
 
-	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd, versionCmd)
+	syncCmd := &cobra.Command{
+		Use:   "sync",
+		Short: "sync tasks with the configured PocketBase server",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, runSync)
+		},
+		SilenceUsage: true,
+	}
+
+	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd, versionCmd, syncCmd)
 	return root
 }
 
@@ -504,6 +517,42 @@ func runRm(cmd *cobra.Command, d Deps, args []string) error {
 	}
 	_, err = fmt.Fprintf(cmd.OutOrStdout(), "- removed: %s\n", flat(task.Text))
 	return err
+}
+
+// runSync merges the local store with the configured PocketBase server.
+// Credentials never come from config: the sync package reads them from the
+// environment.
+func runSync(cmd *cobra.Command, d Deps) error {
+	if d.Config.SyncURL == "" {
+		return fmt.Errorf("sync is not configured: set sync.url in config.yaml (or PB_URL)")
+	}
+	var res sync.Result
+	if err := spin("syncing", func() error {
+		var err error
+		res, err = syncRun(d.Store, sync.Server{
+			URL:        d.Config.SyncURL,
+			Collection: d.Config.SyncCollection,
+			Email:      d.Config.SyncEmail,
+			Password:   d.Config.SyncPassword,
+		})
+		return err
+	}); err != nil {
+		return err
+	}
+	line := fmt.Sprintf("- synced: %d pushed, %d pulled", len(res.Push), res.Pulled)
+	if res.Resolved > 0 {
+		line += fmt.Sprintf(", %s resolved", plural(res.Resolved, "duplicate"))
+	}
+	_, err := fmt.Fprintln(cmd.OutOrStdout(), line)
+	return err
+}
+
+// plural renders "1 duplicate" / "2 duplicates".
+func plural(n int, word string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, word)
+	}
+	return fmt.Sprintf("%d %ss", n, word)
 }
 
 func runStatus(cmd *cobra.Command, d Deps, args []string) error {
@@ -963,9 +1012,10 @@ func filterRepos(paths []string, cfg config.Config) ([]string, error) {
 }
 
 // importCommits stores commits as done tasks stamped with the commit time;
-// commits already imported (same text, same day) are skipped.
+// commits already imported (same text, same day) are skipped — including
+// tombstoned ones, so a deleted import never resurrects on re-run.
 func importCommits(cmd *cobra.Command, st *store.Store, commits []git.Commit) error {
-	existing, err := st.List()
+	existing, err := st.Snapshot()
 	if err != nil {
 		return err
 	}

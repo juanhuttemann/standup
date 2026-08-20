@@ -31,6 +31,10 @@ type Config struct {
 	MailFrom                    string
 	ReposInclude                []string
 	ReposExclude                []string
+	SyncURL                     string
+	SyncCollection              string
+	SyncEmail                   string
+	SyncPassword                string
 	ObsidianVault               string
 	ObsidianNote                string
 	EditorInstructions          string
@@ -350,6 +354,7 @@ func Load() (Config, error) {
 	v.SetDefault("smtp_port", 587)
 	v.SetDefault("obsidian.note", "Standups/{date}.md")
 	v.SetDefault("model_call_timeout", "60s")
+	v.SetDefault("sync.collection", "standup_tasks")
 
 	cfg, err := applicationConfig(v)
 	if err != nil {
@@ -373,19 +378,28 @@ func Load() (Config, error) {
 
 func applicationConfig(v *viper.Viper) (Config, error) {
 	cfg := Config{
-		MeetingTime:      v.GetString("meeting_time"),
-		DataFile:         v.GetString("data_file"),
-		Offline:          v.GetBool("offline"),
-		Provider:         v.GetString("provider"),
-		Language:         v.GetString("language"),
-		Timezone:         v.GetString("timezone"),
-		SMTPHost:         v.GetString("smtp_host"),
-		SMTPPort:         v.GetInt("smtp_port"),
-		SMTPUser:         v.GetString("smtp_user"),
-		SMTPPassword:     v.GetString("smtp_password"),
-		MailFrom:         v.GetString("mail_from"),
-		ReposInclude:     v.GetStringSlice("repos.include"),
-		ReposExclude:     v.GetStringSlice("repos.exclude"),
+		MeetingTime:  v.GetString("meeting_time"),
+		DataFile:     v.GetString("data_file"),
+		Offline:      v.GetBool("offline"),
+		Provider:     v.GetString("provider"),
+		Language:     v.GetString("language"),
+		Timezone:     v.GetString("timezone"),
+		SMTPHost:     v.GetString("smtp_host"),
+		SMTPPort:     v.GetInt("smtp_port"),
+		SMTPUser:     v.GetString("smtp_user"),
+		SMTPPassword: v.GetString("smtp_password"),
+		MailFrom:     v.GetString("mail_from"),
+		ReposInclude: v.GetStringSlice("repos.include"),
+		ReposExclude: v.GetStringSlice("repos.exclude"),
+		// The PocketBase connection shares one prefix, so each fact has
+		// exactly one name: PB_URL and PB_COLLECTION override their yaml
+		// keys, PB_EMAIL and PB_PASSWORD are credentials with no yaml key
+		// at all (deployment facts, like OPENAI_*). A .env works for all
+		// four — godotenv has already put it in the environment.
+		SyncURL:          envOr("PB_URL", v.GetString("sync.url")),
+		SyncCollection:   envOr("PB_COLLECTION", v.GetString("sync.collection")),
+		SyncEmail:        os.Getenv("PB_EMAIL"),
+		SyncPassword:     os.Getenv("PB_PASSWORD"),
 		ObsidianVault:    v.GetString("obsidian.vault"),
 		ObsidianNote:     v.GetString("obsidian.note"),
 		ModelCallTimeout: v.GetDuration("model_call_timeout"),
@@ -492,6 +506,14 @@ func loadDotEnv(dirs []string) error {
 		}
 	}
 	return nil
+}
+
+// envOr returns the environment value when set, else the fallback.
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 // findUp returns the path if it exists in the cwd or any parent directory.

@@ -5,6 +5,34 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `standup sync`: keeps one task list across machines by merging the local
+  store with a PocketBase server. Point `sync.url` at the server in
+  `config.yaml`. The PocketBase connection shares one env prefix so each
+  fact has exactly one name: `PB_URL`/`PB_COLLECTION` override the yaml
+  keys, and `PB_EMAIL`/`PB_PASSWORD` are credentials that exist only in the
+  environment or a `.env`, never a config file.
+  The first sync provisions the collection (`sync.collection`,
+  default `standup_tasks`) with superuser-only access, so PocketBase needs
+  no manual setup, and sync stays off until `sync.url` is set. Merging is
+  deterministic and model-free: tasks union by id, the most recently
+  changed copy wins (ties go to the server), deletes travel as tombstones
+  so a removal propagates instead of being pushed back, and the same commit
+  imported on two machines collapses to one task. The merged result is
+  saved locally before anything is uploaded, so an interrupted sync leaves
+  a consistent store and retries on the next run; a second sync with
+  nothing to do is a no-op. A remote record edited by hand into an invalid
+  one is refused by name (record, id, bad value, and where to fix it) with
+  zero local writes.
+
+### Changed
+
+- `standup rm` now tombstones a task instead of dropping its line: the
+  record stays in the JSONL stamped with its deletion time so `sync` can
+  propagate the removal. `list` and reports hide tombstones, and
+  `standup commits` no longer re-imports a commit whose task was deleted.
+
 ## [0.14.0] - 2026-08-17
 
 ### Added

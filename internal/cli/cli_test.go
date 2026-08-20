@@ -27,6 +27,7 @@ import (
 	"standup/internal/git"
 	"standup/internal/report"
 	"standup/internal/store"
+	"standup/internal/sync"
 	standupupdate "standup/internal/update"
 )
 
@@ -2420,4 +2421,82 @@ func unsetCliEnv(t *testing.T, keys ...string) {
 			})
 		}
 	}
+}
+
+// --- sync ---------------------------------------------------------------
+
+// syncHarness builds a root command with sync configured and syncRun faked,
+// so CLI tests never need a PocketBase server.
+func syncHarness(t *testing.T, cfg config.Config, res sync.Result, runErr error) (*cobra.Command, *bytes.Buffer, *[]string) {
+	t.Helper()
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	var calls []string
+	old := syncRun
+	syncRun = func(s *store.Store, srv sync.Server) (sync.Result, error) {
+		calls = append(calls, strings.Join([]string{srv.URL, srv.Collection, srv.Email, srv.Password}, "|"))
+		assert.Same(t, st, s, "sync gets the CLI's store")
+		return res, runErr
+	}
+	t.Cleanup(func() { syncRun = old })
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) { return Deps{Store: st, Config: cfg}, nil })
+	root.SetOut(buf)
+	root.SetErr(buf)
+	return root, buf, &calls
+}
+
+func TestSyncCommand(t *testing.T) {
+	cfg := config.Config{SyncURL: "https://pb.example.com", SyncCollection: "my_tasks",
+		SyncEmail: "admin@example.com", SyncPassword: "s3cret"}
+	res := sync.Result{Push: []store.Task{{ID: "a"}, {ID: "b"}}, Pulled: 3}
+	root, buf, calls := syncHarness(t, cfg, res, nil)
+	root.SetArgs([]string{"sync"})
+	require.NoError(t, root.Execute())
+
+	assert.Equal(t, []string{"https://pb.example.com|my_tasks|admin@example.com|s3cret"}, *calls,
+		"url, collection and credentials all come from the loaded config")
+	assert.Contains(t, buf.String(), "2 pushed")
+	assert.Contains(t, buf.String(), "3 pulled")
+}
+
+func TestSyncReportsResolvedDuplicates(t *testing.T) {
+	cfg := config.Config{SyncURL: "https://pb.example.com", SyncCollection: "my_tasks"}
+	root, buf, _ := syncHarness(t, cfg, sync.Result{Resolved: 2}, nil)
+	root.SetArgs([]string{"sync"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "2 duplicates resolved")
+}
+
+func TestSyncQuietWhenNothingResolved(t *testing.T) {
+	cfg := config.Config{SyncURL: "https://pb.example.com", SyncCollection: "my_tasks"}
+	root, buf, _ := syncHarness(t, cfg, sync.Result{}, nil)
+	root.SetArgs([]string{"sync"})
+	require.NoError(t, root.Execute())
+	assert.NotContains(t, buf.String(), "duplicate", "no duplicate noise on a clean sync")
+}
+
+func TestSyncNotConfigured(t *testing.T) {
+	root, _, calls := syncHarness(t, config.Config{SyncCollection: "my_tasks"}, sync.Result{}, nil)
+	root.SetArgs([]string{"sync"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sync.url", "the error names the setting to fill in")
+	assert.Empty(t, *calls, "no server is contacted when sync is not configured")
+}
+
+func TestSyncPropagatesError(t *testing.T) {
+	cfg := config.Config{SyncURL: "https://pb.example.com", SyncCollection: "my_tasks"}
+	root, _, _ := syncHarness(t, cfg, sync.Result{}, errors.New("pocketbase is down"))
+	root.SetArgs([]string{"sync"})
+	assert.ErrorContains(t, root.Execute(), "pocketbase is down")
+}
+
+func TestSyncRegistered(t *testing.T) {
+	root := New(func() (Deps, error) { return Deps{}, nil })
+	var names []string
+	for _, c := range root.Commands() {
+		names = append(names, c.Name())
+	}
+	assert.Contains(t, names, "sync")
 }

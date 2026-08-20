@@ -120,7 +120,7 @@ func TestJSONLFormatOnDisk(t *testing.T) {
 
 	var obj map[string]any
 	require.NoError(t, json.Unmarshal([]byte(lines[0]), &obj))
-	assert.ElementsMatch(t, []string{"id", "task", "status", "timestamp"}, keysOf(obj))
+	assert.ElementsMatch(t, []string{"id", "task", "status", "timestamp", "updated"}, keysOf(obj))
 	assert.Equal(t, tk.ID, obj["id"])
 	assert.Equal(t, "write tests", obj["task"])
 	assert.Equal(t, "todo", obj["status"])
@@ -128,6 +128,10 @@ func TestJSONLFormatOnDisk(t *testing.T) {
 	parsed, err := time.Parse(time.RFC3339, obj["timestamp"].(string))
 	require.NoError(t, err)
 	assert.True(t, parsed.Equal(tk.Timestamp))
+
+	updated, err := time.Parse(time.RFC3339, obj["updated"].(string))
+	require.NoError(t, err)
+	assert.True(t, updated.Equal(tk.Updated))
 }
 
 func keysOf(m map[string]any) []string {
@@ -291,6 +295,148 @@ func TestDelete(t *testing.T) {
 	got, err := s.List()
 	require.NoError(t, err)
 	assert.Empty(t, got)
+}
+
+func TestAddStampsUpdated(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	s.Now = fixedClock(now)
+
+	tk, err := s.Add("task")
+	require.NoError(t, err)
+	assert.True(t, tk.Updated.Equal(now), "add stamps Updated with the clock")
+	assert.True(t, tk.Deleted.IsZero(), "fresh tasks are live")
+}
+
+func TestAddAtStampsImportTime(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	s.Now = fixedClock(now)
+
+	at := time.Date(2026, 8, 14, 16, 42, 0, 0, time.UTC)
+	tk, err := s.AddAt("imported", "done", at)
+	require.NoError(t, err)
+	assert.True(t, tk.Timestamp.Equal(at), "event time is the given time")
+	assert.True(t, tk.Updated.Equal(now), "modification time is the import moment")
+}
+
+func TestMutationsBumpUpdated(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	t0 := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	s.Now = fixedClock(t0)
+	tk, err := s.Add("task")
+	require.NoError(t, err)
+
+	t1 := t0.Add(time.Hour)
+	s.Now = fixedClock(t1)
+
+	st, err := s.SetStatus(tk.ID, "in-progress")
+	require.NoError(t, err)
+	assert.True(t, st.Updated.Equal(t1), "SetStatus bumps Updated")
+	assert.True(t, st.Timestamp.Equal(t0), "event time preserved")
+
+	ed, err := s.UpdateText(tk.ID, "renamed")
+	require.NoError(t, err)
+	assert.True(t, ed.Updated.Equal(t1), "UpdateText bumps Updated")
+
+	au, err := s.SetAuthor(tk.ID, "alice@example.com")
+	require.NoError(t, err)
+	assert.True(t, au.Updated.Equal(t1), "SetAuthor bumps Updated")
+
+	br, err := s.SetBranch(tk.ID, "main")
+	require.NoError(t, err)
+	assert.True(t, br.Updated.Equal(t1), "SetBranch bumps Updated")
+}
+
+func TestDeleteTombstones(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	t0 := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	s.Now = fixedClock(t0)
+	tk, err := s.Add("doomed")
+	require.NoError(t, err)
+
+	t1 := t0.Add(time.Hour)
+	s.Now = fixedClock(t1)
+	require.NoError(t, s.Delete(tk.ID))
+
+	live, err := s.List()
+	require.NoError(t, err)
+	assert.Empty(t, live, "tombstoned tasks are hidden")
+
+	all, err := s.Snapshot()
+	require.NoError(t, err)
+	require.Len(t, all, 1, "the tombstone stays on record")
+	assert.True(t, all[0].Deleted.Equal(t1), "delete stamps Deleted with the clock")
+
+	_, err = s.FindByPrefix(tk.ID[:8])
+	assert.Error(t, err, "tombstoned tasks are not addressable")
+
+	raw, err := os.ReadFile(s.Path)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "doomed", "the tombstone persists on disk")
+}
+
+func TestSnapshotIncludesTombstones(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	base := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	s.Now = fixedClock(base)
+	live, err := s.Add("live")
+	require.NoError(t, err)
+	dead, err := s.Add("dead")
+	require.NoError(t, err)
+	require.NoError(t, s.Delete(dead.ID))
+
+	all, err := s.Snapshot()
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+	assert.Equal(t, live.ID, all[0].ID)
+	assert.Equal(t, dead.ID, all[1].ID)
+
+	got, err := s.List()
+	require.NoError(t, err)
+	assert.Equal(t, []Task{live}, got, "List hides the tombstone")
+}
+
+func TestReplaceAll(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	ts := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	tasks := []Task{
+		{ID: "aa111111-1111-1111-1111-111111111111", Text: "one", Status: "todo", Timestamp: ts, Updated: ts},
+		{ID: "bb222222-2222-2222-2222-222222222222", Text: "two", Status: "done", Timestamp: ts, Updated: ts, Deleted: ts.Add(time.Hour)},
+	}
+	require.NoError(t, s.ReplaceAll(tasks))
+
+	reloaded, err := Open(s.Path)
+	require.NoError(t, err)
+	all, err := reloaded.Snapshot()
+	require.NoError(t, err)
+	assert.Equal(t, tasks, all, "the full set survives a reload, tombstones included")
+
+	for _, bad := range []Task{
+		{ID: "x", Text: "y", Status: "bogus", Timestamp: ts},
+		{ID: "x", Text: "  ", Status: "todo", Timestamp: ts},
+		{Text: "y", Status: "todo", Timestamp: ts},
+	} {
+		assert.Error(t, s.ReplaceAll([]Task{bad}), "invalid record rejected: %+v", bad)
+	}
+
+	all, err = s.Snapshot()
+	require.NoError(t, err)
+	assert.Len(t, all, 2, "a rejected replace leaves the store untouched")
+}
+
+func TestModTimeFallsBackToTimestamp(t *testing.T) {
+	ts := time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)
+	pre := Task{ID: "x", Text: "y", Status: "todo", Timestamp: ts}
+	assert.True(t, pre.ModTime().Equal(ts), "pre-sync records fall back to Timestamp")
+	pre.Updated = ts.Add(time.Hour)
+	assert.True(t, pre.ModTime().Equal(ts.Add(time.Hour)), "Updated wins when set")
 }
 
 func TestAddWithStatus(t *testing.T) {
@@ -536,4 +682,68 @@ func TestConcurrentMutationsDoNotLoseUpdates(t *testing.T) {
 	tasks, err := s.List()
 	require.NoError(t, err)
 	assert.Len(t, tasks, count)
+}
+
+// --- the batch path carries the same sync semantics as the single-task one ---
+
+// `standup -p "drop that"` goes through ApplyBatch. If it dropped the line
+// instead of tombstoning, the delete would never reach another machine.
+func TestApplyBatchDeleteTombstones(t *testing.T) {
+	s := seedStore(t, "delete-id", "keep-id")
+	now := time.Date(2026, 8, 17, 11, 30, 0, 0, time.UTC)
+	s.Now = fixedClock(now)
+
+	changes, err := s.ApplyBatch([]BatchOperation{{Kind: OperationDelete, ID: "delete-id"}})
+	require.NoError(t, err)
+	require.Len(t, changes, 1)
+	assert.Nil(t, changes[0].After, "a delete still reports no After")
+
+	live, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, live, 1)
+	assert.Equal(t, "keep-id", live[0].ID)
+
+	all, err := s.Snapshot()
+	require.NoError(t, err)
+	require.Len(t, all, 2, "the record stays on file for sync")
+	for _, task := range all {
+		if task.ID == "delete-id" {
+			assert.True(t, task.Deleted.Equal(now), "tombstoned at the delete time")
+		}
+	}
+}
+
+func TestApplyBatchStampsUpdated(t *testing.T) {
+	s := seedStore(t, "edit-id", "status-id")
+	now := time.Date(2026, 8, 17, 11, 30, 0, 0, time.UTC)
+	s.Now = fixedClock(now)
+
+	changes, err := s.ApplyBatch([]BatchOperation{
+		{Kind: OperationCreate, Text: "new task"},
+		{Kind: OperationEdit, ID: "edit-id", Text: "edited task"},
+		{Kind: OperationStatus, ID: "status-id", Status: "done"},
+	})
+	require.NoError(t, err)
+	require.Len(t, changes, 3)
+	for i, change := range changes {
+		require.NotNil(t, change.After)
+		assert.True(t, change.After.Updated.Equal(now), "operation %d stamps Updated for last-writer-wins", i)
+	}
+}
+
+func TestApplyBatchTreatsTombstonedIDAsUnknown(t *testing.T) {
+	s := seedStore(t, "gone-id")
+	s.Now = fixedClock(time.Date(2026, 8, 17, 11, 30, 0, 0, time.UTC))
+	_, err := s.ApplyBatch([]BatchOperation{{Kind: OperationDelete, ID: "gone-id"}})
+	require.NoError(t, err)
+
+	_, err = s.ApplyBatch([]BatchOperation{{Kind: OperationEdit, ID: "gone-id", Text: "back from the dead"}})
+	assert.ErrorContains(t, err, "unknown id", "a deleted task is gone to the batch path too")
+}
+
+func TestDeleteTwiceReportsUnknown(t *testing.T) {
+	s := seedStore(t, "gone-id")
+	s.Now = fixedClock(time.Date(2026, 8, 17, 11, 30, 0, 0, time.UTC))
+	require.NoError(t, s.Delete("gone-id"))
+	assert.ErrorContains(t, s.Delete("gone-id"), "unknown id")
 }

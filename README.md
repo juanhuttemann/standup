@@ -16,7 +16,8 @@ AI-assisted standups from rough notes, tasks, and Git history.
 Write what you worked on in your own words. `standup` turns it into clean task
 entries, lets you manage them with one natural-language request, and rephrases
 the result into a consistent daily update. Task state, report structure, time
-windows, and writes stay deterministic.
+windows, and writes stay deterministic. Work on more than one machine?
+[Sync](#sync-across-machines) keeps them on one task list.
 
 ![demo](demo.gif)
 
@@ -148,6 +149,7 @@ standup generate --webhook <url>    # POST the report (Slack-compatible JSON)
 standup generate --mail <address>   # email the report (needs smtp_* in config.yaml)
 standup speak                       # print a spoken brief (no speech synthesis)
 standup speak -o standup.wav        # synthesize via a chat-completions audio-output model
+standup sync                        # merge tasks with your PocketBase server (see Sync)
 
 standup doctor                      # check the setup: data file, git identity, endpoint
 standup init                        # write default config files for editing
@@ -203,6 +205,51 @@ Obsidian export is one-way; the JSONL task store remains the source of truth.
 `{date}` resolves to `YYYY-MM-DD` in the configured timezone. For existing
 notes, standup replaces only the content between its managed
 `standup:start` and `standup:end` markers.
+
+## Sync across machines
+
+Work on a laptop and a desktop? `standup sync` keeps one task list on both.
+Point `sync.url` at a [PocketBase](https://pocketbase.io) server in
+`config.yaml` and put the superuser credentials in your environment or
+`.env` — they are never read from a config file:
+
+```sh
+PB_EMAIL=admin@example.com
+PB_PASSWORD=your-superuser-password
+```
+
+```sh
+standup sync    # merge local and remote, both directions
+```
+
+That is the whole setup. The first sync creates the collection
+(`sync.collection`, default `standup_tasks`) with superuser-only access, so
+there is nothing to configure in PocketBase by hand. Sync stays off until a
+url is set, and every other command keeps working without it.
+
+The four PocketBase settings share one prefix, so each has exactly one name:
+`PB_URL` and `PB_COLLECTION` override `sync.url` and `sync.collection` from
+the environment, and `PB_EMAIL`/`PB_PASSWORD` exist only there.
+
+What to expect:
+
+- **Both directions, one command.** Local tasks go up, remote tasks come
+  down, and re-running with nothing to do is a no-op.
+- **Edits win by recency.** The most recently changed copy of a task wins;
+  exact ties go to the server.
+- **Deletes travel.** `standup rm` on one machine removes the task
+  everywhere, instead of the other machines pushing it back.
+- **No duplicate commits.** The same commit imported on two machines
+  collapses to a single task.
+- **Safe to interrupt.** The merged result reaches your disk before
+  anything is uploaded, so a failed sync just retries on the next run.
+
+No model is involved: merging is deterministic, and `sync` never needs
+`OPENAI_*` credentials.
+
+Note that `PB_PASSWORD` is a PocketBase *superuser* password —
+whoever holds it controls that whole server. Point `sync.url` at a server
+you keep for standup rather than one hosting anything else.
 
 ## Use with AI agents
 

@@ -84,7 +84,7 @@ func unsetenv(t *testing.T, keys ...string) {
 func cleanStandupEnv(t *testing.T) {
 	t.Helper()
 	t.Cleanup(func() {
-		for _, k := range []string{"STANDUP_MEETING_TIME", "STANDUP_DATA_FILE", "STANDUP_OFFLINE", "STANDUP_LANGUAGE", "STANDUP_SMTP_PASSWORD"} {
+		for _, k := range []string{"STANDUP_MEETING_TIME", "STANDUP_DATA_FILE", "STANDUP_OFFLINE", "STANDUP_LANGUAGE", "STANDUP_SMTP_PASSWORD", "PB_URL", "PB_COLLECTION", "PB_EMAIL", "PB_PASSWORD"} {
 			if err := os.Unsetenv(k); err != nil {
 				t.Errorf("unset %s: %v", k, err)
 			}
@@ -162,6 +162,85 @@ func TestLoadObsidianSettings(t *testing.T) {
 	cfg, err = Load()
 	require.NoError(t, err)
 	assert.Equal(t, "/env/vault", cfg.ObsidianVault)
+}
+
+func TestLoadSyncSettings(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "sync:\n  url: \"https://pb.example.com\"\n  collection: \"my_tasks\"\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://pb.example.com", cfg.SyncURL)
+	assert.Equal(t, "my_tasks", cfg.SyncCollection)
+}
+
+// Sync credentials are deployment facts like OPENAI_*: PB_EMAIL/PB_PASSWORD
+// in the environment or a .env, never a config key. Deliberately outside the
+// STANDUP_ namespace so they cannot be mistaken for `sync:` yaml settings.
+func TestLoadSyncCredentials(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "sync:\n  url: \"https://pb.example.com\"\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	t.Setenv("PB_EMAIL", "admin@example.com")
+	t.Setenv("PB_PASSWORD", "s3cret")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "admin@example.com", cfg.SyncEmail)
+	assert.Equal(t, "s3cret", cfg.SyncPassword)
+}
+
+func TestLoadSyncCredentialsNeverFromYAML(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "sync:\n  url: \"https://pb.example.com\"\n  email: \"file@example.com\"\n  password: \"from-file\"\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.SyncEmail, "credentials are never read from a config file")
+	assert.Empty(t, cfg.SyncPassword)
+}
+
+func TestLoadSyncDefaults(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.SyncURL, "sync is disabled out of the box")
+	assert.Equal(t, "standup_tasks", cfg.SyncCollection)
+}
+
+// The whole PocketBase connection shares one prefix — PB_URL, PB_COLLECTION,
+// PB_EMAIL, PB_PASSWORD — so there is one name per fact, not two.
+func TestLoadSyncEnvOverridesYAML(t *testing.T) {
+	isolateDirs(t)
+	cleanStandupEnv(t)
+	dir := t.TempDir()
+	write(t, filepath.Join(dir, "config.yaml"), "sync:\n  url: \"https://yaml.example.com\"\n  collection: \"yaml_tasks\"\n")
+	write(t, filepath.Join(dir, "agent.yaml"), agentYAML)
+	t.Setenv("STANDUP_CONFIG_DIR", dir)
+	t.Setenv("PB_URL", "https://env.example.com")
+	t.Setenv("PB_COLLECTION", "env_tasks")
+
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "https://env.example.com", cfg.SyncURL, "PB_URL beats the yaml")
+	assert.Equal(t, "env_tasks", cfg.SyncCollection, "PB_COLLECTION beats the yaml")
 }
 
 func TestLoadDefaults(t *testing.T) {

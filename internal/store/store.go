@@ -21,6 +21,17 @@ type Task struct {
 	Author    string    `json:"author,omitempty"`
 	Branch    string    `json:"branch,omitempty"`
 	Timestamp time.Time `json:"timestamp"`
+	Updated   time.Time `json:"updated,omitzero"` // last modification; zero = pre-sync record
+	Deleted   time.Time `json:"deleted,omitzero"` // tombstone; zero = live
+}
+
+// ModTime is the last modification time; records from before the sync
+// schema (no Updated) fall back to their event timestamp.
+func (t Task) ModTime() time.Time {
+	if t.Updated.IsZero() {
+		return t.Timestamp
+	}
+	return t.Updated
 }
 
 type Store struct {
@@ -110,8 +121,8 @@ func validateTask(t Task) error {
 	if strings.TrimSpace(t.Text) == "" {
 		return errors.New("empty task text")
 	}
-	if !validStatus(t.Status) {
-		return errInvalidStatus(t.Status)
+	if !ValidStatus(t.Status) {
+		return errInValidStatus(t.Status)
 	}
 	if t.Timestamp.IsZero() {
 		return errors.New("zero task timestamp")
@@ -185,15 +196,15 @@ func (s *Store) AddAt(text, status string, ts time.Time) (Task, error) {
 	if status == "" {
 		status = "todo"
 	}
-	if !validStatus(status) {
-		return Task{}, errInvalidStatus(status)
+	if !ValidStatus(status) {
+		return Task{}, errInValidStatus(status)
 	}
 	if strings.TrimSpace(text) == "" {
 		return Task{}, errors.New("store: empty task text")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t := Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: ts}
+	t := Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: ts, Updated: s.now()}
 	tasks, err := s.load()
 	if err != nil {
 		return Task{}, err
@@ -202,7 +213,24 @@ func (s *Store) AddAt(text, status string, ts time.Time) (Task, error) {
 	return t, s.save(tasks)
 }
 
+// List returns live tasks (tombstones hidden), ordered by timestamp.
 func (s *Store) List() ([]Task, error) {
+	tasks, err := s.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Task, 0, len(tasks))
+	for _, t := range tasks {
+		if t.Deleted.IsZero() {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// Snapshot returns every record including tombstones: the sync input and
+// the commit-import dedupe set (deleted imports must not resurrect).
+func (s *Store) Snapshot() ([]Task, error) {
 	tasks, err := s.load()
 	if err != nil {
 		return nil, err
@@ -211,6 +239,20 @@ func (s *Store) List() ([]Task, error) {
 		tasks = []Task{}
 	}
 	return tasks, nil
+}
+
+// ReplaceAll validates and persists a full task set (a sync merge result);
+// a single invalid record rejects the whole replace, leaving the file
+// untouched.
+func (s *Store) ReplaceAll(tasks []Task) error {
+	for _, t := range tasks {
+		if err := validateTask(t); err != nil {
+			return fmt.Errorf("store: replace: %w", err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.save(tasks)
 }
 
 func (s *Store) ListDay(day time.Time) ([]Task, error) {
@@ -267,6 +309,7 @@ func (s *Store) UpdateText(id, text string) (Task, error) {
 	for i, t := range tasks {
 		if t.ID == id {
 			tasks[i].Text = text
+			tasks[i].Updated = s.now()
 			return tasks[i], s.save(tasks)
 		}
 	}
@@ -274,8 +317,8 @@ func (s *Store) UpdateText(id, text string) (Task, error) {
 }
 
 func (s *Store) SetStatus(id, status string) (Task, error) {
-	if !validStatus(status) {
-		return Task{}, errInvalidStatus(status)
+	if !ValidStatus(status) {
+		return Task{}, errInValidStatus(status)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -286,6 +329,7 @@ func (s *Store) SetStatus(id, status string) (Task, error) {
 	for i, t := range tasks {
 		if t.ID == id {
 			tasks[i].Status = status
+			tasks[i].Updated = s.now()
 			return tasks[i], s.save(tasks)
 		}
 	}
@@ -303,6 +347,7 @@ func (s *Store) SetAuthor(id, author string) (Task, error) {
 	for i, t := range tasks {
 		if t.ID == id {
 			tasks[i].Author = author
+			tasks[i].Updated = s.now()
 			return tasks[i], s.save(tasks)
 		}
 	}
@@ -320,6 +365,7 @@ func (s *Store) SetBranch(id, branch string) (Task, error) {
 	for i, t := range tasks {
 		if t.ID == id {
 			tasks[i].Branch = branch
+			tasks[i].Updated = s.now()
 			return tasks[i], s.save(tasks)
 		}
 	}
@@ -334,8 +380,9 @@ func (s *Store) Delete(id string) error {
 		return err
 	}
 	for i, t := range tasks {
-		if t.ID == id {
-			return s.save(append(tasks[:i:i], tasks[i+1:]...))
+		if t.ID == id && t.Deleted.IsZero() {
+			tasks[i].Deleted = s.now()
+			return s.save(tasks)
 		}
 	}
 	return fmt.Errorf("store: unknown id %q", id)
@@ -375,8 +422,8 @@ func (s *Store) applyOperation(tasks []Task, operation BatchOperation) ([]Task, 
 		if status == "" {
 			status = "todo"
 		}
-		if !validStatus(status) {
-			return tasks, Change{}, errInvalidStatus(status)
+		if !ValidStatus(status) {
+			return tasks, Change{}, errInValidStatus(status)
 		}
 		if strings.TrimSpace(operation.Text) == "" {
 			return tasks, Change{}, errors.New("empty task text")
@@ -385,7 +432,7 @@ func (s *Store) applyOperation(tasks []Task, operation BatchOperation) ([]Task, 
 		if ts.IsZero() {
 			ts = s.now()
 		}
-		task := Task{ID: uuid.NewString(), Text: operation.Text, Status: status, Timestamp: ts}
+		task := Task{ID: uuid.NewString(), Text: operation.Text, Status: status, Timestamp: ts, Updated: s.now()}
 		return append(tasks, task), Change{Kind: operation.Kind, After: taskPtr(task)}, nil
 	case OperationEdit, OperationStatus, OperationDelete:
 		index := taskIndex(tasks, operation.ID)
@@ -399,24 +446,31 @@ func (s *Store) applyOperation(tasks []Task, operation BatchOperation) ([]Task, 
 				return tasks, Change{}, errors.New("empty task text")
 			}
 			tasks[index].Text = operation.Text
+			tasks[index].Updated = s.now()
 			return tasks, Change{Kind: operation.Kind, Before: taskPtr(before), After: taskPtr(tasks[index])}, nil
 		case OperationStatus:
-			if !validStatus(operation.Status) {
-				return tasks, Change{}, errInvalidStatus(operation.Status)
+			if !ValidStatus(operation.Status) {
+				return tasks, Change{}, errInValidStatus(operation.Status)
 			}
 			tasks[index].Status = operation.Status
+			tasks[index].Updated = s.now()
 			return tasks, Change{Kind: operation.Kind, Before: taskPtr(before), After: taskPtr(tasks[index])}, nil
 		case OperationDelete:
-			tasks = append(tasks[:index:index], tasks[index+1:]...)
+			// Tombstone, never drop: a prompt-driven delete has to reach
+			// the other machines too. Change still reports no After, so
+			// callers keep seeing a deletion.
+			tasks[index].Deleted = s.now()
 			return tasks, Change{Kind: operation.Kind, Before: taskPtr(before)}, nil
 		}
 	}
 	return tasks, Change{}, fmt.Errorf("unknown operation kind %q", operation.Kind)
 }
 
+// taskIndex finds a live task; tombstones are invisible here exactly as
+// they are to List, so a deleted id reads as unknown.
 func taskIndex(tasks []Task, id string) int {
 	for i := range tasks {
-		if tasks[i].ID == id {
+		if tasks[i].ID == id && tasks[i].Deleted.IsZero() {
 			return i
 		}
 	}
@@ -449,11 +503,14 @@ func (s *Store) FindByPrefix(p string) (Task, error) {
 	}
 }
 
-func validStatus(s string) bool {
+// ValidStatus reports whether s is one of the four task statuses. Exported
+// so sync can reject a hand-edited remote record naming the remote, rather
+// than letting an anonymous store error surface at save time.
+func ValidStatus(s string) bool {
 	return s == "todo" || s == "in-progress" || s == "blocked" || s == "done"
 }
 
-func errInvalidStatus(s string) error {
+func errInValidStatus(s string) error {
 	return fmt.Errorf("store: invalid status %q (valid: todo, in-progress, blocked, done)", s)
 }
 
