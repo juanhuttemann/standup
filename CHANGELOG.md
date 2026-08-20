@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-19
+
 ### Added
 
 - `standup sync`: keeps one task list across machines by merging the local
@@ -28,10 +30,13 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ### Changed
 
-- `standup rm` now tombstones a task instead of dropping its line: the
-  record stays in the JSONL stamped with its deletion time so `sync` can
-  propagate the removal. `list` and reports hide tombstones, and
-  `standup commits` no longer re-imports a commit whose task was deleted.
+- Deletes now tombstone instead of dropping a line, on both write paths
+  (`rm` and the batch path behind `standup -p`): the record stays in the
+  JSONL stamped with its deletion time so `sync` can propagate the removal,
+  and every mutation on both paths stamps an update time for last-writer-
+  wins ordering. `list` and reports hide tombstones, a deleted id reads as
+  unknown, and `standup commits` no longer re-imports a commit whose task
+  was deleted.
 
 ## [0.14.0] - 2026-08-17
 
