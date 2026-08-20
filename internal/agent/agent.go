@@ -34,9 +34,18 @@ import (
 type Assistant interface {
 	AddTasks(ctx context.Context, rawText string) ([]store.Task, error)
 	Plan(ctx context.Context, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error)
-	Generate(ctx context.Context, sec report.Section) (string, error)
+	Generate(ctx context.Context, sec report.Section) (Generated, error)
 	Script(ctx context.Context, report string) (string, error)
 	Synthesize(ctx context.Context, script string) ([]byte, error)
+}
+
+// Generated is a rendered report plus the reason its entries were not
+// rephrased. Fallback is empty when the model's text was used; the layout is
+// deterministic either way, but a silent fallback let users ship a raw commit
+// dump believing the model wrote it.
+type Generated struct {
+	Text     string
+	Fallback string
 }
 
 type runFunc func(ctx context.Context, prompt string) (string, error)
@@ -111,12 +120,12 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	if timeout <= 0 {
 		timeout = modelTimeout
 	}
-	newAgent, textHint := newAgentFactory(provider, timeout)
+	newAgent, envPrefix := newAgentFactory(provider, timeout)
 	newRun := func(a *agent.Agent) runFunc {
 		return func(ctx context.Context, prompt string) (string, error) {
 			out, err := a.RunText(ctx, prompt).Collect()
 			if err != nil {
-				return "", fmt.Errorf("endpoint call failed — check %s and network: %w", textHint, err)
+				return "", callError(err, envPrefix)
 			}
 			return out.String(), nil
 		}
@@ -127,7 +136,7 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 			seen := make(map[string]bool)
 			for update, runErr := range a.RunText(ctx, prompt) {
 				if runErr != nil {
-					return "", fmt.Errorf("endpoint call failed — check %s and network: %w", textHint, runErr)
+					return "", callError(runErr, envPrefix)
 				}
 				if progress != nil {
 					reportToolCalls(update, seen, progress)
@@ -163,6 +172,70 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 	}, nil
 }
 
+// Check proves the configured provider actually works: it makes the smallest
+// real model call and classifies the failure. Presence of the variables and a
+// reachable host say nothing about a dead key or a model that does not exist,
+// and a false green from `doctor` is worse than no doctor at all.
+func Check(ctx context.Context, cfg config.Config) error {
+	provider := cfg.Provider
+	if provider == "" {
+		provider = "openai"
+	}
+	required, err := config.ProviderEnv(provider)
+	if err != nil {
+		return err
+	}
+	for _, key := range required {
+		if os.Getenv(key) == "" {
+			return fmt.Errorf("%s is not set", key)
+		}
+	}
+	timeout := cfg.ModelCallTimeout
+	if timeout <= 0 {
+		timeout = modelTimeout
+	}
+	newAgent, envPrefix := newAgentFactory(provider, timeout)
+	probe := newAgent("doctor", "Answers a liveness probe.", cfg.DoctorInstructions, nil)
+	out, err := probe.RunText(ctx, "ping").Collect()
+	if err != nil {
+		return callError(err, envPrefix)
+	}
+	if strings.TrimSpace(out.String()) == "" {
+		return fmt.Errorf("%s answered with no text; check %s_MODEL", envPrefix, envPrefix)
+	}
+	return nil
+}
+
+// callError names the setting a failed model call actually points at. The
+// HTTP status already distinguishes a rejected key from a rejected model, so
+// blaming the base URL for both sends users to the one thing that works.
+func callError(err error, envPrefix string) error {
+	switch statusOf(err) {
+	case http.StatusUnauthorized, http.StatusForbidden:
+		return fmt.Errorf("endpoint rejected the credentials — check %s_API_KEY: %w", envPrefix, err)
+	case http.StatusNotFound, http.StatusBadRequest:
+		return fmt.Errorf("endpoint rejected the request — check %s_MODEL: %w", envPrefix, err)
+	case http.StatusTooManyRequests:
+		return fmt.Errorf("endpoint rate-limited the call — retry later: %w", err)
+	default:
+		return fmt.Errorf("endpoint call failed — check %s_BASE_URL and network: %w", envPrefix, err)
+	}
+}
+
+// statusOf reports the HTTP status an SDK error carries, or 0 when the call
+// never reached an answer (DNS, connection refused, timeout).
+func statusOf(err error) int {
+	var openAIErr *openai.Error
+	if errors.As(err, &openAIErr) {
+		return openAIErr.StatusCode
+	}
+	var anthropicErr *anthropic.Error
+	if errors.As(err, &anthropicErr) {
+		return anthropicErr.StatusCode
+	}
+	return 0
+}
+
 func newAgentFactory(provider string, timeout time.Duration) (agentFactory, string) {
 	httpClient := &http.Client{Timeout: timeout}
 	if provider == "anthropic" {
@@ -178,7 +251,7 @@ func newAgentFactory(provider string, timeout time.Duration) (agentFactory, stri
 				Instructions: instructions,
 				Config:       agent.Config{Name: name, Description: description, Tools: tools},
 			})
-		}, "ANTHROPIC_BASE_URL"
+		}, "ANTHROPIC"
 	}
 	client := openai.NewClient(
 		option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
@@ -190,7 +263,7 @@ func newAgentFactory(provider string, timeout time.Duration) (agentFactory, stri
 			Instructions: instructions,
 			Config:       agent.Config{Name: name, Description: description, Tools: tools},
 		})
-	}, "OPENAI_BASE_URL"
+	}, "OPENAI"
 }
 
 func reportToolCalls(update *agent.ResponseUpdate, seen map[string]bool, progress func(string)) {
@@ -377,12 +450,23 @@ func Local(cfg config.Config, st *store.Store) (Assistant, error) {
 }
 
 // tplFuncs are the funcs available to the generate templates. fold collapses
-// a task text to one row: multi-line entries (commit bodies) must not break
-// the bullet layout.
-var tplFuncs = template.FuncMap{"fold": foldText}
+// a task text to one row and subject keeps its first line only: an imported
+// commit stores the whole message, and a 1700-character body rendered as one
+// bullet is not a report entry.
+var tplFuncs = template.FuncMap{"fold": foldText, "subject": subjectText}
 
 func foldText(s string) string {
 	return strings.Join(strings.Fields(s), " ")
+}
+
+// subjectText is the task's first non-empty line, collapsed to one row.
+func subjectText(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if folded := foldText(line); folded != "" {
+			return folded
+		}
+	}
+	return ""
 }
 
 func parseTemplates(cfg config.Config) (genTpl, daysTpl *template.Template, err error) {
@@ -406,6 +490,14 @@ func (a *impl) AddTasks(ctx context.Context, rawText string) ([]store.Task, erro
 	if err != nil {
 		return nil, err
 	}
+	// The note is the only source of tags, for every task it produced: the
+	// editor minted "#1" out of "numbr 1 lol", and a stored tag the user
+	// never wrote is worse than a rephrased one — `list --tag` finds it.
+	sources := make([]string, len(parsed))
+	for i := range sources {
+		sources[i] = rawText
+	}
+	dropInventedTags(sources, parsed)
 	preserveTags(rawText, parsed)
 	return persist(a.st, parsed)
 }
@@ -484,23 +576,28 @@ func relativeDate(task, now time.Time) string {
 // Generate renders the report deterministically in Go; online mode first
 // rephrases the task texts through the reporter (formatting never depends on
 // the model). Any rephrase failure falls back to the original texts.
-func (a *impl) Generate(ctx context.Context, sec report.Section) (string, error) {
+func (a *impl) Generate(ctx context.Context, sec report.Section) (Generated, error) {
 	texts := taskTexts(sec)
+	fallback := ""
 	if len(texts) > 0 {
-		if repl, ok := a.rephrase(ctx, texts); ok {
+		repl, reason := a.rephrase(ctx, texts)
+		if reason == "" {
 			applyTexts(&sec, repl)
 		}
+		fallback = reason
 	}
 	var b strings.Builder
 	if err := tplFor(sec, a.genTpl, a.daysTpl).Execute(&b, sec); err != nil {
-		return "", fmt.Errorf("agent: generate template: %w", err)
+		return Generated{}, fmt.Errorf("agent: generate template: %w", err)
 	}
-	return b.String(), nil
+	return Generated{Text: b.String(), Fallback: fallback}, nil
 }
 
 // rephrase exchanges the task texts for rewritten ones, one per input, via
-// the reporter agent's JSON contract.
-func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, bool) {
+// the reporter agent's JSON contract. The second result names why the
+// rewrite was refused, empty when it was accepted: the fallback fires
+// precisely when the input is large and messy, so it has to be visible.
+func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, string) {
 	var prompt strings.Builder
 	if a.lang != "" {
 		fmt.Fprintf(&prompt, "Write the entries in %s.\n", a.lang)
@@ -511,18 +608,67 @@ func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, bool) {
 	}
 	out, err := a.reporter(ctx, prompt.String())
 	if err != nil {
-		return nil, false
+		return nil, fmt.Sprintf("the model call failed (%v)", err)
 	}
 	repl, err := extractStrings(out)
-	if err != nil || len(repl) != len(texts) {
-		return nil, false
+	if err != nil {
+		return nil, "the model answered off-contract (no JSON entries in the reply)"
+	}
+	if len(repl) != len(texts) {
+		return nil, fmt.Sprintf("the model answered off-contract (%d entries for %d tasks)", len(repl), len(texts))
 	}
 	for _, r := range repl {
 		if strings.TrimSpace(r) == "" {
-			return nil, false
+			return nil, "the model answered off-contract (an entry came back empty)"
 		}
 	}
-	return repl, true
+	dropInventedTags(texts, repl)
+	for i := range repl {
+		repl[i] = stripListMarker(repl[i])
+	}
+	return repl, ""
+}
+
+// dropInventedTags demotes #tokens the rephraser minted: #word is this app's
+// own tag syntax (`list --tag`), so an invented one shows a tag the task does
+// not carry. The word stays, only the # goes.
+func dropInventedTags(source, rewritten []string) {
+	for i := range rewritten {
+		had := map[string]bool{}
+		for _, field := range strings.Fields(source[i]) {
+			if tag, ok := tagToken(field); ok {
+				had[tag] = true
+			}
+		}
+		fields := strings.Fields(rewritten[i])
+		for j, field := range fields {
+			if tag, ok := tagToken(field); ok && !had[tag] {
+				fields[j] = strings.TrimPrefix(field, "#")
+			}
+		}
+		rewritten[i] = strings.Join(fields, " ")
+	}
+}
+
+// stripListMarker removes a bullet the reporter echoed from its input. Go
+// renders the bullets; an entry that carries its own turns into "- [done] -
+// fixed the bug" and travels on into the spoken brief.
+func stripListMarker(s string) string {
+	trimmed := strings.TrimLeft(s, " \t")
+	for _, marker := range []string{"- ", "* ", "• "} {
+		if strings.HasPrefix(trimmed, marker) {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, marker))
+		}
+	}
+	return s
+}
+
+// tagToken reports the lowercased tag a field carries, if any.
+func tagToken(field string) (string, bool) {
+	if !strings.HasPrefix(field, "#") || len(field) == 1 {
+		return "", false
+	}
+	return strings.ToLower(strings.Trim(field, "#.,;:!?")), true
 }
 
 // Script rewrites the rendered report as a spoken brief via the speaker
@@ -554,6 +700,9 @@ func scriptGrounded(report, script string) bool {
 			return false
 		}
 	}
+	if !daysGrounded(report, lowerScript) {
+		return false
+	}
 	bullets := 0
 	for _, line := range strings.Split(report, "\n") {
 		if !strings.HasPrefix(line, "- ") {
@@ -575,6 +724,43 @@ func scriptGrounded(report, script string) bool {
 	return bullets > 0 && sentenceCount(script) == bullets
 }
 
+// dayWords are the time anchors a brief may use. The day split is decided in Go and
+// carried in the report's headings, so a brief may only name a day the report
+// names: a run said work happened "yesterday" that happened today — a factual
+// error about the user's own work, spoken aloud in a meeting.
+var dayWords = []string{
+	"today", "yesterday", "tomorrow",
+	"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+}
+
+func daysGrounded(report, lowerScript string) bool {
+	var headings strings.Builder
+	for _, line := range strings.Split(report, "\n") {
+		if strings.HasPrefix(line, "## ") {
+			headings.WriteString(strings.ToLower(line) + " ")
+		}
+	}
+	known := headings.String()
+	for _, day := range dayWords {
+		// Headings abbreviate weekdays ("Mon 2026-08-10"), so three letters
+		// are the common ground between a heading and a spoken day.
+		if containsWord(lowerScript, day) && !strings.Contains(known, day[:3]) {
+			return false
+		}
+	}
+	return true
+}
+
+// containsWord reports whether lowered contains word as a whole word.
+func containsWord(lowered, word string) bool {
+	for _, field := range strings.FieldsFunc(lowered, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) }) {
+		if field == word {
+			return true
+		}
+	}
+	return false
+}
+
 func sentenceCount(script string) int {
 	count := 0
 	inSentence := false
@@ -593,13 +779,18 @@ func sentenceCount(script string) int {
 	return count
 }
 
+// spokenFallback derives a faithful brief from the rendered report when the
+// speaker cannot be trusted with it. Each section is anchored once — repeating
+// "Today:" before every item reads like a template, not a person.
 func spokenFallback(report string) string {
 	var heading string
+	anchored := false
 	var sentences []string
 	for _, line := range strings.Split(report, "\n") {
 		switch {
 		case strings.HasPrefix(line, "## "):
 			heading = strings.TrimSpace(strings.TrimPrefix(line, "## "))
+			anchored = false
 		case strings.HasPrefix(line, "- "):
 			text := strings.TrimSpace(strings.TrimPrefix(line, "- "))
 			if strings.HasPrefix(text, "[") {
@@ -610,20 +801,36 @@ func spokenFallback(report string) string {
 			if open := strings.LastIndex(text, " ("); open >= 0 && strings.HasSuffix(text, ")") {
 				text = text[:open]
 			}
-			if heading != "" && text != "" {
-				sentences = append(sentences, heading+": "+text+".")
+			if heading == "" || text == "" {
+				continue
 			}
+			if anchored {
+				sentences = append(sentences, sentence("Also, "+text))
+				continue
+			}
+			sentences = append(sentences, sentence(heading+": "+text))
+			anchored = true
 		}
 	}
 	return strings.Join(sentences, " ")
 }
 
-func preserveTags(raw string, parsed []extracted) {
+// sentence ends a spoken line once: a task text that already ends in
+// punctuation must not gain a second period.
+func sentence(text string) string {
+	if strings.HasSuffix(text, ".") || strings.HasSuffix(text, "!") || strings.HasSuffix(text, "?") {
+		return text
+	}
+	return text + "."
+}
+
+// preserveTags restores #tags the editor dropped from a single-task rewrite.
+func preserveTags(raw string, parsed []string) {
 	if len(parsed) != 1 {
 		return
 	}
 	existing := make(map[string]bool)
-	for _, field := range strings.Fields(parsed[0].text) {
+	for _, field := range strings.Fields(parsed[0]) {
 		if strings.HasPrefix(field, "#") {
 			existing[strings.ToLower(field)] = true
 		}
@@ -632,7 +839,7 @@ func preserveTags(raw string, parsed []extracted) {
 		if !strings.HasPrefix(field, "#") || len(field) == 1 || existing[strings.ToLower(field)] {
 			continue
 		}
-		parsed[0].text += " " + field
+		parsed[0] += " " + field
 		existing[strings.ToLower(field)] = true
 	}
 }
@@ -655,23 +862,22 @@ func (l *local) Synthesize(context.Context, string) ([]byte, error) {
 }
 
 func (l *local) AddTasks(_ context.Context, rawText string) ([]store.Task, error) {
-	var parsed []extracted
-	for _, p := range splitParagraphs(rawText) {
-		parsed = append(parsed, extracted{text: p})
-	}
-	return persist(l.st, parsed)
+	return persist(l.st, splitParagraphs(rawText))
 }
 
 func (l *local) Plan(context.Context, string, []store.Task, time.Time) ([]store.BatchOperation, error) {
 	return nil, errors.New("agent: prompt requires a model endpoint (offline mode)")
 }
 
-func (l *local) Generate(_ context.Context, sec report.Section) (string, error) {
+// Generate renders the deterministic layout. Offline is not a fallback: no
+// model was ever going to phrase these entries, so there is nothing to warn
+// about.
+func (l *local) Generate(_ context.Context, sec report.Section) (Generated, error) {
 	var b strings.Builder
 	if err := tplFor(sec, l.genTpl, l.daysTpl).Execute(&b, sec); err != nil {
-		return "", fmt.Errorf("agent: generate template: %w", err)
+		return Generated{}, fmt.Errorf("agent: generate template: %w", err)
 	}
-	return b.String(), nil
+	return Generated{Text: b.String()}, nil
 }
 
 // tplFor picks the two-section template for the default window and the
@@ -685,16 +891,18 @@ func tplFor(sec report.Section, genTpl, daysTpl *template.Template) *template.Te
 }
 
 // taskTexts flattens the section's tasks in render order: days first, then
-// blockers.
+// blockers. Only the subject lines travel — the reporter rephrases what the
+// report actually shows, and a store full of commit bodies no longer buries
+// the contract in tens of kilobytes of input.
 func taskTexts(sec report.Section) []string {
 	var out []string
 	for _, d := range sec.Days {
 		for _, t := range d.Tasks {
-			out = append(out, t.Text)
+			out = append(out, subjectText(t.Text))
 		}
 	}
 	for _, t := range sec.Blockers {
-		out = append(out, t.Text)
+		out = append(out, subjectText(t.Text))
 	}
 	return out
 }
@@ -747,6 +955,9 @@ func extractStrings(s string) ([]string, error) {
 // validation remains authoritative for IDs, statuses, and empty text.
 var errInvalidOperationPlan = errors.New("agent: planner returned an invalid operation plan; try a simpler prompt")
 
+// messageBudget bounds model text quoted back to the user.
+const messageBudget = 160
+
 func safeDiagnostic(s string) string {
 	clean := strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
@@ -754,15 +965,26 @@ func safeDiagnostic(s string) string {
 		}
 		return r
 	}, s)
-	clean = strings.Join(strings.Fields(clean), " ")
-	runes := []rune(clean)
-	if len(runes) > 160 {
-		clean = string(runes[:160]) + "…"
-	}
+	clean = clipWords(strings.Join(strings.Fields(clean), " "), messageBudget)
 	if clean == "" {
 		return "empty"
 	}
 	return clean
+}
+
+// clipWords shortens a message at a word boundary. Cutting mid-word ("the
+// existing tasks are about login redirect, deployment, in…") removes exactly
+// the part that was about to tell the user what they could have matched.
+func clipWords(s string, budget int) string {
+	runes := []rune(s)
+	if len(runes) <= budget {
+		return s
+	}
+	clipped := string(runes[:budget])
+	if i := strings.LastIndex(clipped, " "); i > 0 {
+		clipped = clipped[:i]
+	}
+	return clipped + "…"
 }
 
 func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) {
@@ -811,16 +1033,11 @@ func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) 
 }
 
 func noApplicableChanges(message string) error {
-	const maxRunes = 160
 	reason := strings.Join(strings.Fields(message), " ")
 	if reason == "" {
 		reason = "a requested task may be missing or ambiguous"
 	}
-	runes := []rune(reason)
-	if len(runes) > maxRunes {
-		reason = string(runes[:maxRunes]) + "…"
-	}
-	return fmt.Errorf("agent: no applicable changes: %s", reason)
+	return fmt.Errorf("agent: no applicable changes: %s", clipWords(reason, messageBudget))
 }
 
 func operationTime(when string, now time.Time) (time.Time, error) {
@@ -837,10 +1054,12 @@ func operationTime(when string, now time.Time) (time.Time, error) {
 	return time.Date(date.Year(), date.Month(), date.Day(), now.Hour(), now.Minute(), now.Second(), now.Nanosecond(), now.Location()), nil
 }
 
-func persist(st *store.Store, parsed []extracted) ([]store.Task, error) {
-	operations := make([]store.BatchOperation, 0, len(parsed))
-	for _, p := range parsed {
-		operations = append(operations, store.BatchOperation{Kind: store.OperationCreate, Text: p.text, Status: p.status})
+// persist writes the cleaned texts as new tasks. The status is derived from
+// each text in Go: the model reads and phrases, it never decides a status.
+func persist(st *store.Store, texts []string) ([]store.Task, error) {
+	operations := make([]store.BatchOperation, 0, len(texts))
+	for _, text := range texts {
+		operations = append(operations, store.BatchOperation{Kind: store.OperationCreate, Text: text, Status: store.InferStatus(text)})
 	}
 	changes, err := st.ApplyBatch(operations)
 	if err != nil {
@@ -853,14 +1072,10 @@ func persist(st *store.Store, parsed []extracted) ([]store.Task, error) {
 	return added, nil
 }
 
-type extracted struct {
-	text   string
-	status string
-}
-
-// extractTasks finds the editor's JSON reply. Entries may be plain strings
-// or {"task": "...", "status": "..."} objects; missing status means todo.
-func extractTasks(s string) ([]extracted, error) {
+// extractTasks finds the editor's JSON reply and returns the task texts.
+// Entries may be plain strings or {"task": "..."} objects; any status the
+// model volunteers is ignored — Go derives it from the text.
+func extractTasks(s string) ([]string, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '{' {
 			continue
@@ -869,27 +1084,26 @@ func extractTasks(s string) ([]extracted, error) {
 			Tasks []json.RawMessage `json:"tasks"`
 		}
 		if err := json.NewDecoder(strings.NewReader(s[i:])).Decode(&v); err == nil && len(v.Tasks) > 0 {
-			var out []extracted
+			var out []string
 			ok := true
 			for _, raw := range v.Tasks {
-				var e extracted
+				var text string
 				if len(raw) > 0 && raw[0] == '"' {
-					if err := json.Unmarshal(raw, &e.text); err != nil {
+					if err := json.Unmarshal(raw, &text); err != nil {
 						ok = false
 						break
 					}
 				} else {
 					var o struct {
-						Task   string `json:"task"`
-						Status string `json:"status"`
+						Task string `json:"task"`
 					}
 					if err := json.Unmarshal(raw, &o); err != nil || strings.TrimSpace(o.Task) == "" {
 						ok = false
 						break
 					}
-					e.text, e.status = o.Task, o.Status
+					text = o.Task
 				}
-				out = append(out, e)
+				out = append(out, text)
 			}
 			if ok {
 				return out, nil

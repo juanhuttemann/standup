@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gofrs/flock"
 	"github.com/google/uuid"
 )
 
@@ -81,6 +83,44 @@ func (s *Store) now() time.Time {
 		return s.Now()
 	}
 	return time.Now()
+}
+
+// lockTimeout bounds the wait for another process's store lock: past it the
+// holder is stuck and a named error beats an indefinite hang.
+var lockTimeout = 10 * time.Second
+
+// lockRetry is the poll interval while waiting for the lock.
+const lockRetry = 20 * time.Millisecond
+
+// withLock runs fn as the store file's only writer. Every mutation is a
+// read-modify-write of the whole JSONL, so overlapping invocations (an agent
+// firing `commits` and `add`, a CI job, a shell loop) would otherwise clobber
+// each other and report success. The mutex covers goroutines; the file lock
+// covers processes. Reads need neither: save publishes by atomic rename.
+func (s *Store) withLock(fn func() error) (err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o755); err != nil {
+		return err
+	}
+	// A lock file beside the store, never the store itself: save replaces the
+	// store by rename, so a lock held on it would guard a discarded inode.
+	lock := flock.New(s.Path + ".lock")
+	ctx, cancel := context.WithTimeout(context.Background(), lockTimeout)
+	defer cancel()
+	locked, lockErr := lock.TryLockContext(ctx, lockRetry)
+	switch {
+	case errors.Is(lockErr, context.DeadlineExceeded), lockErr == nil && !locked:
+		return fmt.Errorf("store: timed out after %s waiting for another standup process to write %s", lockTimeout, s.Path)
+	case lockErr != nil:
+		return fmt.Errorf("store: lock %s: %w", lock.Path(), lockErr)
+	}
+	defer func() {
+		if unlockErr := lock.Unlock(); unlockErr != nil {
+			err = errors.Join(err, fmt.Errorf("store: unlock %s: %w", lock.Path(), unlockErr))
+		}
+	}()
+	return fn()
 }
 
 func (s *Store) load() ([]Task, error) {
@@ -202,15 +242,19 @@ func (s *Store) AddAt(text, status string, ts time.Time) (Task, error) {
 	if strings.TrimSpace(text) == "" {
 		return Task{}, errors.New("store: empty task text")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t := Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: ts, Updated: s.now()}
-	tasks, err := s.load()
+	var t Task
+	err := s.withLock(func() error {
+		t = Task{ID: uuid.NewString(), Text: text, Status: status, Timestamp: ts, Updated: s.now()}
+		tasks, err := s.load()
+		if err != nil {
+			return err
+		}
+		return s.save(append(tasks, t))
+	})
 	if err != nil {
 		return Task{}, err
 	}
-	tasks = append(tasks, t)
-	return t, s.save(tasks)
+	return t, nil
 }
 
 // List returns live tasks (tombstones hidden), ordered by timestamp.
@@ -250,9 +294,7 @@ func (s *Store) ReplaceAll(tasks []Task) error {
 			return fmt.Errorf("store: replace: %w", err)
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.save(tasks)
+	return s.withLock(func() error { return s.save(tasks) })
 }
 
 func (s *Store) ListDay(day time.Time) ([]Task, error) {
@@ -300,92 +342,53 @@ func (s *Store) UpdateText(id, text string) (Task, error) {
 	if strings.TrimSpace(text) == "" {
 		return Task{}, errors.New("store: empty task text")
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tasks, err := s.load()
-	if err != nil {
-		return Task{}, err
-	}
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].Text = text
-			tasks[i].Updated = s.now()
-			return tasks[i], s.save(tasks)
-		}
-	}
-	return Task{}, fmt.Errorf("store: unknown id %q", id)
+	return s.mutate(id, func(t *Task) { t.Text = text })
 }
 
 func (s *Store) SetStatus(id, status string) (Task, error) {
 	if !ValidStatus(status) {
 		return Task{}, errInValidStatus(status)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tasks, err := s.load()
-	if err != nil {
-		return Task{}, err
-	}
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].Status = status
-			tasks[i].Updated = s.now()
-			return tasks[i], s.save(tasks)
-		}
-	}
-	return Task{}, fmt.Errorf("store: unknown id %q", id)
+	return s.mutate(id, func(t *Task) { t.Status = status })
 }
 
 // SetAuthor records which commit author a task came from (team reports).
 func (s *Store) SetAuthor(id, author string) (Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tasks, err := s.load()
-	if err != nil {
-		return Task{}, err
-	}
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].Author = author
-			tasks[i].Updated = s.now()
-			return tasks[i], s.save(tasks)
-		}
-	}
-	return Task{}, fmt.Errorf("store: unknown id %q", id)
+	return s.mutate(id, func(t *Task) { t.Author = author })
 }
 
 // SetBranch records the branch a task's commit was made on.
 func (s *Store) SetBranch(id, branch string) (Task, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tasks, err := s.load()
-	if err != nil {
-		return Task{}, err
-	}
-	for i, t := range tasks {
-		if t.ID == id {
-			tasks[i].Branch = branch
-			tasks[i].Updated = s.now()
-			return tasks[i], s.save(tasks)
-		}
-	}
-	return Task{}, fmt.Errorf("store: unknown id %q", id)
+	return s.mutate(id, func(t *Task) { t.Branch = branch })
 }
 
 func (s *Store) Delete(id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tasks, err := s.load()
-	if err != nil {
-		return err
-	}
-	for i, t := range tasks {
-		if t.ID == id && t.Deleted.IsZero() {
-			tasks[i].Deleted = s.now()
-			return s.save(tasks)
+	_, err := s.mutate(id, func(t *Task) { t.Deleted = s.now() })
+	return err
+}
+
+// mutate applies apply to the live task with id and persists the result under
+// the store lock; every single-field setter shares this read-modify-write.
+func (s *Store) mutate(id string, apply func(*Task)) (Task, error) {
+	var out Task
+	err := s.withLock(func() error {
+		tasks, err := s.load()
+		if err != nil {
+			return err
 		}
+		index := taskIndex(tasks, id)
+		if index < 0 {
+			return fmt.Errorf("store: unknown id %q", id)
+		}
+		apply(&tasks[index])
+		tasks[index].Updated = s.now()
+		out = tasks[index]
+		return s.save(tasks)
+	})
+	if err != nil {
+		return Task{}, err
 	}
-	return fmt.Errorf("store: unknown id %q", id)
+	return out, nil
 }
 
 // ApplyBatch validates and applies operations in order, then persists them in
@@ -394,22 +397,24 @@ func (s *Store) ApplyBatch(operations []BatchOperation) ([]Change, error) {
 	if len(operations) == 0 {
 		return []Change{}, nil
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	tasks, err := s.load()
-	if err != nil {
-		return nil, err
-	}
-	changes := make([]Change, 0, len(operations))
-	for i, operation := range operations {
-		var change Change
-		tasks, change, err = s.applyOperation(tasks, operation)
+	var changes []Change
+	err := s.withLock(func() error {
+		tasks, err := s.load()
 		if err != nil {
-			return nil, fmt.Errorf("store: batch operation %d: %w", i+1, err)
+			return err
 		}
-		changes = append(changes, change)
-	}
-	if err := s.save(tasks); err != nil {
+		changes = make([]Change, 0, len(operations))
+		for i, operation := range operations {
+			var change Change
+			tasks, change, err = s.applyOperation(tasks, operation)
+			if err != nil {
+				return fmt.Errorf("store: batch operation %d: %w", i+1, err)
+			}
+			changes = append(changes, change)
+		}
+		return s.save(tasks)
+	})
+	if err != nil {
 		return nil, err
 	}
 	return changes, nil

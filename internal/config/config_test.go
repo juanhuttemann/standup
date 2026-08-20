@@ -702,3 +702,47 @@ func TestEnsureConfigCreatesEditableFile(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, defaults.ConfigYAML, string(b))
 }
+
+// init wrote to the home directory even with $STANDUP_CONFIG_DIR set, so the
+// files it created were in a directory nothing would ever read and the
+// follow-up `config edit` opened a different file.
+func TestInitHonorsConfigDirEnv(t *testing.T) {
+	xdg := isolateDirs(t)
+	sandbox := t.TempDir()
+	t.Setenv("STANDUP_CONFIG_DIR", sandbox)
+
+	dir, err := Init()
+	require.NoError(t, err)
+	assert.Equal(t, sandbox, dir)
+	for _, name := range []string{"config.yaml", "agent.yaml"} {
+		assert.FileExists(t, filepath.Join(sandbox, name))
+		assert.NoFileExists(t, filepath.Join(xdg, "standup", name))
+	}
+	path, err := EnsureConfig()
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(sandbox, "config.yaml"), path,
+		"config edit opens the file init just wrote")
+}
+
+func TestSetRejectsValuesThatBreakEveryCommand(t *testing.T) {
+	isolateDirs(t)
+	for _, tt := range []struct{ key, value, want string }{
+		{"timezone", "Mars/Phobos", "IANA"},
+		{"meeting_time", "99:99", "HH:MM"},
+		{"meeting_time", "half past nine", "HH:MM"},
+	} {
+		t.Run(tt.key+"="+tt.value, func(t *testing.T) {
+			_, err := Set(tt.key, tt.value)
+			require.Error(t, err, "a value that breaks list and generate is refused at set time")
+			assert.Contains(t, err.Error(), tt.want)
+		})
+	}
+	for _, tt := range []struct{ key, value string }{
+		{"timezone", "America/Asuncion"},
+		{"timezone", ""},
+		{"meeting_time", "09:30"},
+	} {
+		_, err := Set(tt.key, tt.value)
+		assert.NoError(t, err, "valid values still apply")
+	}
+}

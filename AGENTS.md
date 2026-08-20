@@ -31,6 +31,16 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Models read; Go writes. A model never mutates the store: extracted editor output is
   persisted deterministically in Go (a model-driven tool loop was observed to execute
   the same write repeatedly). Store mutations happen in `store`/`cli` only.
+- Models never judge state. The editor returns texts only; `store.InferStatus`
+  derives the status from the task's own text (a model asked to judge invented
+  `blocked` for routine work, and an invented blocker reaches the team). Model
+  output is checked before use everywhere it can be: entry counts, invented
+  `#tags`, and day words absent from the report all fall back to deterministic
+  text, and the fallback is reported rather than silent.
+- Destructive plans are previewed, never assumed: `-p` prints the deletions and
+  asks (or refuses with `--yes` when nothing can be asked), because that is the
+  path where a model decides the blast radius. A whole `-p` run is bounded by
+  `promptCalls * model_call_timeout`.
 - Natural-language CRUD uses Agent Framework agents-as-tools: one coordinator delegates
   to create, update, and delete specialists. They return a typed operation plan; Go
   validates and applies the complete batch atomically, then formats the committed changes.
@@ -90,6 +100,20 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   accept only the expected binary archive, validate the candidate's `--version`,
   and replace from the executable's directory so failures leave the old binary.
 
+### Concurrency
+- The JSONL store is rewritten whole on every mutation, so every writer takes an
+  exclusive lock on `<data_file>.lock` (gofrs/flock) around load-modify-save.
+  Reads take nothing: `save` publishes by atomic rename. Never call a locking
+  store method from inside `withLock` — the mutex is not reentrant.
+
+### Diagnostics
+- `doctor` proves, never assumes: presence and reachability are checks, but the
+  last one is a real model call. Failed model calls name the setting the HTTP
+  status implicates (`*_API_KEY` for 401/403, `*_MODEL` for 400/404), never the
+  base URL by default.
+- User-facing errors carry no internal package prefixes; `lazy`/`runRoot` strip
+  them at the CLI boundary.
+
 ### TDD loop
 - Write the failing test first (testify). Tests use `t.TempDir()` and fake `Assistant` impls.
 - Pure packages (`store`, `report`, `config`) are tested without any network.
@@ -146,6 +170,7 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   `RELEASING.md`.
 
 ### Statuses
-- `todo` | `in-progress` | `blocked` | `done` — validated at the store boundary.
+- `todo` | `in-progress` | `blocked` | `done` — validated at the store boundary,
+  and derived there too (`store.InferStatus`, English-only, `todo` when unsure).
 - Destructive `rm` requires `--force` after the refusal message identifies the
   matched task; `add --raw -` is the explicit stdin form.

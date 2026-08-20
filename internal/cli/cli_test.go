@@ -39,6 +39,7 @@ type fakeAssistant struct {
 	genSec           *report.Section
 	genSecs          []report.Section
 	genOut           string
+	genFallback      string
 	genErr           error
 	scriptCalls      int
 	scriptRep        string
@@ -55,10 +56,18 @@ type fakeAssistant struct {
 	planResult       []store.BatchOperation
 	planErr          error
 	planProgress     []string
+	planHold         time.Duration
 	planVerboseCalls int
 }
 
 func (f *fakeAssistant) Plan(ctx context.Context, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+	if f.planHold > 0 {
+		select {
+		case <-time.After(f.planHold):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.planCalls++
 	f.planPrompt = prompt
 	f.planTasks = append([]store.Task(nil), tasks...)
@@ -88,11 +97,11 @@ func (f *fakeAssistant) AddTasks(ctx context.Context, rawText string) ([]store.T
 	return f.addResult, nil
 }
 
-func (f *fakeAssistant) Generate(ctx context.Context, sec report.Section) (string, error) {
+func (f *fakeAssistant) Generate(ctx context.Context, sec report.Section) (agent.Generated, error) {
 	f.genCalls++
 	*f.genSec = sec
 	f.genSecs = append(f.genSecs, sec)
-	return f.genOut, f.genErr
+	return agent.Generated{Text: f.genOut, Fallback: f.genFallback}, f.genErr
 }
 
 func (f *fakeAssistant) Script(ctx context.Context, report string) (string, error) {
@@ -801,7 +810,9 @@ func TestGenerateOutputFile(t *testing.T) {
 	b, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, "## Today\n- did stuff\n", string(b))
-	assert.Empty(t, buf.String(), "stdout silent when a path is given")
+	assert.Equal(t, "wrote "+path+"\n", buf.String(),
+		"a minute of model calls must not end in silence: the path is echoed like every other mutation")
+	assert.NotContains(t, buf.String(), "did stuff", "the report itself goes to the file, not stdout")
 }
 
 func TestGenerateOutputFileTruncates(t *testing.T) {
@@ -993,7 +1004,8 @@ func TestGenerateWebhookFailureSurfaces(t *testing.T) {
 	err = root.Execute()
 	require.Error(t, err, "webhook failure surfaces")
 	assert.Contains(t, err.Error(), "webhook")
-	assert.Contains(t, root.ErrOrStderr().(*bytes.Buffer).String(), "webhook: failed")
+	assert.NotContains(t, root.ErrOrStderr().(*bytes.Buffer).String(), "webhook: failed",
+		"a delivery failure is reported once, as the command's error")
 }
 
 func TestDeliverReportAttemptsEverySinkAndReportsResults(t *testing.T) {
@@ -1011,7 +1023,7 @@ func TestDeliverReportAttemptsEverySinkAndReportsResults(t *testing.T) {
 	require.NoError(t, gen.Flags().Set("clip", "true"))
 	err = deliverReport(gen, config.Config{}, "report")
 	require.Error(t, err)
-	assert.Contains(t, buf.String(), "webhook: failed: boom")
+	assert.Contains(t, err.Error(), "boom", "every sink is attempted and the failure is returned")
 	assert.Contains(t, buf.String(), "clipboard: delivered")
 }
 
@@ -1413,7 +1425,7 @@ func TestCommitsAllAuthorsRecordsAuthor(t *testing.T) {
 	old := gitLogAll
 	gitLogAll = func(dir string, since time.Time) ([]git.Commit, error) {
 		return []git.Commit{
-			{Hash: "h1", Body: "alice work", Author: "alice@example.com", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)},
+			{Hash: "h1", Body: "alice work", Author: "alice@example.com", Name: "Alice Dev", When: time.Date(2026, 8, 14, 10, 0, 0, 0, time.Local)},
 			{Hash: "h2", Body: "bob work", Author: "bob@example.com", When: time.Date(2026, 8, 14, 11, 0, 0, 0, time.Local)},
 		}, nil
 	}
@@ -1423,8 +1435,8 @@ func TestCommitsAllAuthorsRecordsAuthor(t *testing.T) {
 	tasks, err := st.List()
 	require.NoError(t, err)
 	require.Len(t, tasks, 2)
-	assert.Equal(t, "alice@example.com", tasks[0].Author)
-	assert.Equal(t, "bob@example.com", tasks[1].Author)
+	assert.Equal(t, "Alice Dev", tasks[0].Author, "team headings read as names, not email addresses")
+	assert.Equal(t, "bob@example.com", tasks[1].Author, "a commit with no author name falls back to the email")
 }
 
 func TestCommitsWithoutAllAuthorsUsesPersonalLog(t *testing.T) {
@@ -1447,12 +1459,15 @@ func TestCommitsWithoutAllAuthorsUsesPersonalLog(t *testing.T) {
 }
 
 func TestGenerateTeamGroupsByAuthor(t *testing.T) {
-	assistant := &fakeAssistant{genOut: "- [done] work (10:00)"}
+	assistant := &fakeAssistant{genOut: "## Today\n- [done] work (10:00)"}
 	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
+	oldName := gitName
+	gitName = func(string) (string, error) { return "Juan", nil }
+	t.Cleanup(func() { gitName = oldName })
 	for _, seed := range []struct{ text, author string }{
-		{"alice work", "alice@example.com"},
-		{"bob work", "bob@example.com"},
+		{"alice work", "Alice Dev"},
+		{"bob work", "Bob Ops"},
 		{"my manual task", ""},
 	} {
 		tk, err := st.Add(seed.text)
@@ -1465,8 +1480,11 @@ func TestGenerateTeamGroupsByAuthor(t *testing.T) {
 	root.SetArgs([]string{"generate", "--team"})
 	require.NoError(t, root.Execute())
 	require.Len(t, assistant.genSecs, 3, "one render per author group plus the unattributed group")
-	assert.Contains(t, buf.String(), "## alice@example.com")
-	assert.Contains(t, buf.String(), "## bob@example.com")
+	assert.Contains(t, buf.String(), "## Alice Dev")
+	assert.Contains(t, buf.String(), "## Bob Ops")
+	assert.Contains(t, buf.String(), "## Juan", "the reader must be able to tell whose the first block is")
+	assert.Contains(t, buf.String(), "### Today", "day headings nest under their author")
+	assert.NotContains(t, buf.String(), "\n## Today", "a day heading never sits beside an author heading")
 	for _, sec := range assistant.genSecs {
 		for _, day := range sec.Days {
 			for i := 1; i < len(day.Tasks); i++ {
@@ -1476,16 +1494,20 @@ func TestGenerateTeamGroupsByAuthor(t *testing.T) {
 	}
 }
 
-func TestGenerateTeamWithoutAuthorsRendersSolo(t *testing.T) {
-	assistant := &fakeAssistant{genOut: "- [done] work (10:00)"}
+func TestGenerateTeamWithoutAuthorsNamesTheCurrentUser(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- [done] work (10:00)"}
 	st, root, buf := newHarness(t, assistant)
 	st.Now = today(8, 0)
+	oldName, oldIdent := gitName, gitIdentity
+	gitName = func(string) (string, error) { return "", errors.New("unset") }
+	gitIdentity = func(string) (string, error) { return "me@example.com", nil }
+	t.Cleanup(func() { gitName, gitIdentity = oldName, oldIdent })
 	_, err := st.Add("plain task")
 	require.NoError(t, err)
 	root.SetArgs([]string{"generate", "--team"})
 	require.NoError(t, root.Execute())
-	require.Len(t, assistant.genSecs, 1, "no recorded authors: one section, no headings")
-	assert.NotContains(t, buf.String(), "@example.com")
+	require.Len(t, assistant.genSecs, 1, "no recorded authors: one section")
+	assert.Contains(t, buf.String(), "## me@example.com", "the email is the fallback when user.name is unset")
 }
 
 func TestCommitsIncludesSubmodules(t *testing.T) {
@@ -1818,7 +1840,7 @@ func TestPromptAppliesMixedOperationsAndPrintsChanges(t *testing.T) {
 		{Kind: store.OperationDelete, ID: deleteTask.ID},
 	}
 
-	root.SetArgs([]string{"--prompt", "apply several changes"})
+	root.SetArgs([]string{"--prompt", "apply several changes", "--yes"})
 	require.NoError(t, root.Execute())
 
 	tasks, err := st.List()
@@ -1961,7 +1983,7 @@ func TestPromptInvalidBatchLeavesStoreUnchanged(t *testing.T) {
 		{Kind: store.OperationDelete, ID: "invented-id"},
 	}
 
-	root.SetArgs([]string{"-p", "bad plan"})
+	root.SetArgs([]string{"-p", "bad plan", "--yes"})
 	require.Error(t, root.Execute())
 	tasks, listErr := st.List()
 	require.NoError(t, listErr)
@@ -1991,8 +2013,8 @@ func (r *rawAss) AddTasks(ctx context.Context, rawText string) ([]store.Task, er
 	return nil, errors.New("model must not be called with --raw")
 }
 
-func (r *rawAss) Generate(ctx context.Context, sec report.Section) (string, error) {
-	return "", nil
+func (r *rawAss) Generate(ctx context.Context, sec report.Section) (agent.Generated, error) {
+	return agent.Generated{}, nil
 }
 
 func (r *rawAss) Script(ctx context.Context, report string) (string, error) {
@@ -2499,4 +2521,367 @@ func TestSyncRegistered(t *testing.T) {
 		names = append(names, c.Name())
 	}
 	assert.Contains(t, names, "sync")
+}
+
+// A doctor that only checks presence and reachability reported all-green for
+// a dead API key, and the very next command failed.
+func TestDoctorFailsWhenTheModelCallFails(t *testing.T) {
+	pipeStdin(t, "")
+	st, _, _ := newHarness(t, &fakeAssistant{})
+	oldIdent := gitIdentity
+	gitIdentity = func(string) (string, error) { return "me@example.com", nil }
+	oldReachable := reachable
+	reachable = func(string, string) error { return nil }
+	oldCheck := modelCheck
+	modelCheck = func(context.Context, config.Config) error {
+		return errors.New("endpoint rejected the credentials — check OPENAI_API_KEY: 401 Unauthorized")
+	}
+	t.Cleanup(func() { gitIdentity, reachable, modelCheck = oldIdent, oldReachable, oldCheck })
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("OPENAI_MODEL", "test-model")
+
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return &fakeAssistant{}, nil },
+			Raw:       &fakeAssistant{},
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", DataFile: st.Path},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"doctor"})
+	require.Error(t, root.Execute())
+	assert.Contains(t, buf.String(), "ok   endpoint reachable")
+	assert.Contains(t, buf.String(), "fail model answers")
+	assert.Contains(t, buf.String(), "OPENAI_API_KEY")
+}
+
+func TestDoctorPassesWhenTheModelAnswers(t *testing.T) {
+	pipeStdin(t, "")
+	st, _, _ := newHarness(t, &fakeAssistant{})
+	oldIdent := gitIdentity
+	gitIdentity = func(string) (string, error) { return "me@example.com", nil }
+	oldReachable := reachable
+	reachable = func(string, string) error { return nil }
+	oldCheck := modelCheck
+	called := 0
+	modelCheck = func(context.Context, config.Config) error { called++; return nil }
+	t.Cleanup(func() { gitIdentity, reachable, modelCheck = oldIdent, oldReachable, oldCheck })
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:1")
+	t.Setenv("OPENAI_MODEL", "test-model")
+
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return &fakeAssistant{}, nil },
+			Raw:       &fakeAssistant{},
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", DataFile: st.Path},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"doctor"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, 1, called, "doctor proves the setup with a real model call")
+	assert.Contains(t, buf.String(), "ok   model answers")
+}
+
+// "delete all of my tasks" wiped the store with no confirmation and no undo,
+// while `rm` refuses a single task without --force.
+func TestPromptRefusesDeletesWithoutConfirmation(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, buf := newHarness(t, assistant)
+	one, err := st.Add("keep me")
+	require.NoError(t, err)
+	two, err := st.Add("keep me too")
+	require.NoError(t, err)
+	assistant.planResult = []store.BatchOperation{
+		{Kind: store.OperationDelete, ID: one.ID},
+		{Kind: store.OperationDelete, ID: two.ID},
+	}
+
+	root.SetArgs([]string{"-p", "delete all of my tasks"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--yes")
+	assert.Contains(t, buf.String(), "will delete")
+	assert.Contains(t, buf.String(), "keep me too")
+	tasks, listErr := st.List()
+	require.NoError(t, listErr)
+	assert.Len(t, tasks, 2, "a refused plan writes nothing")
+}
+
+func TestPromptAppliesDeletesWithYes(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, _ := newHarness(t, assistant)
+	one, err := st.Add("remove me")
+	require.NoError(t, err)
+	assistant.planResult = []store.BatchOperation{{Kind: store.OperationDelete, ID: one.ID}}
+
+	root.SetArgs([]string{"-p", "delete that task", "--yes"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	assert.Empty(t, tasks)
+}
+
+func TestPromptWithoutDeletesNeedsNoConfirmation(t *testing.T) {
+	assistant := &fakeAssistant{
+		planResult: []store.BatchOperation{{Kind: store.OperationCreate, Text: "new task", Status: "todo"}},
+	}
+	st, root, _ := newHarness(t, assistant)
+
+	root.SetArgs([]string{"-p", "add a task"})
+	require.NoError(t, root.Execute())
+	tasks, err := st.List()
+	require.NoError(t, err)
+	assert.Len(t, tasks, 1)
+}
+
+func TestClipboardCommandPerPlatform(t *testing.T) {
+	found := func(want string) func(string) (string, error) {
+		return func(name string) (string, error) {
+			if name == want {
+				return "/usr/bin/" + name, nil
+			}
+			return "", errors.New("not found")
+		}
+	}
+	name, args, err := clipboardCommand("darwin", found("nothing"))
+	require.NoError(t, err)
+	assert.Equal(t, "pbcopy", name)
+	assert.Empty(t, args)
+
+	name, args, err = clipboardCommand("linux", found("xclip"))
+	require.NoError(t, err)
+	assert.Equal(t, "xclip", name)
+	assert.Equal(t, []string{"-selection", "clipboard"}, args)
+
+	name, _, err = clipboardCommand("linux", found("wl-copy"))
+	require.NoError(t, err)
+	assert.Equal(t, "wl-copy", name)
+
+	_, _, err = clipboardCommand("linux", found("nothing"))
+	assert.ErrorContains(t, err, "no clipboard command found")
+}
+
+// wl-copy owns the clipboard from a forked child that inherits the parent's
+// output pipes: collecting its output waited for that child, so
+// `generate --clip` copied the report and then hung forever printing nothing.
+func TestWriteClipboardDoesNotWaitForAForkedHelper(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh is the stand-in for a forking clipboard helper")
+	}
+	done := make(chan error, 1)
+	go func() { done <- writeClipboard("sh", []string{"-c", "cat >/dev/null; sleep 30 &"}, "report") }()
+	select {
+	case err := <-done:
+		assert.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("writeClipboard waited for the helper's forked child")
+	}
+}
+
+func TestWriteClipboardReportsAFailingCommand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("sh is the stand-in for a failing clipboard helper")
+	}
+	err := writeClipboard("sh", []string{"-c", "exit 3"}, "report")
+	assert.ErrorContains(t, err, "clipboard sh")
+}
+
+// `commits` stores a commit's whole message: one 1700-character task rendered
+// as a single row destroyed the column layout of the whole listing.
+func TestListTruncatesLongTaskRows(t *testing.T) {
+	pipeStdin(t, "")
+	st, root, buf := newHarness(t, &fakeAssistant{})
+	st.Now = today(8, 0)
+	body := "add sync: merge tasks with a PocketBase server across machines " + strings.Repeat("body text ", 200)
+	_, err := st.Add(body)
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"list", "--days", "1"})
+	require.NoError(t, root.Execute())
+	row := strings.TrimRight(buf.String(), "\n")
+	assert.Less(t, len([]rune(row)), 140, "the row fits a terminal")
+	assert.Contains(t, row, "add sync: merge tasks with a PocketBase server")
+	assert.True(t, strings.HasSuffix(row, "…"), "truncation is visible")
+
+	tasks, err := st.List()
+	require.NoError(t, err)
+	assert.Equal(t, body, tasks[0].Text, "the store keeps the full text")
+}
+
+// The rephrase fallback used to be invisible: the user shipped raw task text
+// to their team believing the model wrote it.
+func TestGenerateNotesTheVerbatimFallback(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- [done] raw text", genFallback: "the model answered off-contract (12 entries for 39 tasks)"}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"generate"})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "note: the model answered off-contract (12 entries for 39 tasks); using the task texts verbatim")
+}
+
+func TestGenerateStaysQuietWhenTheModelAnswers(t *testing.T) {
+	assistant := &fakeAssistant{genOut: "## Today\n- [done] shipped it"}
+	st, root, buf := newHarness(t, assistant)
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"generate"})
+	require.NoError(t, root.Execute())
+	assert.NotContains(t, buf.String(), "note:")
+}
+
+// A read-only diagnostic left an empty tasks.jsonl behind on machines that
+// had never run standup.
+func TestDoctorDoesNotCreateTheDataFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "fresh", "tasks.jsonl")
+	require.NoError(t, checkWritable(path))
+	assert.NoFileExists(t, path, "probing writability must not create the store")
+	entries, err := os.ReadDir(filepath.Dir(path))
+	require.NoError(t, err)
+	assert.Empty(t, entries, "and must leave no probe behind either")
+
+	require.NoError(t, os.WriteFile(path, []byte(""), 0o644))
+	assert.NoError(t, checkWritable(path), "an existing store is still checked")
+	require.NoError(t, os.Chmod(path, 0o444))
+	assert.Error(t, checkWritable(path), "an unwritable store is reported")
+}
+
+// model_call_timeout bounds one call and the coordinator makes several, so a
+// -p run had no overall bound at all and could sit silent indefinitely.
+func TestPromptGivesUpOnItsWallClockBudget(t *testing.T) {
+	assistant := &fakeAssistant{planHold: 2 * time.Second}
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) { return assistant, nil },
+			Raw:       assistant,
+			Store:     st,
+			Config:    config.Config{MeetingTime: "09:30", ModelCallTimeout: 20 * time.Millisecond},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"-p", "do something slow"})
+
+	start := time.Now()
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "model_call_timeout")
+	assert.Less(t, time.Since(start), time.Second, "the budget bounds the whole command")
+	tasks, listErr := st.List()
+	require.NoError(t, listErr)
+	assert.Empty(t, tasks)
+}
+
+func TestPromptBudgetIsAMultipleOfTheCallTimeout(t *testing.T) {
+	assert.Equal(t, 5*time.Minute, promptBudget(time.Minute))
+	assert.Equal(t, 5*time.Minute, promptBudget(0), "an unset timeout falls back to the default call bound")
+}
+
+// The verbose plan reported `status <id> blocked -> blocked` as a change, and
+// applying it would restamp the record for no reason.
+func TestPromptDropsNoOpOperations(t *testing.T) {
+	assistant := &fakeAssistant{}
+	st, root, buf := newHarness(t, assistant)
+	blocked, err := st.Add("triaged the flaky CI job")
+	require.NoError(t, err)
+	_, err = st.SetStatus(blocked.ID, "blocked")
+	require.NoError(t, err)
+	assistant.planResult = []store.BatchOperation{
+		{Kind: store.OperationStatus, ID: blocked.ID, Status: "blocked"},
+		{Kind: store.OperationEdit, ID: blocked.ID, Text: "triaged the flaky CI job"},
+	}
+
+	root.SetArgs([]string{"-p", "block the flaky CI work"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, "no changes\n", buf.String())
+}
+
+// 0 violated the stated rule and was silently reinterpreted as "today",
+// while -5 was rejected.
+func TestListRejectsNonPositiveDays(t *testing.T) {
+	pipeStdin(t, "")
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+	for _, days := range []string{"0", "-5"} {
+		root.SetArgs([]string{"list", "--days", days})
+		err := root.Execute()
+		require.Error(t, err, "--days %s", days)
+		assert.Contains(t, err.Error(), "N >= 1")
+	}
+}
+
+// The first positional is documented as [days]: a typo there sent the user
+// looking for a directory.
+func TestCommitsRejectsATypedDayCount(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	st.Now = today(8, 0)
+	root.SetArgs([]string{"commits", "1o"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "neither a day count nor a directory")
+}
+
+// `store:` and `agent:` are package names the user has no concept of; the
+// messages behind them are good and must survive intact.
+func TestErrorsDoNotLeakPackageNames(t *testing.T) {
+	pipeStdin(t, "")
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	st.Now = today(8, 0)
+	_, err := st.Add("ship")
+	require.NoError(t, err)
+
+	root.SetArgs([]string{"status", "zzzzzz", "nonsense"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Equal(t, `no task with id "zzzzzz"`, err.Error())
+
+	tasks, err := st.List()
+	require.NoError(t, err)
+	root.SetArgs([]string{"status", tasks[0].ID, "nonsense"})
+	err = root.Execute()
+	require.Error(t, err)
+	assert.Equal(t, `invalid status "nonsense" (valid: todo, in-progress, blocked, done)`, err.Error())
+}
+
+// Installing twice printed the same success both times; an edited SKILL.md
+// was replaced with no diff, no prompt and no warning.
+func TestSkillInstallWarnsWhenReplacingAnEditedSkill(t *testing.T) {
+	unsetCliEnv(t, "STANDUP_CONFIG_DIR")
+	repo := t.TempDir()
+	t.Chdir(repo)
+	root := New(func() (Deps, error) { return Deps{}, errors.New("skill install never loads deps") })
+	buf := &bytes.Buffer{}
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"skill", "install"})
+	require.NoError(t, root.Execute())
+	assert.NotContains(t, buf.String(), "warning", "a fresh install has nothing to warn about")
+
+	edited := filepath.Join(repo, ".claude", "skills", "standup", "SKILL.md")
+	require.NoError(t, os.WriteFile(edited, []byte("my own instructions\n"), 0o644))
+	buf.Reset()
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), "warning: replaced an edited "+filepath.Join(".claude", "skills", "standup", "SKILL.md"))
+	assert.NotContains(t, strings.SplitN(buf.String(), "warning:", 2)[0], ".claude",
+		"the untouched root installs without a warning")
+
+	buf.Reset()
+	require.NoError(t, root.Execute())
+	assert.NotContains(t, buf.String(), "warning", "reinstalling the embedded copy is not an edit")
 }

@@ -76,6 +76,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 	root.Flags().StringP("add", "a", "", "task text")
 	root.Flags().StringP("prompt", "p", "", "apply task changes from a natural-language prompt (use - for stdin; weak models may need a longer model_call_timeout)")
 	root.Flags().Bool("verbose", false, "show specialist tool calls for -p")
+	root.Flags().BoolP("yes", "y", false, "apply a -p plan that deletes tasks without confirmation")
 	root.Flags().BoolP("list", "l", false, "list today's tasks")
 	root.Flags().BoolP("generate", "g", false, "generate the standup report")
 
@@ -196,7 +197,7 @@ func New(load func() (Deps, error)) *cobra.Command {
 
 	initCmd := &cobra.Command{
 		Use:   "init",
-		Short: "write default config files to the user config dir",
+		Short: "write default config files to the active config dir",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			dir, err := config.Init()
 			if err != nil {
@@ -296,9 +297,9 @@ func runRoot(cmd *cobra.Command, args []string, load func() (Deps, error)) error
 		}
 		d, err := load()
 		if err != nil {
-			return err
+			return userFacing(err)
 		}
-		return action.run(cmd, d)
+		return userFacing(action.run(cmd, d))
 	}
 	return cmd.Help()
 }
@@ -416,14 +417,39 @@ func runSkillInstall(cmd *cobra.Command, global bool) error {
 		if err := os.MkdirAll(r.dir, 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(filepath.Join(r.dir, "SKILL.md"), []byte(defaults.SkillMD), 0o644); err != nil {
+		file := filepath.Join(r.dir, "SKILL.md")
+		edited, err := skillWasEdited(file)
+		if err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "skill: %s (%s)\n", filepath.Join(r.dir, "SKILL.md"), r.who); err != nil {
+		if err := os.WriteFile(file, []byte(defaults.SkillMD), 0o644); err != nil {
+			return err
+		}
+		// Silently replacing someone's edits is the one thing a file drop
+		// must not do quietly.
+		if edited {
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "warning: replaced an edited %s\n", file); err != nil {
+				return err
+			}
+		}
+		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "skill: %s (%s)\n", file, r.who); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// skillWasEdited reports whether an existing SKILL.md differs from the
+// embedded copy that is about to replace it.
+func skillWasEdited(file string) (bool, error) {
+	b, err := os.ReadFile(file)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return string(b) != defaults.SkillMD, nil
 }
 
 func validateSkillTarget(dir string) error {
@@ -465,9 +491,28 @@ func removeSkillPlaceholder(dir string) error {
 func lazy(cmd *cobra.Command, load func() (Deps, error), run func(*cobra.Command, Deps) error) error {
 	d, err := load()
 	if err != nil {
+		return userFacing(err)
+	}
+	return userFacing(run(cmd, d))
+}
+
+// internalPrefixes are the package names that leaked into user-facing errors.
+// The messages themselves are good — specific, actionable, they name valid
+// values — but `store:` and `agent:` are concepts the user does not have.
+var internalPrefixes = []string{"store: ", "agent: ", "report: ", "config: ", "git: "}
+
+func userFacing(err error) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, prefix := range internalPrefixes {
+		message = strings.ReplaceAll(message, prefix, "")
+	}
+	if message == err.Error() {
 		return err
 	}
-	return run(cmd, d)
+	return errors.New(message)
 }
 
 func runDone(cmd *cobra.Command, d Deps, args []string) error {
@@ -589,10 +634,11 @@ func flat(text string) string {
 	return strings.Join(strings.Fields(text), " ")
 }
 
-// echoTask prints the mutated row so silent mutations never happen.
+// echoTask prints the mutated row so silent mutations never happen. The text
+// is bounded like a list row: importing 30 commits printed 30 walls of text.
 func echoTask(cmd *cobra.Command, t store.Task) error {
 	p := newPainter(cmd.OutOrStdout())
-	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), flat(t.Text))
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), truncate(flat(t.Text), rowTextBudget))
 	return err
 }
 
@@ -812,21 +858,20 @@ func runPrompt(cmd *cobra.Command, d Deps, prompt string) error {
 	if err != nil {
 		return err
 	}
-	var operations []store.BatchOperation
-	var planErr error
-	if flagBool(cmd, "verbose") {
-		operations, planErr = planWithProgress(cmd, assist, prompt, tasks, now)
-	} else if err := spin("planning changes", func() error {
-		operations, planErr = assist.Plan(cmd.Context(), prompt, tasks, now)
-		return nil
-	}); err != nil {
+	operations, err := planOperations(cmd, d, assist, prompt, tasks, now)
+	if err != nil {
 		return err
 	}
-	if planErr != nil {
-		return planErr
+	operations = dropNoOps(operations, tasks)
+	if err := confirmDeletes(cmd, operations, tasks); err != nil {
+		return err
 	}
 	changes, err := d.Store.ApplyBatch(operations)
 	if err != nil {
+		return err
+	}
+	if len(changes) == 0 {
+		_, err := fmt.Fprintln(cmd.OutOrStdout(), "no changes")
 		return err
 	}
 	for _, change := range changes {
@@ -837,13 +882,114 @@ func runPrompt(cmd *cobra.Command, d Deps, prompt string) error {
 	return nil
 }
 
-func planWithProgress(cmd *cobra.Command, assist agent.Assistant, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+// planOperations asks the assistant for a plan under the command's wall-clock
+// budget.
+func planOperations(cmd *cobra.Command, d Deps, assist agent.Assistant, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
+	budget := promptBudget(d.Config.ModelCallTimeout)
+	ctx, cancel := context.WithTimeout(cmd.Context(), budget)
+	defer cancel()
+	var operations []store.BatchOperation
+	var planErr error
+	if flagBool(cmd, "verbose") {
+		operations, planErr = planWithProgress(ctx, cmd, assist, prompt, tasks, now)
+	} else if err := spin("planning changes", func() error {
+		operations, planErr = assist.Plan(ctx, prompt, tasks, now)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("gave up after %s: the coordinator was still working (model_call_timeout bounds one call, %d of them bound the command); raise model_call_timeout or ask for one change at a time", budget, promptCalls)
+	}
+	return operations, planErr
+}
+
+// promptCalls is how many model calls one -p run is allowed to spend: the
+// coordinator plus its three specialists, with a call to spare.
+const promptCalls = 5
+
+// promptBudget bounds a whole -p run. model_call_timeout bounds one call and
+// the coordinator makes several, so without this a weak model could keep the
+// command running indefinitely with nothing on screen.
+func promptBudget(perCall time.Duration) time.Duration {
+	if perCall <= 0 {
+		perCall = time.Minute
+	}
+	return promptCalls * perCall
+}
+
+// dropNoOps removes operations that would change nothing. The verbose plan
+// reported `status <id> blocked -> blocked` as a change, and applying it
+// would restamp the record for no reason.
+func dropNoOps(operations []store.BatchOperation, tasks []store.Task) []store.BatchOperation {
+	current := make(map[string]store.Task, len(tasks))
+	for _, t := range tasks {
+		current[t.ID] = t
+	}
+	kept := make([]store.BatchOperation, 0, len(operations))
+	for _, op := range operations {
+		t, known := current[op.ID]
+		switch {
+		case known && op.Kind == store.OperationStatus && t.Status == op.Status:
+		case known && op.Kind == store.OperationEdit && t.Text == op.Text:
+		default:
+			kept = append(kept, op)
+		}
+	}
+	return kept
+}
+
+// confirmDeletes previews a plan that removes tasks and asks before applying
+// it. The prompt path is the one where a model decides the blast radius — a
+// single "delete all of my tasks" wiped the whole store — so it is the path
+// that most needs a preview, while `rm` already refuses a single task without
+// --force.
+func confirmDeletes(cmd *cobra.Command, operations []store.BatchOperation, tasks []store.Task) error {
+	byID := make(map[string]store.Task, len(tasks))
+	for _, t := range tasks {
+		byID[t.ID] = t
+	}
+	var deletes []string
+	for _, op := range operations {
+		if op.Kind != store.OperationDelete {
+			continue
+		}
+		if t, ok := byID[op.ID]; ok {
+			deletes = append(deletes, fmt.Sprintf("%s [%s] %s", shortID(t.ID), t.Status, truncate(flat(t.Text), rowTextBudget)))
+			continue
+		}
+		deletes = append(deletes, shortID(op.ID))
+	}
+	if len(deletes) == 0 || flagBool(cmd, "yes") {
+		return nil
+	}
+	for _, line := range deletes {
+		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "will delete %s\n", line); err != nil {
+			return err
+		}
+	}
+	if !interactive() {
+		return fmt.Errorf("refusing to delete %s without confirmation; re-run with --yes", plural(len(deletes), "task"))
+	}
+	return confirmPrompt(fmt.Sprintf("delete %s", plural(len(deletes), "task")))
+}
+
+// confirmPrompt asks a yes/no question on the terminal, defaulting to no.
+var confirmPrompt = func(question string) error {
+	_, err := (&promptui.Prompt{Label: question, IsConfirm: true}).Run()
+	if err != nil {
+		return fmt.Errorf("cancelled: %s", question)
+	}
+	return nil
+}
+
+func planWithProgress(ctx context.Context, cmd *cobra.Command, assist agent.Assistant, prompt string, tasks []store.Task, now time.Time) ([]store.BatchOperation, error) {
 	planner, ok := assist.(progressPlanner)
 	if !ok {
-		return assist.Plan(cmd.Context(), prompt, tasks, now)
+		return assist.Plan(ctx, prompt, tasks, now)
 	}
 	var writeErr error
-	operations, err := planner.PlanWithProgress(cmd.Context(), prompt, tasks, now, func(message string) {
+	operations, err := planner.PlanWithProgress(ctx, prompt, tasks, now, func(message string) {
 		if writeErr == nil {
 			_, writeErr = fmt.Fprintln(cmd.ErrOrStderr(), message)
 		}
@@ -855,18 +1001,21 @@ func planWithProgress(cmd *cobra.Command, assist agent.Assistant, prompt string,
 }
 
 func echoChange(cmd *cobra.Command, change store.Change) error {
+	// Rows, like every other listing: a task holding a whole commit message
+	// must not print a wall of text per change.
+	row := func(t *store.Task) string { return truncate(flat(t.Text), rowTextBudget) }
 	switch change.Kind {
 	case store.OperationCreate:
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "created %s [%s] %s\n", shortID(change.After.ID), change.After.Status, change.After.Text)
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "created %s [%s] %s\n", shortID(change.After.ID), change.After.Status, row(change.After))
 		return err
 	case store.OperationEdit:
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "edited %s %s -> %s\n", shortID(change.After.ID), change.Before.Text, change.After.Text)
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "edited %s %s -> %s\n", shortID(change.After.ID), row(change.Before), row(change.After))
 		return err
 	case store.OperationStatus:
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "status %s %s -> %s: %s\n", shortID(change.After.ID), change.Before.Status, change.After.Status, change.After.Text)
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "status %s %s -> %s: %s\n", shortID(change.After.ID), change.Before.Status, change.After.Status, row(change.After))
 		return err
 	case store.OperationDelete:
-		_, err := fmt.Fprintf(cmd.OutOrStdout(), "deleted %s [%s] %s\n", shortID(change.Before.ID), change.Before.Status, change.Before.Text)
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "deleted %s [%s] %s\n", shortID(change.Before.ID), change.Before.Status, row(change.Before))
 		return err
 	default:
 		return fmt.Errorf("unknown change kind %q", change.Kind)
@@ -928,8 +1077,13 @@ func commitsArgs(cmd *cobra.Command, args []string) (int, []string, error) {
 	if len(rest) == 0 {
 		return days, []string{"."}, nil
 	}
-	for _, p := range rest {
+	for i, p := range rest {
 		if fi, err := os.Stat(p); err != nil || !fi.IsDir() {
+			// The first positional is documented as [days], so a typo there
+			// ("1o") must not send the user looking for a directory.
+			if i == 0 && days == 0 {
+				return 0, nil, fmt.Errorf("usage: %s commits [days] [paths...] (%q is neither a day count nor a directory)", cmd.Root().Name(), p)
+			}
 			return 0, nil, fmt.Errorf("usage: %s commits [days] [paths...] (no such directory: %q)", cmd.Root().Name(), p)
 		}
 	}
@@ -1043,8 +1197,10 @@ func importCommits(cmd *cobra.Command, st *store.Store, commits []git.Commit) er
 				return err
 			}
 		}
-		if flagBool(cmd, "all-authors") && c.Author != "" {
-			if t, err = st.SetAuthor(t.ID, c.Author); err != nil {
+		// The display name is what a team report shows as a heading; the
+		// email only ever served the identity filter.
+		if author := commitAuthor(c); flagBool(cmd, "all-authors") && author != "" {
+			if t, err = st.SetAuthor(t.ID, author); err != nil {
 				return err
 			}
 		}
@@ -1057,6 +1213,14 @@ func importCommits(cmd *cobra.Command, st *store.Store, commits []git.Commit) er
 		return err
 	}
 	return nil
+}
+
+// commitAuthor is the name a team report attributes the commit to.
+func commitAuthor(c git.Commit) string {
+	if c.Name != "" {
+		return c.Name
+	}
+	return c.Author
 }
 
 var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
@@ -1135,7 +1299,7 @@ func runList(cmd *cobra.Command, d Deps) error {
 		_, err := fmt.Fprintln(cmd.OutOrStdout(), "no tasks")
 		return err
 	}
-	if flagString(cmd, "date") == "" && flagInt(cmd, "days") == 0 && interactive() {
+	if flagString(cmd, "date") == "" && !cmd.Flags().Changed("days") && interactive() {
 		return selectLoop(st, tag, now, newPainter(cmd.OutOrStdout()))
 	}
 	p := newPainter(cmd.OutOrStdout())
@@ -1147,19 +1311,35 @@ func runList(cmd *cobra.Command, d Deps) error {
 	return nil
 }
 
+// rowTextBudget bounds a list row's text. `commits` stores a commit's whole
+// message, and a single 1700-character task destroyed the column layout of
+// the entire listing. The store keeps the full text; reports show the subject
+// line.
+const rowTextBudget = 100
+
 // rowText renders a task row's text, attributing the branch when recorded.
 func rowText(t store.Task) string {
+	text := truncate(flat(t.Text), rowTextBudget)
 	if t.Branch == "" {
-		return flat(t.Text)
+		return text
 	}
-	return flat(t.Text) + " [" + t.Branch + "]"
+	return text + " [" + t.Branch + "]"
+}
+
+func truncate(s string, budget int) string {
+	runes := []rune(s)
+	if len(runes) <= budget {
+		return s
+	}
+	return strings.TrimRight(string(runes[:budget]), " ") + "…"
 }
 
 // listTasks resolves the list window: one --date day, trailing --days, or
 // today (in the configured timezone — now carries its location).
 func listTasks(cmd *cobra.Command, st *store.Store, now time.Time) ([]store.Task, error) {
 	date, days := flagString(cmd, "date"), flagInt(cmd, "days")
-	if date != "" && days != 0 {
+	daysGiven := cmd.Flags().Changed("days")
+	if date != "" && daysGiven {
 		return nil, fmt.Errorf("usage: %s list: --date and --days are mutually exclusive", cmd.Root().Name())
 	}
 	if date != "" {
@@ -1169,8 +1349,10 @@ func listTasks(cmd *cobra.Command, st *store.Store, now time.Time) ([]store.Task
 		}
 		return st.ListDay(day)
 	}
-	if days != 0 {
-		if days < 0 {
+	if daysGiven {
+		// 0 used to be silently reinterpreted as "today" while -5 was
+		// rejected, though both break the stated rule.
+		if days < 1 {
 			return nil, fmt.Errorf("usage: %s list --days N (N >= 1)", cmd.Root().Name())
 		}
 		return st.ListRange(report.StartOfDay(now.AddDate(0, 0, -(days-1))), now)
@@ -1240,7 +1422,9 @@ func aborted(err error) bool {
 }
 
 func selectLoop(st *store.Store, tag string, now time.Time, p painter) error {
-	actions := []string{"in-progress", "done", "blocked", "delete", "back"}
+	// todo is in the list because a mis-click on blocked (one row above
+	// delete) otherwise has to be undone from the command line.
+	actions := []string{"todo", "in-progress", "done", "blocked", "delete", "back"}
 	for {
 		entries, err := taskEntries(st, tag, now, p)
 		if err != nil {
@@ -1271,6 +1455,9 @@ func selectLoop(st *store.Store, tag string, now time.Time, p painter) error {
 		case "back":
 			return nil
 		case "delete":
+			if err := confirmPrompt("delete " + flat(entries[i].task.Text)); err != nil {
+				continue
+			}
 			if err := st.Delete(entries[i].task.ID); err != nil {
 				return err
 			}
@@ -1285,6 +1472,11 @@ func selectLoop(st *store.Store, tag string, now time.Time, p painter) error {
 func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	if flagBool(cmd, "obsidian") && d.Config.ObsidianVault == "" {
 		return errors.New("obsidian.vault is not configured (run: standup config set obsidian.vault /path/to/vault)")
+	}
+	// Checking the delivery settings costs nothing; discovering them after a
+	// minute of model calls costs the whole report.
+	if flagString(cmd, "mail") != "" && d.Config.SMTPHost == "" {
+		return errors.New("mail: smtp_host is not configured (set smtp_* in config.yaml)")
 	}
 	now, err := nowIn(d)
 	if err != nil {
@@ -1309,6 +1501,13 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 	if err := deliverReport(cmd, d.Config, out); err != nil {
 		return err
 	}
+	return publishReport(cmd, d, out, now)
+}
+
+// publishReport routes the rendered report to its destinations: the vault,
+// a file, or the terminal. Every write echoes the path it wrote.
+func publishReport(cmd *cobra.Command, d Deps, out string, now time.Time) error {
+	published := false
 	if flagBool(cmd, "obsidian") {
 		note := strings.ReplaceAll(d.Config.ObsidianNote, "{date}", now.Format("2006-01-02"))
 		path, err := obsidian.Publish(d.Config.ObsidianVault, note, out)
@@ -1318,14 +1517,19 @@ func runGenerate(cmd *cobra.Command, d Deps, args []string) error {
 		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path); err != nil {
 			return err
 		}
-		if flagString(cmd, "output") == "" {
-			return nil
-		}
+		published = true
 	}
 	if path := flagString(cmd, "output"); path != "" {
-		return os.WriteFile(filepath.Clean(path), []byte(out+"\n"), 0o644)
+		if err := os.WriteFile(filepath.Clean(path), []byte(out+"\n"), 0o644); err != nil {
+			return err
+		}
+		_, err := fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path)
+		return err
 	}
-	_, err = fmt.Fprintln(cmd.OutOrStdout(), colorReport(out, newPainter(cmd.OutOrStdout())))
+	if published {
+		return nil
+	}
+	_, err := fmt.Fprintln(cmd.OutOrStdout(), colorReport(out, newPainter(cmd.OutOrStdout())))
 	return err
 }
 
@@ -1366,7 +1570,7 @@ func renderReport(cmd *cobra.Command, d Deps, tasks []store.Task, now time.Time,
 		if total == 0 {
 			continue
 		}
-		var out string
+		var out agent.Generated
 		var genErr error
 		if err := spin("generating standup", func() error {
 			out, genErr = assist.Generate(cmd.Context(), sec)
@@ -1377,25 +1581,66 @@ func renderReport(cmd *cobra.Command, d Deps, tasks []store.Task, now time.Time,
 		if genErr != nil {
 			return "", genErr
 		}
-		if a != "" {
-			b.WriteString("## " + a + "\n")
+		// The fallback fires precisely when the input is large and messy —
+		// exactly when verbatim task text is least usable — so say so
+		// instead of shipping a raw commit dump as if the model wrote it.
+		if out.Fallback != "" {
+			if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "note: %s; using the task texts verbatim\n", out.Fallback); err != nil {
+				return "", err
+			}
 		}
-		b.WriteString(strings.TrimRight(out, "\n") + "\n")
+		if team {
+			// Every block gets a heading — a reader could not tell whose the
+			// first one was — and the day headings nest under it.
+			b.WriteString("## " + authorHeading(a) + "\n")
+			b.WriteString(strings.TrimRight(demoteHeadings(out.Text), "\n") + "\n")
+			continue
+		}
+		b.WriteString(strings.TrimRight(out.Text, "\n") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n"), nil
+}
+
+// gitName is swappable so CLI tests never depend on a real repository.
+var gitName = git.Name
+
+// authorHeading names a team-report block. Tasks with no recorded author are
+// the person running the report: their commits predate --all-authors, or they
+// typed them in.
+func authorHeading(author string) string {
+	if author != "" {
+		return author
+	}
+	if name, err := gitName("."); err == nil && name != "" {
+		return name
+	}
+	if email, err := gitIdentity("."); err == nil && email != "" {
+		return email
+	}
+	return "unattributed"
+}
+
+// demoteHeadings pushes a rendered report one level down so its days nest
+// under the author heading instead of sitting beside it.
+func demoteHeadings(out string) string {
+	lines := strings.Split(out, "\n")
+	for i, line := range lines {
+		if strings.HasPrefix(line, "## ") {
+			lines[i] = "#" + line
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // deliverReport fans the rendered report out to the requested sinks:
 // webhook POST, email, clipboard.
 func deliverReport(cmd *cobra.Command, cfg config.Config, out string) error {
 	var errs []error
+	// A failure is reported once, by returning it: printing it here too put
+	// the same fact on both streams.
 	deliver := func(name string, fn func() error) {
 		if err := fn(); err != nil {
 			errs = append(errs, err)
-			detail := strings.TrimPrefix(err.Error(), name+": ")
-			if _, writeErr := fmt.Fprintf(cmd.ErrOrStderr(), "%s: failed: %s\n", name, detail); writeErr != nil {
-				errs = append(errs, writeErr)
-			}
 			return
 		}
 		if _, err := fmt.Fprintf(cmd.ErrOrStderr(), "%s: delivered\n", name); err != nil {
@@ -1583,31 +1828,41 @@ func postReport(url, text string) error {
 }
 
 func copyClipboard(text string) error {
-	var name string
-	var args []string
-	switch runtime.GOOS {
+	name, args, err := clipboardCommand(runtime.GOOS, exec.LookPath)
+	if err != nil {
+		return err
+	}
+	return writeClipboard(name, args, text)
+}
+
+// clipboardCommand picks the platform's clipboard writer.
+func clipboardCommand(goos string, lookPath func(string) (string, error)) (string, []string, error) {
+	switch goos {
 	case "windows":
-		name = "clip"
+		return "clip", nil, nil
 	case "darwin":
-		name = "pbcopy"
-	default:
-		for _, c := range []string{"wl-copy", "xclip", "xsel"} {
-			if _, err := exec.LookPath(c); err == nil {
-				name = c
-				break
+		return "pbcopy", nil, nil
+	}
+	for _, c := range []string{"wl-copy", "xclip", "xsel"} {
+		if _, err := lookPath(c); err == nil {
+			if c == "xclip" {
+				return c, []string{"-selection", "clipboard"}, nil
 			}
-		}
-		if name == "" {
-			return errors.New("no clipboard command found (install xclip or wl-clipboard)")
-		}
-		if name == "xclip" {
-			args = []string{"-selection", "clipboard"}
+			return c, nil, nil
 		}
 	}
+	return "", nil, errors.New("no clipboard command found (install xclip or wl-clipboard)")
+}
+
+// writeClipboard pipes the text to the clipboard command without giving it
+// output pipes. On Wayland `wl-copy` owns the selection from a forked child
+// that inherits them, so collecting its output waits for that child to die:
+// `generate --clip` copied the report and then hung forever, printing nothing.
+func writeClipboard(name string, args []string, text string) error {
 	c := exec.Command(name, args...)
 	c.Stdin = strings.NewReader(text)
-	if out, err := c.CombinedOutput(); err != nil {
-		return fmt.Errorf("clipboard %s: %w: %s", name, err, strings.TrimSpace(string(out)))
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("clipboard %s: %w", name, err)
 	}
 	return nil
 }
@@ -1637,34 +1892,46 @@ func runDoctor(cmd *cobra.Command, d Deps) error {
 	}
 	if d.Config.Offline {
 		report("ok   offline mode — endpoint checks skipped\n")
-		if werr != nil {
-			return werr
-		}
-		return errOr(healthy)
-	}
-	required, err := config.ProviderEnv(d.Config.Provider)
-	if err != nil {
-		check("provider", err)
-		if werr != nil {
-			return werr
-		}
-		return errOr(healthy)
-	}
-	for _, key := range required {
-		if os.Getenv(key) == "" {
-			check("env "+key, fmt.Errorf("not set (required for add/generate, or set offline: true)"))
-		} else {
-			report("ok   env %s\n", key)
-		}
-	}
-	reportOptionalOpenAIKey(d.Config.Provider, report)
-	if base := os.Getenv(required[0]); base != "" {
-		check("endpoint reachable", reachable(base, required[0]))
+	} else {
+		doctorProvider(cmd, d.Config, report, check)
 	}
 	if werr != nil {
 		return werr
 	}
 	return errOr(healthy)
+}
+
+// modelCheck is swappable so CLI tests never need a model endpoint.
+var modelCheck = agent.Check
+
+// doctorProvider checks the provider setup end to end. Present variables and
+// a host that answers prove nothing about a dead key or a model that does not
+// exist, so the last step is a real model call.
+func doctorProvider(cmd *cobra.Command, cfg config.Config, report func(string, ...any), check func(string, error)) {
+	required, err := config.ProviderEnv(cfg.Provider)
+	if err != nil {
+		check("provider", err)
+		return
+	}
+	missing := false
+	for _, key := range required {
+		if os.Getenv(key) == "" {
+			check("env "+key, errors.New("not set (required for add/generate, or set offline: true)"))
+			missing = true
+			continue
+		}
+		report("ok   env %s\n", key)
+	}
+	reportOptionalOpenAIKey(cfg.Provider, report)
+	if missing {
+		return
+	}
+	if err := reachable(os.Getenv(required[0]), required[0]); err != nil {
+		check("endpoint reachable", err)
+		return
+	}
+	report("ok   endpoint reachable\n")
+	check("model answers", modelCheck(cmd.Context(), cfg))
 }
 
 func reportOptionalOpenAIKey(provider string, report func(string, ...any)) {
@@ -1683,17 +1950,34 @@ func errOr(healthy bool) error {
 // gitIdentity is swappable so CLI tests never depend on a real repo.
 var gitIdentity = git.Identity
 
+// checkWritable probes the data file without creating it: a read-only
+// diagnostic left an empty tasks.jsonl behind on machines that had never run
+// standup. An existing file is opened for append; otherwise the parent
+// directory is probed with a temporary file that is removed again.
 func checkWritable(path string) error {
 	// The data dir is created lazily by the first add; doctor (the natural
 	// first command after install) must not fail on a fresh install.
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if _, err := os.Stat(path); err == nil {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return err
+		}
+		return f.Close()
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	probe, err := os.CreateTemp(dir, ".standup-doctor-*")
 	if err != nil {
 		return err
 	}
-	return f.Close()
+	if err := probe.Close(); err != nil {
+		return errors.Join(err, os.Remove(probe.Name()))
+	}
+	return os.Remove(probe.Name())
 }
 
 // reachable reports whether the endpoint answers at all (any HTTP status).

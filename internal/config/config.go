@@ -37,6 +37,7 @@ type Config struct {
 	SyncPassword                string
 	ObsidianVault               string
 	ObsidianNote                string
+	DoctorInstructions          string
 	EditorInstructions          string
 	ReporterInstructions        string
 	SpeakerInstructions         string
@@ -182,36 +183,64 @@ func ProviderEnv(provider string) ([]string, error) {
 	}
 }
 
-func setYAMLValue(doc *yaml.Node, key, value string) error {
-	tags := map[string]string{
-		"meeting_time": "!!str", "data_file": "!!str", "offline": "!!bool",
-		"model_call_timeout": "!!str",
-		"provider":           "!!str",
-		"language":           "!!str", "timezone": "!!str", "smtp_host": "!!str",
-		"smtp_port": "!!int", "smtp_user": "!!str", "mail_from": "!!str",
-		"obsidian.vault": "!!str", "obsidian.note": "!!str",
-	}
-	tag, ok := tags[key]
-	if !ok {
-		return fmt.Errorf("unknown config key %q", key)
-	}
+// settingTags is the writable application config surface and each key's YAML
+// type.
+var settingTags = map[string]string{
+	"meeting_time": "!!str", "data_file": "!!str", "offline": "!!bool",
+	"model_call_timeout": "!!str",
+	"provider":           "!!str",
+	"language":           "!!str", "timezone": "!!str", "smtp_host": "!!str",
+	"smtp_port": "!!int", "smtp_user": "!!str", "mail_from": "!!str",
+	"obsidian.vault": "!!str", "obsidian.note": "!!str",
+}
+
+// validSetting checks a value against its key and returns the normalized
+// form. Values that break every later command are rejected here: a bad
+// timezone or meeting time left the tool unusable with nothing pointing back
+// at the command that set it.
+func validSetting(key, tag, value string) (string, error) {
 	switch tag {
 	case "!!bool":
 		parsed, err := strconv.ParseBool(value)
 		if err != nil {
-			return fmt.Errorf("%s must be a boolean: %w", key, err)
+			return "", fmt.Errorf("%s must be a boolean: %w", key, err)
 		}
-		value = strconv.FormatBool(parsed)
+		return strconv.FormatBool(parsed), nil
 	case "!!int":
 		if _, err := strconv.Atoi(value); err != nil {
-			return fmt.Errorf("%s must be an integer: %w", key, err)
+			return "", fmt.Errorf("%s must be an integer: %w", key, err)
 		}
+		return value, nil
 	}
-	if key == "model_call_timeout" {
+	switch key {
+	case "model_call_timeout":
 		d, err := time.ParseDuration(value)
 		if err != nil || d <= 0 {
-			return fmt.Errorf("model_call_timeout must be a positive duration")
+			return "", errors.New("model_call_timeout must be a positive duration")
 		}
+	case "timezone":
+		if value == "" {
+			return value, nil
+		}
+		if _, err := time.LoadLocation(value); err != nil {
+			return "", fmt.Errorf("timezone must be an IANA name such as America/Asuncion: %w", err)
+		}
+	case "meeting_time":
+		if _, err := time.Parse("15:04", value); err != nil {
+			return "", fmt.Errorf("meeting_time must be a 24-hour HH:MM time (got %q)", value)
+		}
+	}
+	return value, nil
+}
+
+func setYAMLValue(doc *yaml.Node, key, value string) error {
+	tag, ok := settingTags[key]
+	if !ok {
+		return fmt.Errorf("unknown config key %q", key)
+	}
+	value, err := validSetting(key, tag, value)
+	if err != nil {
+		return err
 	}
 	if len(doc.Content) == 0 {
 		doc.Content = append(doc.Content, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"})
@@ -299,10 +328,12 @@ func setEnv(key, value string) (string, error) {
 	return path, nil
 }
 
-// Init writes the embedded default config files into the user config dir,
-// never overwriting existing files, and returns the directory path.
+// Init writes the embedded default config files into the active config
+// directory, never overwriting existing files, and returns the directory
+// path. It resolves the directory exactly like `config set` and `config
+// edit`: files written anywhere else would never be read back.
 func Init() (string, error) {
-	dir, err := UserDir()
+	dir, err := writeDir()
 	if err != nil {
 		return "", err
 	}
@@ -431,6 +462,7 @@ func loadAgentConfig(cfg *Config, a *viper.Viper) error {
 		key string
 		dst *string
 	}{
+		{"doctor_instructions", &cfg.DoctorInstructions},
 		{"editor_instructions", &cfg.EditorInstructions},
 		{"reporter_instructions", &cfg.ReporterInstructions},
 		{"generate_input_template", &cfg.GenerateInputTemplate},
@@ -443,7 +475,9 @@ func loadAgentConfig(cfg *Config, a *viper.Viper) error {
 		{"planner_fallback_instructions", &cfg.PlannerFallbackInstructions},
 	} {
 		s := strings.TrimRight(a.GetString(in.key), " \t\r\n")
-		if s == "" && in.key == "planner_fallback_instructions" {
+		// Keys added after a user wrote their agent.yaml fall back to the
+		// embedded prompt: a new agent must not break an existing install.
+		if s == "" && (in.key == "planner_fallback_instructions" || in.key == "doctor_instructions") {
 			s = strings.TrimRight(embeddedAgent.GetString(in.key), " \t\r\n")
 		}
 		if s == "" && plannerKeys[in.key] && !plannerConfigured {

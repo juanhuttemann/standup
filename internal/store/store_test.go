@@ -747,3 +747,80 @@ func TestDeleteTwiceReportsUnknown(t *testing.T) {
 	require.NoError(t, s.Delete("gone-id"))
 	assert.ErrorContains(t, s.Delete("gone-id"), "unknown id")
 }
+
+// Overlapping invocations are the norm (an agent driving the CLI, a CI job, a
+// shell loop), and every write rewrites the whole JSONL: without a
+// cross-process lock the last writer wins and the others' tasks vanish behind
+// a success exit code. A Store per goroutine stands in for a process each: the
+// in-process mutex never covers them.
+func TestConcurrentStoresDoNotLoseWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.jsonl")
+	const writers = 12
+	var wg sync.WaitGroup
+	errs := make(chan error, writers)
+	for i := range writers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			if _, err := s.Add(fmt.Sprintf("task %d", i)); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	s, err := Open(path)
+	require.NoError(t, err)
+	tasks, err := s.List()
+	require.NoError(t, err)
+	assert.Len(t, tasks, writers)
+}
+
+// A status change racing an add must not be swallowed: both writers reported
+// success, so both changes have to be in the file.
+func TestConcurrentStoresDoNotLoseUpdates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tasks.jsonl")
+	seed, err := Open(path)
+	require.NoError(t, err)
+	base, err := seed.Add("base")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 2)
+	for _, write := range []func(*Store) error{
+		func(s *Store) error { _, err := s.SetStatus(base.ID, "done"); return err },
+		func(s *Store) error { _, err := s.Add("racer"); return err },
+	} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s, err := Open(path)
+			if err != nil {
+				errs <- err
+				return
+			}
+			errs <- write(s)
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+	s, err := Open(path)
+	require.NoError(t, err)
+	tasks, err := s.List()
+	require.NoError(t, err)
+	require.Len(t, tasks, 2)
+	got, err := s.FindByPrefix(base.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "done", got.Status)
+}

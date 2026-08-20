@@ -74,6 +74,7 @@ func TestParseLogUsesNULFields(t *testing.T) {
 		strings.Repeat("b", 40),
 		"2026-08-14T10:00:00+02:00",
 		meEmail,
+		"Someone",
 		"subject\n\n" + adversarial,
 		"",
 	}, "\x00")
@@ -86,7 +87,7 @@ func TestParseLogUsesNULFields(t *testing.T) {
 
 func TestParseLogAcceptsSHA256ObjectIDs(t *testing.T) {
 	hash := strings.Repeat("c", 64)
-	out := strings.Join([]string{hash, "2026-08-14T10:00:00Z", meEmail, "subject", ""}, "\x00")
+	out := strings.Join([]string{hash, "2026-08-14T10:00:00Z", meEmail, "Someone", "subject", ""}, "\x00")
 
 	entries, err := parseLog(out)
 	require.NoError(t, err)
@@ -127,6 +128,7 @@ func TestLogAllIncludesTeammates(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, all, 2, "LogAll collects every author")
 	assert.Equal(t, "teammate@example.com", all[1].Author)
+	assert.Equal(t, "Someone", all[1].Name, "commits carry the author display name for team headings")
 }
 
 func TestLogResolvesBranchNames(t *testing.T) {

@@ -15,9 +15,10 @@ AI-assisted standups from rough notes, tasks, and Git history.
 
 Write what you worked on in your own words. `standup` turns it into clean task
 entries, lets you manage them with one natural-language request, and rephrases
-the result into a consistent daily update. Task state, report structure, time
-windows, and writes stay deterministic. Work on more than one machine?
-[Sync](#sync-across-machines) keeps them on one task list.
+the result into a daily update with a consistent structure. Task state,
+statuses, report layout, time windows, and writes stay deterministic — the
+wording is the model's, everything else is the binary's. Work on more than
+one machine? [Sync](#sync-across-machines) keeps them on one task list.
 
 ![demo](demo.gif)
 
@@ -57,6 +58,9 @@ standup config set ANTHROPIC_MODEL your-model
 export ANTHROPIC_API_KEY=your-api-key  # or add it to the active config directory's .env
 standup doctor
 ```
+
+`doctor` finishes with a real one-word model call, so a dead key or a model
+name that does not exist is reported now instead of on your next command.
 
 Then capture work naturally and generate the report:
 
@@ -115,7 +119,11 @@ local JSONL file in either mode.
 - Turns the rendered report into a spoken brief, with optional WAV synthesis.
 
 AI is an enhancement, not the source of truth: models read and phrase; Go owns
-task IDs, statuses, ordering, time math, storage, and report formatting.
+task IDs, statuses, ordering, time math, storage, and report formatting. What
+the model returns is checked before it is used: an entry count that does not
+match the tasks, an invented `#tag`, or a spoken brief that names a day the
+report does not — all fall back to the deterministic text, and `generate` says
+so on stderr when it happens.
 
 ## Command guide
 
@@ -140,6 +148,7 @@ standup status <id> in-progress     # set status: todo, in-progress, blocked, do
 standup edit <id> "fixed text"      # no argument opens $EDITOR (fallback vi, notepad on Windows)
 standup rm --force <id>             # delete after verifying the target shown without --force
 standup -p "add this today and mark yesterday done"  # apply mixed CRUD atomically
+standup -p "delete the old tasks" --yes  # approve a plan that deletes, unattended
 standup -p "add this today" --verbose  # show coordinator → specialist tool calls
 printf '%s\n' "delete the obsolete task" | standup -p -  # read the prompt from stdin
 
@@ -151,7 +160,7 @@ standup speak                       # print a spoken brief (no speech synthesis)
 standup speak -o standup.wav        # synthesize via a chat-completions audio-output model
 standup sync                        # merge tasks with your PocketBase server (see Sync)
 
-standup doctor                      # check the setup: data file, git identity, endpoint
+standup doctor                      # check the setup: data file, git identity, live model call
 standup init                        # write default config files for editing
 standup config set KEY VALUE        # set an app or provider value
 standup config edit                 # open the active config.yaml
@@ -164,10 +173,19 @@ standup version                     # print the version with context
 
 ### Tasks and reports
 
-- Statuses are `todo`, `in-progress`, `blocked`, and `done`.
+- Statuses are `todo`, `in-progress`, `blocked`, and `done`. The binary picks
+  one from the task's own text — impediment wording ("blocked on", "waiting
+  on", "stuck on") is `blocked`, past-tense work ("fixed", "reviewed",
+  "wrote") is `done`, anything else is `todo`. The rules are English-only;
+  `standup status <id>` overrides any of them.
 - Commands that change a task print the updated row.
 - `-p` delegates interpretation to CRUD specialists, validates their complete
-  plan, and applies it in one write; missing or ambiguous targets change nothing.
+  plan, and applies it in one write; missing or ambiguous targets change
+  nothing. A plan that deletes anything is previewed and confirmed first —
+  pass `--yes` to approve it unattended.
+- A whole `-p` run is bounded by five times `model_call_timeout`.
+- Overlapping commands are safe: writers take a lock file beside the store,
+  so a `commits` and an `add` running at once cannot lose each other's tasks.
 - Online commands preflight endpoint connectivity for two seconds before the
   first model call, so stale local endpoints fail quickly.
 - Agent coordination can require several model round trips. Increase
@@ -177,6 +195,10 @@ standup version                     # print the version with context
 - Unfinished tasks from yesterday carry over into Today.
 - Blocked tasks appear under `## Blockers` until resolved.
 - Tags are `#word` tokens in task text.
+- Report bullets show a task's first line; `list` rows are truncated to keep
+  the columns readable. The store always keeps the full text.
+- `meeting_time` bounds today's section at the meeting; once it has passed,
+  the section runs to now.
 
 ### Importing commits
 
@@ -191,8 +213,10 @@ commits, and skips commits already imported.
 - Add `--branch` to show branch attribution as `[branch]` in lists and reports.
 
 For a team report, run `standup commits --all-authors`, followed by
-`standup generate --team`. The report gets one section per author while the
-underlying store remains a single personal file.
+`standup generate --team`. The report gets one `##` section per author — named
+after the commit author, with your own git user name over your own block — and
+the day headings nest under it. The underlying store remains a single personal
+file.
 
 ### Obsidian
 
@@ -282,9 +306,9 @@ use that directory's `.env`, never YAML. The active directory is
 config directory (`~/.config/standup`, or `%APPDATA%\standup` on Windows).
 
 You can also run `standup init` to write `config.yaml` and `agent.yaml` without
-replacing existing files. Resolution order per file is
-`$STANDUP_CONFIG_DIR` → `./config` → the user config directory → embedded
-defaults. `STANDUP_*` environment variables override `.env`, which overrides
+replacing existing files, in that same active directory. Resolution order per
+file is `$STANDUP_CONFIG_DIR` → `./config` → the user config directory →
+embedded defaults. `STANDUP_*` environment variables override `.env`, which overrides
 YAML.
 
 Online mode needs `OPENAI_BASE_URL` and `OPENAI_MODEL` in the environment or a
@@ -319,11 +343,16 @@ follow it. Empty uses the machine's local zone.
 ## Deterministic reports
 
 The report layout (sections, `[status]`, times) is always rendered by the
-binary; a model only rephrases the task texts. If the model is unreachable
-or answers off-contract, `generate` falls back to the verbatim texts — same
-layout, zero network dependency for the format. Missing provider env,
-however, is a configuration error and fails fast with a hint — set
-`offline: true` for the credential-free render.
+binary; a model only rephrases the task texts. Consistency is a promise about
+structure, not wording: the same tasks always produce the same sections, order
+and timestamps, while the phrasing varies between runs.
+
+If the model is unreachable or answers off-contract, `generate` falls back to
+the verbatim texts — same layout, zero network dependency for the format — and
+prints a one-line note on stderr naming the reason, so a verbatim report is
+never mistaken for a written one. Missing provider env, however, is a
+configuration error and fails fast with a hint — set `offline: true` for the
+credential-free render.
 
 ## Offline mode
 

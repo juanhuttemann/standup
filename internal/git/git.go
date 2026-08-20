@@ -19,6 +19,7 @@ type Commit struct {
 	Subject string
 	Body    string // full commit message, trailer block stripped
 	Author  string // author email
+	Name    string // author display name (%an)
 	Branch  string // nearest branch name (name~N for ancestors), best-effort
 	When    time.Time
 }
@@ -26,7 +27,22 @@ type Commit struct {
 var (
 	errNotARepo = errors.New("git: not inside a git working tree — run inside a repository")
 	errNoEmail  = errors.New("git: user.email is not configured — set it with:\n  git config --global user.email you@example.com")
+	errNoName   = errors.New("git: user.name is not configured — set it with:\n  git config --global user.name \"Your Name\"")
 )
+
+// Name returns the configured git user name for dir (the name a team report
+// shows for the person running it).
+func Name(dir string) (string, error) {
+	name, err := run(dir, "config", "user.name")
+	if err != nil {
+		return "", errNoName
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", errNoName
+	}
+	return name, nil
+}
 
 // Identity returns the configured git user email for dir.
 func Identity(dir string) (string, error) {
@@ -69,7 +85,7 @@ func logCommits(dir string, since time.Time, allAuthors bool) ([]Commit, error) 
 	}
 	out, err := run(dir, "log", "--no-merges",
 		"--since="+since.Format(time.RFC3339),
-		"--pretty=format:%H%x00%aI%x00%ae%x00%B%x00")
+		"--pretty=format:%H%x00%aI%x00%ae%x00%an%x00%B%x00")
 	if err != nil {
 		return nil, err
 	}
@@ -87,7 +103,7 @@ func logCommits(dir string, since time.Time, allAuthors bool) ([]Commit, error) 
 			return nil, fmt.Errorf("git: commit time %q: %w", e.when, err)
 		}
 		subject, body := cleanMessage(e.raw)
-		commits = append(commits, Commit{Hash: e.hash, Subject: subject, Body: body, Author: e.author, When: ts})
+		commits = append(commits, Commit{Hash: e.hash, Subject: subject, Body: body, Author: e.author, Name: e.name, When: ts})
 	}
 	slices.Reverse(commits)
 	names := nameRev(dir, commits)
@@ -124,7 +140,7 @@ func nameRev(dir string, commits []Commit) map[string]string {
 
 // entry is one raw log record.
 type entry struct {
-	hash, when, author, raw string
+	hash, when, author, name, raw string
 }
 
 // parseLog splits NUL-delimited fields. Git commit messages cannot contain
@@ -137,16 +153,17 @@ func parseLog(out string) ([]entry, error) {
 	if fields[len(fields)-1] == "" {
 		fields = fields[:len(fields)-1]
 	}
-	if len(fields)%4 != 0 {
+	const perCommit = 5 // hash, author date, author email, author name, message
+	if len(fields)%perCommit != 0 {
 		return nil, fmt.Errorf("git: malformed log output: got %d fields", len(fields))
 	}
-	entries := make([]entry, 0, len(fields)/4)
-	for i := 0; i < len(fields); i += 4 {
+	entries := make([]entry, 0, len(fields)/perCommit)
+	for i := 0; i < len(fields); i += perCommit {
 		hash := strings.TrimLeft(fields[i], "\r\n")
 		if !isObjectID(hash) {
 			return nil, fmt.Errorf("git: malformed object id %q", hash)
 		}
-		entries = append(entries, entry{hash: hash, when: fields[i+1], author: fields[i+2], raw: fields[i+3]})
+		entries = append(entries, entry{hash: hash, when: fields[i+1], author: fields[i+2], name: fields[i+3], raw: fields[i+4]})
 	}
 	return entries, nil
 }

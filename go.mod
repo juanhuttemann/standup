@@ -4,6 +4,7 @@ go 1.26.5
 
 require (
 	github.com/anthropics/anthropic-sdk-go v1.62.0
+	github.com/gofrs/flock v0.13.0
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
 	github.com/manifoldco/promptui v0.9.0

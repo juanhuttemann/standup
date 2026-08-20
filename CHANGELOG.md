@@ -5,6 +5,111 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `standup -p --yes` (`-y`) approves a plan that deletes tasks without a
+  confirmation prompt, for unattended runs.
+
+### Changed
+
+- `add` no longer lets the model choose a task's status. The model invented
+  `blocked` for routine work ("triaged the flaky CI job"), and an invented
+  blocker is reported to the whole team; past-tense work never landed on
+  `done`. Statuses are now derived from the task text in Go, the same way on
+  every path (model, `--raw`, offline): explicit impediment wording
+  ("blocked on", "waiting on", "stuck on") is `blocked`, work described in
+  the past tense ("fixed", "reviewed", "wrote") is `done`, everything else
+  is `todo`. The rules are English-only by design — anything else lands on
+  `todo`, one `standup status <id>` away.
+
+### Fixed
+
+- `doctor` no longer passes a setup that cannot work. It checked that the
+  provider variables were present and that the host answered, so it reported
+  all-green for a dead API key or a model that does not exist and the next
+  command failed. It now finishes with a real model call (a one-word probe,
+  prompt in `agent.yaml` like every other agent) and reports `fail model
+  answers` with the reason.
+- Failed model calls name the setting they are actually about: a rejected
+  key points at `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` and a rejected model at
+  `OPENAI_MODEL`/`ANTHROPIC_MODEL`, instead of blaming the base URL and the
+  network for every failure.
+- `standup init` writes into the active config directory, resolved exactly
+  like `config set` and `config edit`. With `$STANDUP_CONFIG_DIR` set it
+  created files in the home directory that nothing would read, and the
+  follow-up `config edit` opened a different file.
+- `config set` refuses values that would break every later command:
+  `timezone` must be an IANA name and `meeting_time` a 24-hour `HH:MM`, both
+  validated with the same parsers the report uses. They used to be accepted
+  and then failed on every `list` and `generate` with nothing pointing back
+  at the command that set them.
+- `standup -p` has a wall-clock budget (five times `model_call_timeout`, one
+  per coordinator or specialist call) instead of running unbounded, and no
+  longer reports no-op transitions (`blocked -> blocked`) as changes; a plan
+  that changes nothing says "no changes". Its failure messages are clipped at
+  a word boundary, so the part naming what could have matched survives.
+- `doctor` no longer creates the data file it is checking. A read-only
+  diagnostic left an empty `tasks.jsonl` behind on a machine that had never
+  run standup; it now probes the parent directory and cleans up after itself.
+- `list --days 0` is rejected like `--days -5` instead of being silently
+  reinterpreted as today, `standup commits 1o` says the argument is neither a
+  day count nor a directory, and internal package names (`store:`, `agent:`,
+  `report:`) no longer prefix user-facing errors.
+- `skill install` warns when it replaces an edited `SKILL.md` instead of
+  overwriting it silently.
+- `generate --team` produces a readable structure. Every block now carries a
+  heading (the person running the report had none, so a reader could not tell
+  whose the first one was), headings show the commit author's name instead of
+  their email address, and the day headings nest under the author instead of
+  sitting beside them.
+- `speak` can no longer move work to a day the report does not name. A brief
+  claimed yesterday for work done today — a factual error about the user's own
+  work, spoken aloud in a meeting. Day words in the brief are now checked
+  against the report's headings, and an ungrounded brief falls back to the
+  deterministic script, which reads less like a template (one time anchor per
+  section instead of one per item).
+- `generate` says when it fell back to verbatim task text. The rephrase
+  fallback fires exactly when the input is large and messy — when raw text is
+  least usable — and it was silent, so a raw commit dump shipped to the team
+  looked like the model wrote it. A one-line note on stderr now names the
+  reason ("12 entries for 39 tasks", "no JSON entries in the reply", the call
+  error). Offline mode says nothing: nothing was going to phrase it.
+- Reports and list rows no longer carry whole commit bodies. `commits` still
+  stores the full message, but report bullets keep the subject line (the
+  committed templates gained a `subject` helper next to `fold`) and list rows
+  are bounded, so one 1700-character task stops destroying the layout. The
+  reporter is asked to rephrase the subject lines too, which is what made the
+  contract fail on a store built from imported commits.
+- Neither the editor nor the rephraser can invent `#tags`. `#word` is the
+  app's own tag syntax (`list --tag`), so a minted tag showed a tag the task
+  does not carry; an invented one now keeps its word and loses the `#`, on
+  the stored text as well as the report. A list marker echoed back by the rephraser is
+  stripped too, instead of rendering as `- [done] - fixed the bug` and
+  travelling on into the spoken brief.
+- `generate --clip` no longer hangs. On Wayland `wl-copy` keeps the clipboard
+  alive in a forked child that inherited the command's output pipes, so the
+  report was copied and the process then waited forever, printing nothing.
+  The clipboard helper no longer gets those pipes, and the report is printed
+  as usual.
+- `generate -o <file>` echoes the path it wrote. A minute of model calls
+  ended in complete silence, unlike every other mutating command.
+- Delivery failures (`--webhook`, `--mail`, `--clip`) are reported once, as
+  the command's error, instead of the same fact on stdout and stderr. `--mail`
+  also checks `smtp_host` before generating the report rather than after.
+- Deleting tasks now asks first on every path. `standup -p "delete all of my
+  tasks"` wiped the whole store with no confirmation and no undo, while `rm`
+  refused a single task without `--force`: a plan that deletes anything is
+  now previewed line by line and confirmed on a terminal, or refused with a
+  pointer to the new `--yes` flag when nothing can be asked. The interactive
+  list confirms a delete too, and gained the missing `todo` action so a
+  mis-click on `blocked` no longer has to be undone from the command line.
+- Concurrent invocations no longer lose tasks and status changes. Every
+  mutation is a read-modify-write of the whole JSONL, so overlapping
+  commands (an agent driving the CLI, a CI job, a shell loop) clobbered
+  each other and still exited 0. Writers now serialize on a lock file
+  beside the store; a writer that cannot get the lock within 10 seconds
+  fails by name instead of hanging. Reads are unaffected.
+
 ## [0.15.0] - 2026-08-19
 
 ### Added

@@ -292,3 +292,27 @@ func headings(sec Section) []string {
 	}
 	return out
 }
+
+// The cutoff bounds today's section at the meeting, then at now once the
+// meeting has passed. Running late in the day therefore looks identical for
+// every meeting_time — by design, not because the setting is dead.
+func TestMeetingTimeOnlyBitesBeforeTheMeeting(t *testing.T) {
+	late := d(23, 54, 0)
+	lateTask := task(d(23, 54, 0), "todo")
+	for _, meeting := range []string{"00:01", "09:30", "23:00", "23:59"} {
+		sec, err := Build([]store.Task{lateTask}, late, meeting, Trailing(late, 1))
+		require.NoError(t, err, meeting)
+		assert.Equal(t, []string{lateTask.ID}, ids(sec.Days[0].Tasks),
+			"after the meeting the day is reported up to now (meeting_time=%s)", meeting)
+	}
+
+	early := d(8, 0, 0)
+	afterMeeting := task(d(9, 45, 0), "todo")
+	sec, err := Build([]store.Task{afterMeeting}, early, "09:30", Trailing(early, 1))
+	require.NoError(t, err)
+	assert.Empty(t, ids(sec.Days[0].Tasks), "work logged past the meeting waits for the next standup")
+
+	sec, err = Build([]store.Task{afterMeeting}, early, "23:59", Trailing(early, 1))
+	require.NoError(t, err)
+	assert.Equal(t, []string{afterMeeting.ID}, ids(sec.Days[0].Tasks), "a later meeting includes it")
+}
