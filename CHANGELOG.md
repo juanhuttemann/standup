@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-20
+
 ### Added
 
 - `standup -p --yes` (`-y`) approves a plan that deletes tasks without a
