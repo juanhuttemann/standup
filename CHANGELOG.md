@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-22
+
 ### Added
 
 - `standup login` sets a provider up interactively: pick one from a searchable
