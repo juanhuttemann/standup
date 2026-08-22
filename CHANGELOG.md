@@ -24,7 +24,11 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
   output always said. `--check` stays read-only.
 - The Windows CI job also covers `internal/obsidian` (its Windows file
   replacement went untested there) and sets `CGO_ENABLED` explicitly so
-  `-race` keeps working if a runner image ships without gcc.
+  `-race` keeps working if a runner image ships without gcc. The first run
+  of that job caught three harness assumptions that only hold on Linux —
+  test binaries are not locked like an installed running executable, `*` is
+  illegal in Windows filenames, and the vault path assertion missed the 8.3
+  short-name expansion `Publish` applies — all fixed in the tests.
 
 ## [0.18.1] - 2026-08-22
 

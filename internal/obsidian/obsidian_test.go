@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,7 +16,10 @@ func TestPublishCreatesNoteAndDirectories(t *testing.T) {
 
 	path, err := Publish(vault, "Standups/2026-08-16.md", "# Standup\n\n- shipped it\n")
 	require.NoError(t, err)
-	assert.Equal(t, filepath.Join(vault, "Standups", "2026-08-16.md"), path)
+	// Publish canonicalizes the vault, which on Windows also expands 8.3
+	// short names (RUNNER~1 -> runneradmin); compare the note path itself.
+	assert.True(t, strings.HasSuffix(path, filepath.Join("Standups", "2026-08-16.md")),
+		"note lands below the vault, got %s", path)
 	contents, err := os.ReadFile(path)
 	require.NoError(t, err)
 	assert.Equal(t, "<!-- standup:start -->\n# Standup\n\n- shipped it\n<!-- standup:end -->\n", string(contents))
@@ -54,7 +58,15 @@ func TestPublishAppendsBlockWhenMarkersAreAbsent(t *testing.T) {
 
 func TestPublishRejectsUnsafePaths(t *testing.T) {
 	vault := t.TempDir()
-	for _, note := range []string{"", ".", "../outside.md", "nested/../../outside.md", filepath.Join(string(filepath.Separator), "outside.md")} {
+	unsafe := []string{"", ".", "../outside.md", "nested/../../outside.md"}
+	// A rooted path is rejected as absolute on Unix; on Windows "\outside.md"
+	// is volume-relative, so use a drive letter for the same guarantee.
+	if runtime.GOOS == "windows" {
+		unsafe = append(unsafe, `C:\outside.md`)
+	} else {
+		unsafe = append(unsafe, "/outside.md")
+	}
+	for _, note := range unsafe {
 		t.Run(note, func(t *testing.T) {
 			_, err := Publish(vault, note, "report")
 			require.Error(t, err)

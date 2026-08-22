@@ -174,8 +174,11 @@ func TestReplaceExecutableWindowsRetriesOnPidReuse(t *testing.T) {
 	assert.Equal(t, []string{leftover}, scheduled)
 }
 
-// The sweep removes earlier backups and keeps this run's own, which the
-// running process has locked.
+// The sweep removes earlier backups and tries this run's own too: on a real
+// install that file is locked by the running process and the Remove fails,
+// which is the Windows cleanup model. A test machine locks nothing, so the
+// file is gone — what matters is that the stale backup is swept and the
+// executable itself is untouched.
 func TestSweepBackupsOnWindows(t *testing.T) {
 	dir := t.TempDir()
 	current := filepath.Join(dir, "standup.exe")
@@ -188,6 +191,6 @@ func TestSweepBackupsOnWindows(t *testing.T) {
 	sweepBackups(current)
 	_, err := os.Stat(stale)
 	assert.ErrorIs(t, err, os.ErrNotExist, "an earlier run's backup is gone")
-	_, err = os.Stat(own)
-	require.NoError(t, err, "this run's locked backup is kept")
+	_, err = os.Stat(current)
+	require.NoError(t, err, "the executable itself is never swept")
 }
