@@ -225,16 +225,18 @@ func NormalizeBaseURL(raw string) (string, bool) {
 // base URL then only fails on the next command.
 var apiPaths = []string{"/chat/completions", "/completions", "/embeddings", "/responses", "/models"}
 
-// Shadowed reports the settings a selection cannot actually take effect for:
-// a variable already exported in the shell, or loaded from a .env nearer the
+// ShadowedFor reports the provider settings that cannot take effect: a
+// variable already exported in the shell, or loaded from a .env nearer the
 // cwd, wins over the file SaveProvider writes, because godotenv never
-// overrides an already-set variable. Without this a login that verified fine
-// is silently ignored by the very next command.
-func Shadowed(sel ProviderSelection) []string {
+// overrides an already-set variable. Any value at all wins, whatever login is
+// later asked to write, so the question is answerable — and worth asking —
+// before anything has been picked.
+func ShadowedFor(provider string) []string {
+	prefix := envPrefix(provider)
 	var shadowed []string
-	for _, pair := range providerPairs(sel) {
-		if existing := os.Getenv(pair[0]); existing != "" && existing != pair[1] {
-			shadowed = append(shadowed, pair[0])
+	for _, suffix := range []string{"_BASE_URL", "_MODEL", "_API_KEY"} {
+		if os.Getenv(prefix+suffix) != "" {
+			shadowed = append(shadowed, prefix+suffix)
 		}
 	}
 	return shadowed

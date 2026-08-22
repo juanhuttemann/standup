@@ -111,8 +111,8 @@ func swap[T any](t *testing.T, target *T, replacement T) {
 func compatible() []catalog.Provider {
 	return []catalog.Provider{{
 		Name: "Compatible", ID: "compatible", Adapter: "openai",
-		BaseURL: "https://compatible.example.test/v1",
-		Models:  []catalog.Model{{ID: "big", Name: "Big"}, {ID: "small", Name: "Small"}},
+		BaseURL: "https://compatible.example.test/v1", NeedsKey: true,
+		Models: []catalog.Model{{ID: "big", Name: "Big"}, {ID: "small", Name: "Small"}},
 	}}
 }
 
@@ -171,12 +171,39 @@ func TestLoginAsksForABaseURLWhenTheCatalogHasNone(t *testing.T) {
 }
 
 func TestLoginKeepsAnEmptyKeyOutOfTheEnvFile(t *testing.T) {
-	script := &scriptedUI{answers: []string{"Compatible", "", "Big (big)"}, abortAt: -1}
+	script := &scriptedUI{answers: []string{customEndpointItem, "http://localhost:11434/v1", "", "served"}, abortAt: -1}
 	root, _, dir := loginHarness(t, script, compatible())
+	swap(t, &endpointModels, func(context.Context, string, string) ([]catalog.Model, error) {
+		return []catalog.Model{{ID: "served", Name: "served"}}, nil
+	})
 
 	root.SetArgs([]string{"login"})
 	require.NoError(t, root.Execute())
 	assert.NotContains(t, env(t, dir), "OPENAI_API_KEY", "a local endpoint needs no key")
+}
+
+// A hosted provider that names a key variable must not accept an empty key:
+// it buys a 401 at the end of a flow the user has already paid for.
+func TestLoginReAsksWhenAHostedProviderGetsNoKey(t *testing.T) {
+	script := &scriptedUI{answers: []string{"Compatible", "", "sk-real", "Big (big)"}, abortAt: -1}
+	root, _, dir := loginHarness(t, script, compatible())
+
+	root.SetArgs([]string{"login"})
+	require.NoError(t, root.Execute())
+	assert.Equal(t, []string{""}, script.rejected)
+	assert.Contains(t, env(t, dir), "OPENAI_API_KEY=sk-real")
+}
+
+func TestLoginAcceptsNoKeyForACatalogProviderThatNeedsNone(t *testing.T) {
+	providers := compatible()
+	providers[0].NeedsKey = false
+	script := &scriptedUI{answers: []string{"Compatible", "", "Big (big)"}, abortAt: -1}
+	root, _, dir := loginHarness(t, script, providers)
+
+	root.SetArgs([]string{"login"})
+	require.NoError(t, root.Execute())
+	assert.Empty(t, script.rejected, "the catalog says this one authenticates some other way")
+	assert.NotContains(t, env(t, dir), "OPENAI_API_KEY")
 }
 
 func TestLoginReAsksForAnAnthropicKey(t *testing.T) {
@@ -309,8 +336,21 @@ func TestLoginWarnsWhenTheEnvironmentOverridesWhatItWrote(t *testing.T) {
 
 	root.SetArgs([]string{"login"})
 	require.NoError(t, root.Execute())
-	assert.Contains(t, buf.String(), "note OPENAI_BASE_URL is set in your environment and wins over")
+	assert.Contains(t, buf.String(), "note OPENAI_BASE_URL is set in your environment and will win over anything login writes")
 	assert.Contains(t, buf.String(), "run: unset OPENAI_BASE_URL")
+}
+
+// The warning has to arrive before the key and model prompts: after them it
+// is a postmortem of work the user has already done for nothing.
+func TestLoginWarnsBeforeAskingForAnything(t *testing.T) {
+	script := &scriptedUI{answers: []string{"Compatible", "k", "Big (big)"}, abortAt: 1}
+	root, buf, _ := loginHarness(t, script, compatible())
+	t.Setenv("OPENAI_BASE_URL", "http://elsewhere.example.test/v1")
+
+	root.SetArgs([]string{"login"})
+	require.NoError(t, root.Execute(), "the user quit at the key prompt")
+	assert.Contains(t, buf.String(), "will win over anything login writes",
+		"the warning is already on screen when the key is asked for")
 }
 
 // Three shadowed variables are one problem, not three: a line each buried the

@@ -35,11 +35,12 @@ const (
 // Provider is a catwalk provider reduced to what login needs and already
 // mapped onto a standup adapter. Unsupported protocols never appear.
 type Provider struct {
-	Name    string
-	ID      string
-	Adapter string // "openai" or "anthropic"
-	BaseURL string // empty when catwalk carries a $VAR placeholder
-	Models  []Model
+	Name     string
+	ID       string
+	Adapter  string // "openai" or "anthropic"
+	BaseURL  string // empty when catwalk carries a $VAR placeholder
+	NeedsKey bool   // the catalog names a key variable for this provider
+	Models   []Model
 }
 
 // Model is one selectable model.
@@ -127,11 +128,12 @@ func supported(providers []catwalk.Provider) []Provider {
 			continue
 		}
 		out = append(out, Provider{
-			Name:    p.Name,
-			ID:      string(p.ID),
-			Adapter: adapter,
-			BaseURL: endpointOf(p),
-			Models:  models(p),
+			Name:     p.Name,
+			ID:       string(p.ID),
+			Adapter:  adapter,
+			BaseURL:  endpointOf(p),
+			NeedsKey: p.APIKey != "",
+			Models:   models(p),
 		})
 	}
 	return out
@@ -149,7 +151,9 @@ func adapterFor(t catwalk.Type) (string, bool) {
 
 // endpointOf blanks the placeholders catwalk carries for providers whose SDK
 // has a built-in default (for example "$OPENAI_API_ENDPOINT"). standup needs
-// a real base URL, so login asks for those.
+// a real base URL, so login asks for those. The APIKey field is the same kind
+// of placeholder and names someone else's variable, so only its presence is
+// kept (see NeedsKey); standup stores keys under its own names.
 func endpointOf(p catwalk.Provider) string {
 	if strings.HasPrefix(p.APIEndpoint, "$") {
 		return ""

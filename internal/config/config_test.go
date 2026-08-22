@@ -864,21 +864,21 @@ func TestSaveProviderTightensAnExistingEnvFile(t *testing.T) {
 	assert.Contains(t, string(b), "# hand written\nKEEP=me\n", "unrelated content survives")
 }
 
-func TestShadowedNamesEnvironmentValuesThatWinOverTheFile(t *testing.T) {
+func TestShadowedForNamesEnvironmentValuesThatWinOverTheFile(t *testing.T) {
 	isolateDirs(t)
-	sel := ProviderSelection{Provider: "openai", BaseURL: "https://api.example.test/v1", Model: "m", APIKey: "sk"}
-
-	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY"} {
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY"} {
 		t.Setenv(key, "")
 	}
-	assert.Empty(t, Shadowed(sel), "an unset environment shadows nothing")
+	assert.Empty(t, ShadowedFor("openai"), "an unset environment shadows nothing")
 
 	t.Setenv("OPENAI_BASE_URL", "http://elsewhere.example.test/v1")
-	assert.Equal(t, []string{"OPENAI_BASE_URL"}, Shadowed(sel))
-
-	t.Setenv("OPENAI_BASE_URL", sel.BaseURL)
-	assert.Empty(t, Shadowed(sel), "the same value is not a conflict")
+	assert.Equal(t, []string{"OPENAI_BASE_URL"}, ShadowedFor("openai"))
+	assert.Empty(t, ShadowedFor("anthropic"), "the other provider's variables are irrelevant")
 
 	t.Setenv("OPENAI_MODEL", "other-model")
-	assert.Equal(t, []string{"OPENAI_MODEL"}, Shadowed(sel))
+	t.Setenv("OPENAI_API_KEY", "other-key")
+	assert.Equal(t, []string{"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY"}, ShadowedFor("openai"))
+
+	t.Setenv("ANTHROPIC_API_KEY", "sk")
+	assert.Equal(t, []string{"ANTHROPIC_API_KEY"}, ShadowedFor("anthropic"))
 }

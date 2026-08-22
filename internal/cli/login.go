@@ -158,8 +158,10 @@ func loginChoose(cmd *cobra.Command, rep *reporter, providers []catalog.Provider
 		return config.ProviderSelection{}, err
 	}
 	if i == len(providers) {
+		warnShadowed(rep, "openai")
 		return loginCustom(cmd, rep)
 	}
+	warnShadowed(rep, providers[i].Adapter)
 	return loginCatalogProvider(cmd, rep, providers[i])
 }
 
@@ -168,7 +170,7 @@ func loginCustom(cmd *cobra.Command, rep *reporter) (config.ProviderSelection, e
 	if err != nil {
 		return config.ProviderSelection{}, err
 	}
-	key, err := loginKey("openai")
+	key, err := loginKey(false)
 	if err != nil {
 		return config.ProviderSelection{}, err
 	}
@@ -221,7 +223,7 @@ func loginCatalogProvider(cmd *cobra.Command, rep *reporter, p catalog.Provider)
 		}
 		base = typed
 	}
-	key, err := loginKey(p.Adapter)
+	key, err := loginKey(p.NeedsKey || p.Adapter == "anthropic")
 	if err != nil {
 		return config.ProviderSelection{}, err
 	}
@@ -232,18 +234,20 @@ func loginCatalogProvider(cmd *cobra.Command, rep *reporter, p catalog.Provider)
 	return config.ProviderSelection{Provider: p.Adapter, BaseURL: base, Model: model, APIKey: key}, nil
 }
 
-// loginKey requires a value only where the adapter does: an OpenAI-compatible
-// endpoint on localhost needs none, and demanding one would lock those out.
-func loginKey(adapter string) (string, error) {
-	if adapter == "anthropic" {
-		return loginSecret("API key", func(value string) error {
-			if value == "" {
-				return errors.New("the anthropic provider requires an API key")
-			}
-			return nil
-		})
+// loginKey insists on a key wherever one is known to be needed: the catalog
+// names the variable a hosted provider authenticates with, and an accepted
+// empty key is a 401 several prompts later. Only a self-hosted endpoint —
+// where the catalog has nothing to say — may go without one.
+func loginKey(required bool) (string, error) {
+	if !required {
+		return loginSecret("API key (leave empty for a local endpoint)", nil)
 	}
-	return loginSecret("API key (leave empty for a local endpoint)", nil)
+	return loginSecret("API key", func(value string) error {
+		if value == "" {
+			return errors.New("this provider requires an API key")
+		}
+		return nil
+	})
 }
 
 func loginModel(models []catalog.Model) (string, error) {
@@ -294,8 +298,21 @@ func nonEmptyModel(value string) error {
 // A failed check keeps the settings: the common failures (an unentitled
 // model, a rate limit, a flaky network) say nothing about what was typed, and
 // discarding a pasted key over one would be the worst possible answer.
+// warnShadowed speaks before the key and model prompts, not after: a
+// variable exported in the shell means this whole exercise will be ignored,
+// and learning that after pasting a key and hunting through a model list is
+// too late to be worth anything.
+func warnShadowed(rep *reporter, provider string) {
+	shadowed := config.ShadowedFor(provider)
+	if len(shadowed) == 0 {
+		return
+	}
+	rep.printf("note %s %s set in your environment and will win over anything login writes\n",
+		joinWords(shadowed), verb(len(shadowed), "is", "are"))
+	rep.printf("     run: unset %s\n", strings.Join(shadowed, " "))
+}
+
 func loginApply(cmd *cobra.Command, d Deps, rep *reporter, sel config.ProviderSelection) error {
-	shadowed := config.Shadowed(sel)
 	path, err := saveProvider(sel)
 	if err != nil {
 		return err
@@ -304,13 +321,6 @@ func loginApply(cmd *cobra.Command, d Deps, rep *reporter, sel config.ProviderSe
 	// to .env, and a user who cannot find what login wrote cannot fix it.
 	rep.printf("ok   provider %s in %s\n", sel.Provider, filepath.Join(filepath.Dir(path), "config.yaml"))
 	rep.printf("ok   endpoint and model in %s\n", path)
-	if len(shadowed) > 0 {
-		// One problem, one note: a line per variable repeated the same
-		// sentence three times and buried the one thing to do.
-		rep.printf("note %s %s set in your environment and %s over %s\n", joinWords(shadowed),
-			verb(len(shadowed), "is", "are"), verb(len(shadowed), "wins", "win"), path)
-		rep.printf("     run: unset %s\n", strings.Join(shadowed, " "))
-	}
 
 	cfg := d.Config
 	cfg.Provider = sel.Provider

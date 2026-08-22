@@ -20,8 +20,9 @@ func sample() []catwalk.Provider {
 	return []catwalk.Provider{
 		{
 			Name: "Compatible", ID: "compatible", Type: catwalk.TypeOpenAICompat,
-			APIEndpoint: "https://compatible.example.test/v1", DefaultLargeModelID: "big",
-			Models: []catwalk.Model{{ID: "small", Name: "Small"}, {ID: "big", Name: "Big"}},
+			APIEndpoint: "https://compatible.example.test/v1", APIKey: "$COMPATIBLE_API_KEY",
+			DefaultLargeModelID: "big",
+			Models:              []catwalk.Model{{ID: "small", Name: "Small"}, {ID: "big", Name: "Big"}},
 		},
 		{
 			Name: "Placeholder", ID: "placeholder", Type: catwalk.TypeOpenAI,
@@ -92,6 +93,17 @@ func TestLoadPutsTheProvidersDefaultModelFirst(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got.Providers[0].Models, 2)
 	assert.Equal(t, "big", got.Providers[0].Models[0].ID, "the provider's own recommendation leads")
+}
+
+// catwalk names the variable a provider authenticates with, or carries none
+// at all. That is the only signal for whether login must insist on a key, and
+// an accepted empty key means a 401 several prompts later.
+func TestLoadCarriesWhetherAProviderNeedsAKey(t *testing.T) {
+	srv := serve(t, sample())
+	got, err := Client{URL: srv.URL, Dir: t.TempDir()}.Load(context.Background())
+	require.NoError(t, err)
+	assert.True(t, got.Providers[0].NeedsKey, "a provider naming an API key variable needs one")
+	assert.False(t, got.Providers[3].NeedsKey, "one naming none does not")
 }
 
 func TestLoadBlanksAPlaceholderEndpoint(t *testing.T) {

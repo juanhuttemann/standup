@@ -25,13 +25,17 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
   the HTTP status implicates. An unentitled model or a rate limit says nothing
   about the key you just pasted, and making you paste it again would be the
   worst possible answer.
-- `login` warns when provider variables already exported in your environment
-  override the file it just wrote, which otherwise ends with a login that
-  verified fine being ignored by the very next command. It is one note naming
-  every shadowed variable, followed by the `unset` line to run — three
-  variables are one problem, and a line each buried the thing to do under
-  repetition. The summary names both homes it wrote to, because a user who
-  cannot find what `login` saved cannot correct it.
+- `login` warns as soon as you pick a provider if variables exported in your
+  environment will win over anything it writes, since that decides whether the
+  rest of the flow is worth doing at all. It is one note naming every shadowed
+  variable followed by the `unset` line to run: three variables are one
+  problem, and a line each buried the thing to do under repetition. The
+  summary names both homes it wrote to, because a user who cannot find what
+  `login` saved cannot correct it.
+- `login` insists on an API key for a provider the catalog says needs one, and
+  accepts an empty one only for a self-hosted endpoint, where the catalog has
+  nothing to say. It used to accept an empty key for any OpenAI-compatible
+  provider, which bought a 401 at the end of a flow already paid for.
 
 ### Fixed
 
