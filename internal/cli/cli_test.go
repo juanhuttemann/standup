@@ -755,7 +755,7 @@ func TestGenerateDaysArg(t *testing.T) {
 	root.SetArgs([]string{"generate", "3"})
 	require.NoError(t, root.Execute())
 	require.Len(t, assistant.genSec.Days, 3)
-	assert.Equal(t, []string{"Thu 2026-08-13", "Yesterday", "Today"},
+	assert.Equal(t, []string{"Thu 2026-08-13", "Fri 2026-08-14", "Sat 2026-08-15"},
 		[]string{assistant.genSec.Days[0].Heading, assistant.genSec.Days[1].Heading, assistant.genSec.Days[2].Heading})
 }
 
@@ -767,7 +767,8 @@ func TestGenerateDaysDefaultTwo(t *testing.T) {
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
 	require.Len(t, assistant.genSec.Days, 2)
-	assert.NotNil(t, assistant.genSec.Yesterday, "compat fields set for the default window")
+	assert.Equal(t, []string{"Yesterday", "Today"},
+		[]string{assistant.genSec.Days[0].Heading, assistant.genSec.Days[1].Heading})
 }
 
 func TestGenerateBadDaysArg(t *testing.T) {
@@ -790,7 +791,7 @@ func TestGenerateCarryOverInPrompt(t *testing.T) {
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
 	found := false
-	for _, tk := range assistant.genSec.Today {
+	for _, tk := range assistant.genSec.Days[1].Tasks() {
 		if tk.ID == unfinished.ID {
 			found = true
 		}
@@ -882,7 +883,6 @@ func TestGenerateFromToWindow(t *testing.T) {
 	assert.Equal(t, []string{"Thu 2026-08-13", "Fri 2026-08-14"},
 		[]string{assistant.genSec.Days[0].Heading, assistant.genSec.Days[1].Heading},
 		"explicit historical windows get dated headings, no cutoff")
-	assert.Nil(t, assistant.genSec.Yesterday)
 }
 
 func TestGenerateSingleExplicitDate(t *testing.T) {
@@ -928,7 +928,7 @@ func TestGenerateWeekendAwareDefault(t *testing.T) {
 	root.SetArgs([]string{"generate"})
 	require.NoError(t, root.Execute())
 	require.Len(t, assistant.genSec.Days, 2, "Friday + today")
-	assert.Equal(t, []string{"friday task"}, taskTextsOf(assistant.genSec.Yesterday))
+	assert.Equal(t, []string{"friday task"}, taskTextsOf(assistant.genSec.Days[0].Tasks()))
 }
 
 func taskTextsOf(ts []store.Task) []string {
@@ -1487,8 +1487,9 @@ func TestGenerateTeamGroupsByAuthor(t *testing.T) {
 	assert.NotContains(t, buf.String(), "\n## Today", "a day heading never sits beside an author heading")
 	for _, sec := range assistant.genSecs {
 		for _, day := range sec.Days {
-			for i := 1; i < len(day.Tasks); i++ {
-				assert.Equal(t, day.Tasks[0].Author, day.Tasks[i].Author, "every section is single-author")
+			tasks := day.Tasks()
+			for i := 1; i < len(tasks); i++ {
+				assert.Equal(t, tasks[0].Author, tasks[i].Author, "every section is single-author")
 			}
 		}
 	}
@@ -2033,12 +2034,15 @@ func (r *rawAss) Plan(ctx context.Context, prompt string, tasks []store.Task, no
 var _ agent.Assistant = (*rawAss)(nil)
 
 func TestColorReport(t *testing.T) {
-	in := "## Today\n- [todo] a (09:00)\n- [done] b (10:00)\n- [in-progress] c (11:00)\n- [blocked] d (12:00)\n"
-	on := colorReport(in, painter{on: true})
-	assert.Contains(t, on, "["+painter{on: true}.status("todo")+"]")
-	assert.Contains(t, on, "["+painter{on: true}.status("done")+"]")
-	assert.Contains(t, on, "["+painter{on: true}.status("in-progress")+"]")
-	assert.Contains(t, on, "["+painter{on: true}.status("blocked")+"]")
+	p := painter{on: true}
+	in := "## Today\n### Done\n- a (09:00)\n### In progress\n- b (10:00)\n### Next\n- c (11:00)\n## Blockers\n- d (12:00)\n"
+	on := colorReport(in, p)
+	assert.Contains(t, on, "### "+p.wrap(statusColor("done"), "Done"))
+	assert.Contains(t, on, "### "+p.wrap(statusColor("in-progress"), "In progress"))
+	assert.Contains(t, on, "### "+p.wrap(statusColor("todo"), "Next"))
+	assert.Contains(t, on, "## "+p.wrap(statusColor("blocked"), "Blockers"))
+	assert.Contains(t, on, "## Today", "a day heading is not a status")
+	assert.Contains(t, on, "- a (09:00)", "only the headings are painted")
 	assert.Equal(t, in, colorReport(in, painter{on: false}), "colors off: verbatim")
 }
 
@@ -2057,7 +2061,6 @@ func TestAddRawBypassesModel(t *testing.T) {
 	require.NoError(t, err)
 	raw, err := agent.Local(config.Config{
 		GenerateInputTemplate: "x",
-		DaysTemplate:          "x",
 	}, st)
 	require.NoError(t, err)
 	buf := &bytes.Buffer{}
@@ -2080,7 +2083,7 @@ func TestAddRawBypassesModel(t *testing.T) {
 func TestAddRawDashReadsCommandStdin(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
-	raw, err := agent.Local(config.Config{GenerateInputTemplate: "x", DaysTemplate: "x"}, st)
+	raw, err := agent.Local(config.Config{GenerateInputTemplate: "x"}, st)
 	require.NoError(t, err)
 	root := New(func() (Deps, error) { return Deps{Raw: raw, Store: st}, nil })
 	root.SetIn(strings.NewReader("first\n\nsecond"))
@@ -2098,7 +2101,6 @@ func TestAddWarnsOnExactDuplicateWithoutBlocking(t *testing.T) {
 	require.NoError(t, err)
 	raw, err := agent.Local(config.Config{
 		GenerateInputTemplate: "x",
-		DaysTemplate:          "x",
 	}, st)
 	require.NoError(t, err)
 	buf := &bytes.Buffer{}
@@ -2787,8 +2789,8 @@ func TestPromptGivesUpOnItsWallClockBudget(t *testing.T) {
 }
 
 func TestPromptBudgetIsAMultipleOfTheCallTimeout(t *testing.T) {
-	assert.Equal(t, 5*time.Minute, promptBudget(time.Minute))
-	assert.Equal(t, 5*time.Minute, promptBudget(0), "an unset timeout falls back to the default call bound")
+	assert.Equal(t, 6*time.Minute, promptBudget(time.Minute))
+	assert.Equal(t, 6*time.Minute, promptBudget(0), "an unset timeout falls back to the default call bound")
 }
 
 // The verbose plan reported `status <id> blocked -> blocked` as a change, and
@@ -2884,4 +2886,116 @@ func TestSkillInstallWarnsWhenReplacingAnEditedSkill(t *testing.T) {
 	buf.Reset()
 	require.NoError(t, root.Execute())
 	assert.NotContains(t, buf.String(), "warning", "reinstalling the embedded copy is not an edit")
+}
+
+// TestListAlignsColumns: the status column was unpadded, so every piped or
+// pasted listing came out ragged. The TUI path already aligned.
+func TestListAlignsColumns(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAssistant{})
+	st.Now = today(9, 0)
+	for _, text := range []string{"fixed the login redirect thing", "stuck waiting on devops", "write API docs"} {
+		_, err := st.Add(text)
+		require.NoError(t, err)
+	}
+	root.SetArgs([]string{"list", "--days", "1"})
+	require.NoError(t, root.Execute())
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	require.Len(t, lines, 3)
+	want := strings.Index(lines[0], "09:00")
+	for _, line := range lines {
+		assert.Equal(t, want, strings.Index(line, "09:00"), "every row starts its time column at the same offset: %q", line)
+	}
+}
+
+// TestListTruncatesAtAWordBoundary: commit-imported rows were cut mid-token.
+func TestListTruncatesAtAWordBoundary(t *testing.T) {
+	st, root, buf := newHarness(t, &fakeAssistant{})
+	st.Now = today(9, 0)
+	_, err := st.Add(strings.Repeat("refactoring ", 20) + "finished")
+	require.NoError(t, err)
+	root.SetArgs([]string{"list", "--days", "1"})
+	require.NoError(t, root.Execute())
+
+	out := strings.TrimRight(buf.String(), "\n")
+	require.Contains(t, out, "…")
+	shown := strings.TrimSuffix(out[strings.Index(out, "refactoring"):], "…")
+	assert.True(t, strings.HasSuffix(shown, "refactoring"), "the row ends on a whole word, got %q", shown)
+}
+
+// TestAddRawEchoesTheWholeTask: the echo exists to confirm what was stored,
+// and it was the one place truncation defeated the purpose.
+func TestAddRawEchoesTheWholeTask(t *testing.T) {
+	long := "ugh spent like 4 hrs today just banging my head against that stupid caching thing in the checkout flow, turns out redis was evicting keys cuz maxmemory was set way too low, anyway fixed it i think #checkout"
+	_, root, buf := newHarness(t, &fakeAssistant{addResult: []store.Task{{ID: "x", Text: long, Status: "done"}}})
+	root.SetArgs([]string{"add", "--raw", long})
+	require.NoError(t, root.Execute())
+	assert.Contains(t, buf.String(), long)
+	assert.NotContains(t, buf.String(), "…")
+}
+
+// TestAmbiguousIDListsTheCandidates: printing the rows turns a retry into a
+// copy-paste.
+func TestAmbiguousIDListsTheCandidates(t *testing.T) {
+	st, root, _ := newHarness(t, &fakeAssistant{})
+	st.Now = today(9, 0)
+	var ids []string
+	for _, text := range []string{"first task", "second task"} {
+		task, err := st.Add(text)
+		require.NoError(t, err)
+		ids = append(ids, task.ID)
+	}
+	// Force a shared prefix by rewriting the store's ids.
+	require.NoError(t, retagIDs(st, ids, []string{"aaaa1111-0000-0000-0000-000000000001", "aaaa2222-0000-0000-0000-000000000002"}))
+
+	root.SetArgs([]string{"done", "aaaa"})
+	err := root.Execute()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `ambiguous id "aaaa"`)
+	assert.Contains(t, err.Error(), "first task", "the candidate rows are the answer to the question")
+	assert.Contains(t, err.Error(), "second task")
+	assert.Contains(t, err.Error(), "aaaa1111")
+}
+
+// retagIDs rewrites the store's ids in place so a test can force a shared
+// prefix; uuids never collide on their own.
+func retagIDs(st *store.Store, from, to []string) error {
+	b, err := os.ReadFile(st.Path)
+	if err != nil {
+		return err
+	}
+	out := string(b)
+	for i := range from {
+		out = strings.ReplaceAll(out, from[i], to[i])
+	}
+	return os.WriteFile(st.Path, []byte(out), 0o644)
+}
+
+// TestAddWithoutAProviderStillCaptures: on a clean install the first command
+// anyone types was `add`, and it exited 1 with nothing stored.
+func TestAddWithoutAProviderStillCaptures(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
+	require.NoError(t, err)
+	raw, err := agent.Local(config.Config{GenerateInputTemplate: "x"}, st)
+	require.NoError(t, err)
+	buf := &bytes.Buffer{}
+	root := New(func() (Deps, error) {
+		return Deps{
+			Assistant: func() (agent.Assistant, error) {
+				return nil, &agent.ProviderUnconfiguredError{Missing: []string{"OPENAI_BASE_URL", "OPENAI_MODEL"}}
+			},
+			Raw: raw, Store: st, Config: config.Config{MeetingTime: "09:30"},
+		}, nil
+	})
+	root.SetOut(buf)
+	root.SetErr(buf)
+	root.SetArgs([]string{"add", "fixed a bug"})
+	require.NoError(t, root.Execute(), "the note is captured, not dropped")
+
+	stored, err := st.List()
+	require.NoError(t, err)
+	require.Len(t, stored, 1)
+	assert.Equal(t, "fixed a bug", stored[0].Text)
+	assert.Contains(t, buf.String(), "OPENAI_BASE_URL", "the note names what is missing")
+	assert.Contains(t, buf.String(), "doctor", "and where to fix it")
 }

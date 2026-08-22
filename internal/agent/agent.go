@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -56,25 +57,23 @@ type agentFactory func(name, description, instructions string, tools []tool.Tool
 type ttsFunc func(ctx context.Context, input string) ([]byte, error)
 
 type impl struct {
-	editor          runFunc
-	reporter        runFunc
-	speaker         runFunc
-	planner         progressRunFunc
-	plannerFallback runFunc
-	tts             ttsFunc
-	lang            string // optional output language
-	st              *store.Store
-	genTpl          *template.Template
-	daysTpl         *template.Template
+	editor        runFunc
+	curator       runFunc
+	speaker       runFunc
+	planner       progressRunFunc
+	plannerDirect runFunc
+	tts           ttsFunc
+	lang          string // optional output language
+	st            *store.Store
+	tpl           *template.Template
 }
 
 var _ Assistant = (*impl)(nil)
 
 // local is the offline assistant: no model endpoint, deterministic behavior.
 type local struct {
-	st      *store.Store
-	genTpl  *template.Template
-	daysTpl *template.Template
+	st  *store.Store
+	tpl *template.Template
 }
 
 var _ Assistant = (*local)(nil)
@@ -88,12 +87,12 @@ var modelTimeout = 60 * time.Second
 var endpointPreflightTimeout = 2 * time.Second
 
 func New(cfg config.Config, st *store.Store) (Assistant, error) {
-	genTpl, daysTpl, err := parseTemplates(cfg)
+	tpl, err := parseTemplate(cfg)
 	if err != nil {
 		return nil, err
 	}
 	if cfg.Offline {
-		return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
+		return &local{st: st, tpl: tpl}, nil
 	}
 	provider := cfg.Provider
 	if provider == "" {
@@ -110,7 +109,7 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("missing required environment variables: %s (or run: standup config set offline true)", strings.Join(missing, ", "))
+		return nil, &ProviderUnconfiguredError{Missing: missing}
 	}
 	baseURL := os.Getenv(required[0])
 	if err := preflightEndpoint(baseURL, required[0]); err != nil {
@@ -154,22 +153,30 @@ func New(cfg config.Config, st *store.Store) (Assistant, error) {
 		agenttool.New(updater, agenttool.Config{}),
 		agenttool.New(deleter, agenttool.Config{}),
 	})
-	plannerFallback := newAgent("planner-fallback", "Plans standup CRUD directly when tool delegation is unavailable.", cfg.PlannerFallbackInstructions, nil)
+	plannerDirect := newAgent("planner-direct", "Plans standup CRUD in a single call.", cfg.PlannerDirectInstructions, nil)
 	return &impl{
-		editor:          newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
-		reporter:        newRun(newAgent("reporter", "Rephrases report entries.", cfg.ReporterInstructions, nil)),
-		speaker:         newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
-		planner:         newProgressRun(planner),
-		plannerFallback: newRun(plannerFallback),
+		editor:        newRun(newAgent("editor", "Cleans and splits new task text.", cfg.EditorInstructions, nil)),
+		curator:       newRun(newAgent("curator", "Condenses report entries into standup lines.", cfg.CuratorInstructions, nil)),
+		speaker:       newRun(newAgent("speaker", "Writes spoken standup briefs.", cfg.SpeakerInstructions, nil)),
+		planner:       newProgressRun(planner),
+		plannerDirect: newRun(plannerDirect),
 		tts: newTTS(openai.NewClient(
 			option.WithBaseURL(os.Getenv("OPENAI_BASE_URL")),
 			option.WithHTTPClient(&http.Client{Timeout: timeout}),
 		)),
-		lang:    cfg.Language,
-		st:      st,
-		genTpl:  genTpl,
-		daysTpl: daysTpl,
+		lang: cfg.Language,
+		st:   st,
+		tpl:  tpl,
 	}, nil
+}
+
+// ProviderUnconfiguredError reports that online mode has no endpoint to talk
+// to. It is a distinct type because dropping the user's input over it is the
+// wrong answer: `add` captures the note and says what is missing.
+type ProviderUnconfiguredError struct{ Missing []string }
+
+func (e *ProviderUnconfiguredError) Error() string {
+	return fmt.Sprintf("missing required environment variables: %s (or run: standup config set offline true)", strings.Join(e.Missing, ", "))
 }
 
 // Check proves the configured provider actually works: it makes the smallest
@@ -442,18 +449,32 @@ func wavWrap(pcm []byte) []byte {
 // Local returns the deterministic assistant: no model endpoint, paragraph
 // splitting on add, direct template render on generate.
 func Local(cfg config.Config, st *store.Store) (Assistant, error) {
-	genTpl, daysTpl, err := parseTemplates(cfg)
+	tpl, err := parseTemplate(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &local{st: st, genTpl: genTpl, daysTpl: daysTpl}, nil
+	return &local{st: st, tpl: tpl}, nil
 }
 
-// tplFuncs are the funcs available to the generate templates. fold collapses
-// a task text to one row and subject keeps its first line only: an imported
+// tplFuncs are the funcs available to the generate template. fold collapses a
+// task text to one row and subject keeps its first line only: an imported
 // commit stores the whole message, and a 1700-character body rendered as one
-// bullet is not a report entry.
-var tplFuncs = template.FuncMap{"fold": foldText, "subject": subjectText}
+// bullet is not a report entry. entry is what the report renders with.
+var tplFuncs = template.FuncMap{"fold": foldText, "subject": subjectText, "entry": entryText}
+
+// entryText renders a task as a report bullet. Capitalization and the
+// trailing period are decided here, once, for every entry: cleanup used to
+// happen at add time only, so a store filled by `add`, `add --raw` and
+// `commits` produced one section written in three registers. Wording is the
+// curator's job; punctuation is not.
+func entryText(s string) string {
+	text := strings.TrimSuffix(subjectText(s), ".")
+	if text == "" {
+		return ""
+	}
+	r := []rune(text)
+	return string(unicode.ToUpper(r[0])) + string(r[1:])
+}
 
 func foldText(s string) string {
 	return strings.Join(strings.Fields(s), " ")
@@ -469,16 +490,12 @@ func subjectText(s string) string {
 	return ""
 }
 
-func parseTemplates(cfg config.Config) (genTpl, daysTpl *template.Template, err error) {
-	genTpl, err = template.New("generate").Funcs(tplFuncs).Parse(cfg.GenerateInputTemplate)
+func parseTemplate(cfg config.Config) (*template.Template, error) {
+	tpl, err := template.New("generate").Funcs(tplFuncs).Parse(cfg.GenerateInputTemplate)
 	if err != nil {
-		return nil, nil, fmt.Errorf("agent: generate template: %w", err)
+		return nil, fmt.Errorf("agent: generate template: %w", err)
 	}
-	daysTpl, err = template.New("generate-days").Funcs(tplFuncs).Parse(cfg.DaysTemplate)
-	if err != nil {
-		return nil, nil, fmt.Errorf("agent: days template: %w", err)
-	}
-	return genTpl, daysTpl, nil
+	return tpl, nil
 }
 
 func (a *impl) AddTasks(ctx context.Context, rawText string) ([]store.Task, error) {
@@ -538,26 +555,43 @@ func (a *impl) PlanWithProgress(ctx context.Context, prompt string, tasks []stor
 	if err != nil {
 		return nil, fmt.Errorf("agent: encode planner input: %w", err)
 	}
-	out, err := a.planner(ctx, "Input:\n"+string(input), progress)
+	return a.plan(ctx, "Input:\n"+string(input), now, progress)
+}
+
+// plan resolves the request with the cheapest sufficient path: one direct
+// planner call first, the coordinator and its specialists only when that call
+// fails or refuses. Delegating unconditionally spent five model calls — over
+// forty seconds — on requests the user could have typed as two CLI verbs, and
+// the specialists earn that cost only on the fuzzy targets a single pass
+// cannot resolve.
+func (a *impl) plan(ctx context.Context, input string, now time.Time, progress func(string)) ([]store.BatchOperation, error) {
+	direct := ""
+	if a.plannerDirect != nil {
+		out, err := a.plannerDirect(ctx, input)
+		if err != nil {
+			return nil, err
+		}
+		operations, parseErr := extractOperations(out, now)
+		if parseErr == nil {
+			return operations, nil
+		}
+		if a.planner == nil {
+			return operations, parseErr
+		}
+		direct = out
+	}
+	if progress != nil {
+		progress("delegating to specialists")
+	}
+	out, err := a.planner(ctx, input, progress)
 	if err != nil {
 		return nil, err
 	}
 	operations, parseErr := extractOperations(out, now)
-	if parseErr == nil || !errors.Is(parseErr, errInvalidOperationPlan) || a.plannerFallback == nil {
-		return operations, parseErr
+	if parseErr != nil && errors.Is(parseErr, errInvalidOperationPlan) && direct != "" {
+		return nil, fmt.Errorf("%w; direct output: %q; delegated output: %q", parseErr, safeDiagnostic(direct), safeDiagnostic(out))
 	}
-	if progress != nil {
-		progress("fallback planner")
-	}
-	fallbackOut, fallbackErr := a.plannerFallback(ctx, "Input:\n"+string(input))
-	if fallbackErr != nil {
-		return nil, fallbackErr
-	}
-	operations, fallbackParseErr := extractOperations(fallbackOut, now)
-	if fallbackParseErr != nil && errors.Is(fallbackParseErr, errInvalidOperationPlan) {
-		return nil, fmt.Errorf("%w; primary output: %q; fallback output: %q", fallbackParseErr, safeDiagnostic(out), safeDiagnostic(fallbackOut))
-	}
-	return operations, fallbackParseErr
+	return operations, parseErr
 }
 
 func relativeDate(task, now time.Time) string {
@@ -574,62 +608,207 @@ func relativeDate(task, now time.Time) string {
 }
 
 // Generate renders the report deterministically in Go; online mode first
-// rephrases the task texts through the reporter (formatting never depends on
-// the model). Any rephrase failure falls back to the original texts.
+// curates the entries through the curator (layout never depends on the
+// model). Any curation failure falls back to the stored texts, one bullet
+// each.
 func (a *impl) Generate(ctx context.Context, sec report.Section) (Generated, error) {
-	texts := taskTexts(sec)
 	fallback := ""
-	if len(texts) > 0 {
-		repl, reason := a.rephrase(ctx, texts)
+	if src := buckets(sec); len(src) > 0 {
+		curated, reason := a.curate(ctx, src)
 		if reason == "" {
-			applyTexts(&sec, repl)
+			applyCuration(&sec, curated)
 		}
 		fallback = reason
 	}
 	var b strings.Builder
-	if err := tplFor(sec, a.genTpl, a.daysTpl).Execute(&b, sec); err != nil {
+	if err := a.tpl.Execute(&b, sec); err != nil {
 		return Generated{}, fmt.Errorf("agent: generate template: %w", err)
 	}
 	return Generated{Text: b.String(), Fallback: fallback}, nil
 }
 
-// rephrase exchanges the task texts for rewritten ones, one per input, via
-// the reporter agent's JSON contract. The second result names why the
-// rewrite was refused, empty when it was accepted: the fallback fires
-// precisely when the input is large and messy, so it has to be visible.
-func (a *impl) rephrase(ctx context.Context, texts []string) ([]string, string) {
-	var prompt strings.Builder
-	if a.lang != "" {
-		fmt.Fprintf(&prompt, "Write the entries in %s.\n", a.lang)
+// bucket is one addressable list of entries in a report: a day's status
+// group, or the blockers. Curation happens inside a bucket and never across
+// them, so a merged entry cannot change day or status — Go still owns both.
+type bucket struct {
+	Heading string
+	Label   string
+	Tasks   []store.Task
+}
+
+// buckets snapshots the section's task lists in render order. applyCuration
+// walks the same order, so a bucket's position is its identity.
+func buckets(sec report.Section) []bucket {
+	var out []bucket
+	for _, d := range sec.Days {
+		for _, g := range d.Groups {
+			out = append(out, bucket{Heading: d.Heading, Label: g.Label, Tasks: g.Tasks})
+		}
 	}
-	prompt.WriteString("\nTasks:")
-	for _, t := range texts {
-		prompt.WriteString("\n- " + t)
+	if len(sec.Blockers) > 0 {
+		out = append(out, bucket{Heading: "Blockers", Tasks: sec.Blockers})
 	}
-	out, err := a.reporter(ctx, prompt.String())
+	return out
+}
+
+func applyCuration(sec *report.Section, curated [][]store.Task) {
+	i := 0
+	for di := range sec.Days {
+		for gi := range sec.Days[di].Groups {
+			sec.Days[di].Groups[gi].Tasks = curated[i]
+			i++
+		}
+	}
+	if len(sec.Blockers) > 0 {
+		sec.Blockers = curated[i]
+	}
+}
+
+// curate asks the curator to condense each bucket into standup lines and
+// returns the surviving entries per bucket. The second result names why the
+// curation was refused, empty when it was accepted: the fallback ships the
+// raw work log, so it has to be visible.
+//
+// This is the one editorial judgement in the pipeline — 28 commit subjects
+// are not a standup, and turning them into four lines is the job only a model
+// can do. Rephrasing them one for one was not: it returned its input.
+func (a *impl) curate(ctx context.Context, src []bucket) ([][]store.Task, string) {
+	total := 0
+	for _, b := range src {
+		total += len(b.Tasks)
+	}
+	out, err := a.curator(ctx, curationPrompt(src, a.lang))
 	if err != nil {
 		return nil, fmt.Sprintf("the model call failed (%v)", err)
 	}
-	repl, err := extractStrings(out)
+	entries, err := extractEntries(out)
 	if err != nil {
 		return nil, "the model answered off-contract (no JSON entries in the reply)"
 	}
-	if len(repl) != len(texts) {
-		return nil, fmt.Sprintf("the model answered off-contract (%d entries for %d tasks)", len(repl), len(texts))
+	owner, err := assignEntries(entries, src, total)
+	if err != nil {
+		return nil, "the model answered off-contract (" + err.Error() + ")"
 	}
-	for _, r := range repl {
-		if strings.TrimSpace(r) == "" {
-			return nil, "the model answered off-contract (an entry came back empty)"
-		}
-	}
-	dropInventedTags(texts, repl)
-	for i := range repl {
-		repl[i] = stripListMarker(repl[i])
-	}
-	return repl, ""
+	return owner, ""
 }
 
-// dropInventedTags demotes #tokens the rephraser minted: #word is this app's
+// curationPrompt numbers every entry under its own section heading: the
+// numbers are the only handle the curator gets on the store, and a section it
+// cannot name is a section it cannot move work into.
+func curationPrompt(src []bucket, lang string) string {
+	var p strings.Builder
+	if lang != "" {
+		fmt.Fprintf(&p, "Write the entries in %s.\n", lang)
+	}
+	p.WriteString("\nReport:")
+	n := 0
+	for _, b := range src {
+		fmt.Fprintf(&p, "\n## %s", b.Heading)
+		if b.Label != "" {
+			fmt.Fprintf(&p, "\n### %s", b.Label)
+		}
+		for _, t := range b.Tasks {
+			n++
+			fmt.Fprintf(&p, "\n%d. %s", n, subjectText(t.Text))
+		}
+	}
+	return p.String()
+}
+
+// curatedEntry is one standup line and the input lines it covers.
+type curatedEntry struct {
+	Text    string `json:"text"`
+	Sources []int  `json:"sources"`
+}
+
+// assignEntries validates the curator's plan and rebuilds each bucket from
+// it. Every input line must be covered exactly once and every entry must stay
+// inside one bucket: those two rules make dropped work and relabelled work
+// impossible, which is what lets a model be trusted with the editing at all.
+func assignEntries(entries []curatedEntry, src []bucket, total int) ([][]store.Task, error) {
+	seen := make([]bool, total)
+	curated := make([][]store.Task, len(src))
+	for _, e := range entries {
+		text := strings.TrimSpace(stripListMarker(e.Text))
+		if text == "" {
+			return nil, errors.New("an entry came back empty")
+		}
+		sources, owner, err := resolveSources(e.Sources, src, seen)
+		if err != nil {
+			return nil, err
+		}
+		curated[owner] = append(curated[owner], mergeTasks(sources, text))
+	}
+	for i, ok := range seen {
+		if !ok {
+			return nil, fmt.Errorf("entry %d was dropped", i+1)
+		}
+	}
+	return curated, nil
+}
+
+// resolveSources maps one entry's line numbers to their tasks, rejecting
+// numbers that are out of range, repeated, or spread across two buckets.
+func resolveSources(numbers []int, src []bucket, seen []bool) ([]store.Task, int, error) {
+	if len(numbers) == 0 {
+		return nil, 0, errors.New("an entry cited no input line")
+	}
+	sorted := append([]int(nil), numbers...)
+	sort.Ints(sorted)
+	var tasks []store.Task
+	owner := -1
+	for _, n := range sorted {
+		if n < 1 || n > len(seen) {
+			return nil, 0, fmt.Errorf("entry %d does not exist", n)
+		}
+		if seen[n-1] {
+			return nil, 0, fmt.Errorf("entry %d was used twice", n)
+		}
+		seen[n-1] = true
+		b, task := locate(src, n)
+		if owner >= 0 && owner != b {
+			return nil, 0, errors.New("one entry mixed two sections")
+		}
+		owner = b
+		tasks = append(tasks, task)
+	}
+	return tasks, owner, nil
+}
+
+// locate finds the bucket and task behind a 1-based line number.
+func locate(src []bucket, n int) (int, store.Task) {
+	for i, b := range src {
+		if n <= len(b.Tasks) {
+			return i, b.Tasks[n-1]
+		}
+		n -= len(b.Tasks)
+	}
+	return -1, store.Task{} // unreachable: n is range-checked by the caller
+}
+
+// mergeTasks builds the entry a curated line renders as. Everything except
+// the wording stays deterministic: the earliest source's time anchors the
+// line, and the branch survives only when every source shared it.
+func mergeTasks(sources []store.Task, text string) store.Task {
+	merged := sources[0]
+	merged.Text = text
+	for _, t := range sources[1:] {
+		if t.Branch != merged.Branch {
+			merged.Branch = ""
+			break
+		}
+	}
+	var raw []string
+	for _, t := range sources {
+		raw = append(raw, t.Text)
+	}
+	rewritten := []string{merged.Text}
+	dropInventedTags([]string{strings.Join(raw, " ")}, rewritten)
+	merged.Text = rewritten[0]
+	return merged
+}
+
+// dropInventedTags demotes #tokens the curator minted: #word is this app's
 // own tag syntax (`list --tag`), so an invented one shows a tag the task does
 // not carry. The word stays, only the # goes.
 func dropInventedTags(source, rewritten []string) {
@@ -650,7 +829,7 @@ func dropInventedTags(source, rewritten []string) {
 	}
 }
 
-// stripListMarker removes a bullet the reporter echoed from its input. Go
+// stripListMarker removes a bullet the curator echoed from its input. Go
 // renders the bullets; an entry that carries its own turns into "- [done] -
 // fixed the bug" and travels on into the spoken brief.
 func stripListMarker(s string) string {
@@ -690,7 +869,19 @@ func (a *impl) Script(ctx context.Context, report string) (string, error) {
 	if !scriptGrounded(report, script) {
 		return spokenFallback(report), nil
 	}
-	return script, nil
+	return spokenText(script), nil
+}
+
+// spokenText removes the app's own #tag syntax: a listener hears "hashtag
+// checkout", which is markup read aloud in a meeting. The word stays.
+func spokenText(s string) string {
+	fields := strings.Fields(s)
+	for i, f := range fields {
+		if strings.HasPrefix(f, "#") && len(f) > 1 {
+			fields[i] = strings.TrimPrefix(f, "#")
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 func scriptGrounded(report, script string) bool {
@@ -721,7 +912,11 @@ func scriptGrounded(report, script string) bool {
 			return false
 		}
 	}
-	return bullets > 0 && sentenceCount(script) == bullets
+	// Every bullet is accounted for by the loop above, so a shorter brief has
+	// combined entries — which is what a person does. More sentences than
+	// entries is where invented detail lives.
+	sentences := sentenceCount(script)
+	return bullets > 0 && sentences > 0 && sentences <= bullets
 }
 
 // dayWords are the time anchors a brief may use. The day split is decided in Go and
@@ -780,39 +975,64 @@ func sentenceCount(script string) int {
 }
 
 // spokenFallback derives a faithful brief from the rendered report when the
-// speaker cannot be trusted with it. Each section is anchored once — repeating
-// "Today:" before every item reads like a template, not a person.
+// speaker cannot be trusted with it. Each section is anchored once and the
+// items after it vary their connective — repeating "Also," before every item
+// reads like a template, not a person — and the anchor carries the section's
+// own label, so planned work is not announced in the grammar of finished
+// work.
 func spokenFallback(report string) string {
-	var heading string
-	anchored := false
+	var day, anchor string
+	used := 0
 	var sentences []string
 	for _, line := range strings.Split(report, "\n") {
 		switch {
+		case strings.HasPrefix(line, "### "):
+			anchor = spokenAnchor(day, strings.TrimSpace(strings.TrimPrefix(line, "### ")))
+			used = 0
 		case strings.HasPrefix(line, "## "):
-			heading = strings.TrimSpace(strings.TrimPrefix(line, "## "))
-			anchored = false
+			day = strings.TrimSpace(strings.TrimPrefix(line, "## "))
+			anchor = day
+			used = 0
 		case strings.HasPrefix(line, "- "):
-			text := strings.TrimSpace(strings.TrimPrefix(line, "- "))
-			if strings.HasPrefix(text, "[") {
-				if end := strings.Index(text, "] "); end >= 0 {
-					text = text[end+2:]
-				}
-			}
-			if open := strings.LastIndex(text, " ("); open >= 0 && strings.HasSuffix(text, ")") {
-				text = text[:open]
-			}
-			if heading == "" || text == "" {
+			text := spokenText(bulletText(line))
+			if anchor == "" || text == "" {
 				continue
 			}
-			if anchored {
-				sentences = append(sentences, sentence("Also, "+text))
-				continue
+			if used > 0 {
+				sentences = append(sentences, sentence(connectives[(used-1)%len(connectives)]+text))
+			} else {
+				sentences = append(sentences, sentence(anchor+": "+text))
 			}
-			sentences = append(sentences, sentence(heading+": "+text))
-			anchored = true
+			used++
 		}
 	}
 	return strings.Join(sentences, " ")
+}
+
+// connectives are the openings the fallback cycles through after a section's
+// first item.
+var connectives = []string{"Also, ", "Then, ", "After that, ", "On top of that, "}
+
+// spokenAnchor names a day's status group the way it is said out loud.
+func spokenAnchor(day, label string) string {
+	switch label {
+	case "Next":
+		return "Next up"
+	case "In progress":
+		return "In progress"
+	default:
+		return day
+	}
+}
+
+// bulletText strips a rendered bullet down to its wording: the leading
+// marker, and the trailing "(15:04)" that a listener does not need.
+func bulletText(line string) string {
+	text := strings.TrimSpace(strings.TrimPrefix(line, "- "))
+	if open := strings.LastIndex(text, " ("); open >= 0 && strings.HasSuffix(text, ")") {
+		text = text[:open]
+	}
+	return text
 }
 
 // sentence ends a spoken line once: a task text that already ends in
@@ -874,81 +1094,27 @@ func (l *local) Plan(context.Context, string, []store.Task, time.Time) ([]store.
 // about.
 func (l *local) Generate(_ context.Context, sec report.Section) (Generated, error) {
 	var b strings.Builder
-	if err := tplFor(sec, l.genTpl, l.daysTpl).Execute(&b, sec); err != nil {
+	if err := l.tpl.Execute(&b, sec); err != nil {
 		return Generated{}, fmt.Errorf("agent: generate template: %w", err)
 	}
 	return Generated{Text: b.String()}, nil
 }
 
-// tplFor picks the two-section template for the default window and the
-// range template for any other layout (aliases are only set for the default
-// window, including empty ones skipped by both templates).
-func tplFor(sec report.Section, genTpl, daysTpl *template.Template) *template.Template {
-	if len(sec.Days) == 2 && (sec.Yesterday != nil || sec.Today != nil) {
-		return genTpl
-	}
-	return daysTpl
-}
-
-// taskTexts flattens the section's tasks in render order: days first, then
-// blockers. Only the subject lines travel — the reporter rephrases what the
-// report actually shows, and a store full of commit bodies no longer buries
-// the contract in tens of kilobytes of input.
-func taskTexts(sec report.Section) []string {
-	var out []string
-	for _, d := range sec.Days {
-		for _, t := range d.Tasks {
-			out = append(out, subjectText(t.Text))
-		}
-	}
-	for _, t := range sec.Blockers {
-		out = append(out, subjectText(t.Text))
-	}
-	return out
-}
-
-// applyTexts writes rephrased texts back in the same order taskTexts read
-// them.
-func applyTexts(sec *report.Section, repl []string) {
-	i := 0
-	for di := range sec.Days {
-		for ti := range sec.Days[di].Tasks {
-			if i < len(repl) {
-				sec.Days[di].Tasks[ti].Text = repl[i]
-				i++
-			}
-		}
-	}
-	for bi := range sec.Blockers {
-		if i < len(repl) {
-			sec.Blockers[bi].Text = repl[i]
-			i++
-		}
-	}
-	if len(sec.Days) == 2 {
-		if sec.Yesterday != nil {
-			sec.Yesterday = sec.Days[0].Tasks
-		}
-		if sec.Today != nil {
-			sec.Today = sec.Days[1].Tasks
-		}
-	}
-}
-
-// extractStrings finds the reporter's JSON reply: {"tasks": ["...", ...]}.
-func extractStrings(s string) ([]string, error) {
+// extractEntries finds the curator's JSON reply:
+// {"entries": [{"text": "...", "sources": [1, 2]}]}.
+func extractEntries(s string) ([]curatedEntry, error) {
 	for i := 0; i < len(s); i++ {
 		if s[i] != '{' {
 			continue
 		}
 		var v struct {
-			Tasks []string `json:"tasks"`
+			Entries []curatedEntry `json:"entries"`
 		}
-		if err := json.NewDecoder(strings.NewReader(s[i:])).Decode(&v); err == nil && len(v.Tasks) > 0 {
-			return v.Tasks, nil
+		if err := json.NewDecoder(strings.NewReader(s[i:])).Decode(&v); err == nil && len(v.Entries) > 0 {
+			return v.Entries, nil
 		}
 	}
-	return nil, errors.New("agent: no tasks found in reporter output")
+	return nil, errors.New("agent: no entries found in curator output")
 }
 
 // extractOperations accepts only the planner's bounded CRUD contract. Store
@@ -1023,6 +1189,10 @@ func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) 
 				}
 				op.Timestamp = parsed
 			}
+			if !applicable(op) {
+				valid = false
+				break
+			}
 			operations = append(operations, op)
 		}
 		if valid {
@@ -1030,6 +1200,25 @@ func extractOperations(s string, now time.Time) ([]store.BatchOperation, error) 
 		}
 	}
 	return nil, errInvalidOperationPlan
+}
+
+// applicable reports whether an operation carries what its kind needs. An
+// op that parses but cannot be applied is an invalid plan, not a store
+// error: the user reads "batch operation 1: empty task text" and can do
+// nothing with it, while the specialists resolve exactly these cases.
+func applicable(op store.BatchOperation) bool {
+	switch op.Kind {
+	case store.OperationCreate:
+		return strings.TrimSpace(op.Text) != ""
+	case store.OperationEdit:
+		return op.ID != "" && strings.TrimSpace(op.Text) != ""
+	case store.OperationStatus:
+		return op.ID != "" && store.ValidStatus(op.Status)
+	case store.OperationDelete:
+		return op.ID != ""
+	default:
+		return false
+	}
 }
 
 func noApplicableChanges(message string) error {

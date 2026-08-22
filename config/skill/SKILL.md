@@ -22,8 +22,10 @@ trailing `#word` tokens in task text.
 - Team standup: `standup generate --team` renders one section per recorded
   author; tasks without an author render unattributed.
 - Each morning: `standup generate` — yesterday + today (weekend-aware,
-  cutoff at the configured meeting time), blocked tasks under
-  `## Blockers`. `standup generate 5` for more days, `--from`/`--to
+  cutoff at the configured meeting time), each day split into `### Done`,
+  `### In progress` and `### Next`, blocked tasks under `## Blockers`.
+  Online, related entries are merged into standup-length lines; offline
+  renders the stored texts verbatim. `standup generate 5` for more days, `--from`/`--to
   YYYY-MM-DD` for an explicit window, `--clip` to copy the report,
   `--webhook <url>` to POST it (Slack-compatible JSON), `--mail <address>`
   to email it (needs `smtp_*` config), `--obsidian` to publish into the

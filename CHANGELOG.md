@@ -5,6 +5,67 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- Day sections are split into `### Done`, `### In progress` and `### Next`.
+  Completed and planned work rendered as identical bullets differing only by
+  an inline `[todo]` tag, and separating the two is the defining structure of
+  a standup. The inline status tag is gone: the group heading carries it, and
+  `--team` reports nest a level deeper as before.
+- `add` with no model endpoint configured now stores the note as typed and
+  prints what is missing plus a pointer to `doctor`, instead of exiting 1 with
+  nothing captured — which is what the first command on a clean install did.
+- Ambiguous id errors list the matching rows, so a retry is a copy-paste
+  rather than another `list`.
+- `InferStatus` reads work that is underway (`working on`, `in progress`,
+  `wip`) as `in-progress`, a validated status the heuristic never produced.
+
+### Changed
+
+- `generate` gives the model editorial work instead of rewording. It used to
+  rephrase entries one for one and return its input: an online report was
+  byte-identical to the free offline render, on a 6-task day and on a 28-task
+  week, so a user could not tell the feature working from the feature being
+  off. The model now merges related entries within one section — a run of
+  releases, several commits on one feature — into the handful of lines a
+  standup is made of, and writes them in one register. Go validates the
+  merge: every input line must be covered exactly once and every merged line
+  must stay inside its own section, so an entry can never be dropped, moved
+  between days, or given a different status. A merged line takes the earliest
+  source's time and keeps a branch only when every source shared it.
+- Report entries are normalized when rendered, not only when captured.
+  Cleanup ran at `add` time, so `--raw` and `commits` entries kept their
+  original register forever and one section mixed three of them.
+- Status inference reads past the leading verb. Passive voice ("the parser is
+  fixed"), an adverb or filler before the verb ("finally got the parser
+  fixed", "ugh spent 4 hrs…"), and "done with X" all reported finished work
+  as `todo`, and a wrong status is shipped to the team unchecked. The first
+  status signal in the sentence now decides, so a stated intention still wins
+  when it comes first ("need to fix the deprecated api" stays `todo`).
+- Day headings are all relative or all dated, never mixed. A 7-day report read
+  `## Sat 2026-08-15`, `## Sun 2026-08-16`, `## Today`, and so did the default
+  Monday window (`## Fri 2026-08-14`, `## Today`).
+- `-p` resolves most requests in one model call. Delegating to the
+  coordinator and its three specialists unconditionally spent over forty
+  seconds on requests the user could type as two CLI verbs; the specialists
+  now run only when the single pass fails, refuses, or returns a plan that
+  cannot be applied. A `-p` run is bounded by six times `model_call_timeout`.
+- An operation plan that parses but cannot be applied (an edit with no text,
+  a status change with no id) is refused as invalid and retried through the
+  specialists, instead of surfacing `batch operation 1: empty task text`.
+- `speak` reads like a person: the brief may combine entries into a sentence
+  (only inventing extra ones is refused), `#tags` are never read aloud as
+  markup, and the deterministic fallback varies its connectives and announces
+  planned work as planned instead of repeating "Also," before five items that
+  all sounded finished.
+- `list` pads the status column and truncates at a word boundary; `add`'s
+  echo confirms the whole task, since truncating the one line that exists to
+  show what was stored defeats its purpose.
+- `agent.yaml` fills every absent key from the embedded default, so a partial
+  or older file keeps working. The `reporter` agent is replaced by `curator`,
+  `planner_fallback_instructions` is now `planner_direct_instructions`, and
+  the two report templates are one `generate_input_template`.
+
 ## [0.16.0] - 2026-08-20
 
 ### Added

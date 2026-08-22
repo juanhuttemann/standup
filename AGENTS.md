@@ -41,15 +41,30 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   asks (or refuses with `--yes` when nothing can be asked), because that is the
   path where a model decides the blast radius. A whole `-p` run is bounded by
   `promptCalls * model_call_timeout`.
-- Natural-language CRUD uses Agent Framework agents-as-tools: one coordinator delegates
-  to create, update, and delete specialists. They return a typed operation plan; Go
-  validates and applies the complete batch atomically, then formats the committed changes.
+- Natural-language CRUD takes the cheapest sufficient path: one direct planner
+  call, then Agent Framework agents-as-tools (a coordinator delegating to create,
+  update, and delete specialists) only when that pass fails, refuses, or returns a
+  plan Go cannot apply. Delegating unconditionally spent five model calls on work
+  the user could type as two CLI verbs. Either path returns a typed operation plan;
+  Go validates it — including that each operation carries what its kind needs — and
+  applies the complete batch atomically, then formats the committed changes.
   `-p --verbose` surfaces framework function-call names only; arguments repeat the task
   snapshot and stay hidden. Online construction preflights endpoint connectivity for two
   seconds before entering the longer per-model-call timeout.
-- Models phrase; Go formats. Report layout (sections, `[status]`, times) is rendered
-  from the template in Go; the reporter only rephrases task texts over a count-checked
-  JSON contract and any failure falls back to verbatim texts. The speaker rewrites the
+- Models judge editorially; Go formats and bounds. Report layout (day sections,
+  status groups, order, times) is rendered from the template in Go. The curator
+  merges related entries within one section into standup-length lines — the one
+  judgement only a model can make, and the reason the reporter that reworded
+  entries one for one was removed: it returned its input, so an online report was
+  byte-identical to the free offline render. Go validates the merge over a JSON
+  contract of line numbers: every input line covered exactly once, every merged
+  line inside one section, so an entry cannot be dropped, moved between days, or
+  restatused. A merged line takes the earliest source's timestamp and keeps a
+  branch only when every source shared it. Any failure falls back to the stored
+  texts, one bullet each, and says so.
+- Register is rendered, not captured: the template normalizes capitalization and
+  the trailing period, because cleanup at `add` time left `--raw` and `commits`
+  entries in whatever register they arrived in. The speaker rewrites the
   rendered report as a spoken brief over the same contract-free boundary: `speak`
   prints the script (a free preview) and `-o` synthesizes it via a streaming chat
   completion with the audio modality; the pcm16 bytes are WAV-wrapped in Go and the
@@ -60,16 +75,29 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   invented advice and deterministically derives a faithful script from the report.
   The audio request is explicitly verbatim, and Go rejects returned audio when
   the streamed transcript does not match the script's normalized word sequence.
-- Deterministic work stays deterministic: time math, day split, ordering, and the meeting
-  cutoff live in `internal/report`. Commit ingestion is deterministic end to end (author
+  A brief may combine entries into one sentence — that is what a person does, and
+  demanding one sentence per bullet rejected every natural brief, so users only
+  ever heard the deterministic fallback. More sentences than entries is where
+  invented detail lives and is still refused. `#tags` never reach the speech
+  endpoint: a listener hears markup read aloud.
+- Deterministic work stays deterministic: time math, day split, status grouping,
+  ordering, and the meeting cutoff live in `internal/report`. Day headings are all
+  relative or all dated, never mixed within one report. Commit ingestion is deterministic end to end (author
   dates, dedupe, `done` status) — a model never touches it. A model never sorts, filters
   by time, or invents ids.
+- Never drop what the user typed: `add` without a configured endpoint stores the
+  note as typed and names what is missing, because exiting 1 threw away the note
+  on the first command anyone runs. A rejected key or an unreachable host is a
+  different failure and still fails loudly — degrading on every model error would
+  hide a broken setup.
 - The assistant is lazy: only `add` (online), `generate`, `speak`, and `-p` construct it, so
   read-only commands never require provider credentials. Speech env
   (`OPENAI_BASE_URL`/`OPENAI_SPEECH_MODEL`/`OPENAI_SPEECH_VOICE`) is checked even
   later: at `speak -o` synthesis time, so the preview needs only the text-provider vars.
 
 ### Config policy
+- Every `agent.yaml` key falls back to the embedded default when absent, so a
+  partial or older file keeps working and adding an agent never breaks an install.
 - Each setting has exactly one home — never duplicate a setting across files:
   application settings (`meeting_time`, `data_file`, `offline`, `provider`, `language`)
   in `config/config.yaml`; provider facts (`OPENAI_*`, `ANTHROPIC_*`) in local
@@ -172,5 +200,9 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 ### Statuses
 - `todo` | `in-progress` | `blocked` | `done` — validated at the store boundary,
   and derived there too (`store.InferStatus`, English-only, `todo` when unsure).
+  Impediment wording wins outright; otherwise the earliest status signal in the
+  sentence decides, so passive voice and "got X fixed" read as done while a
+  stated intention that comes first stays todo. Reading only the leading verb
+  reported finished work as not started.
 - Destructive `rm` requires `--force` after the refusal message identifies the
   matched task; `add --raw -` is the explicit stdin form.

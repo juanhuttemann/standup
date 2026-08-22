@@ -47,18 +47,25 @@ func (p painter) wrap(code, s string) string {
 	return code + s + ansiReset
 }
 
-func (p painter) status(s string) string {
-	var code string
+// statusColor is the palette entry for a validated status, empty for
+// anything else.
+func statusColor(s string) string {
 	switch s {
 	case "todo":
-		code = ansiTodo
+		return ansiTodo
 	case "in-progress":
-		code = ansiInProgress
+		return ansiInProgress
 	case "blocked":
-		code = ansiBlocked
+		return ansiBlocked
 	case "done":
-		code = ansiDone
-	default:
+		return ansiDone
+	}
+	return ""
+}
+
+func (p painter) status(s string) string {
+	code := statusColor(s)
+	if code == "" {
 		return s
 	}
 	return p.wrap(code, s)

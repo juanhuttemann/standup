@@ -26,19 +26,25 @@ import (
 	"standup/internal/store"
 )
 
-const genTplText = `## Yesterday
-{{range .Yesterday}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
-{{end}}
-## Today
-{{range .Today}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
-{{end}}`
-
-const daysTplText = `{{range .Days}}## {{.Heading}}
-{{range .Tasks}}- [{{.Status}}] {{.Text}} ({{.Timestamp.Format "15:04"}})
+const tplText = `{{range .Days}}## {{.Heading}}
+{{range .Groups}}### {{.Label}}
+{{range .Tasks}}- {{.Text}} ({{.Timestamp.Format "15:04"}})
+{{end}}{{end}}{{end}}{{if .Blockers}}## Blockers
+{{range .Blockers}}- {{.Text}} ({{.Timestamp.Format "15:04"}})
 {{end}}{{end}}`
 
 func mustTpl(s string) *template.Template {
 	return template.Must(template.New("t").Parse(s))
+}
+
+// day builds a one-group day section for the tests that only care about the
+// wording that reaches the report.
+func day(heading, label string, tasks ...store.Task) report.Day {
+	return report.Day{Heading: heading, Groups: []report.Group{{Label: label, Status: tasks[0].Status, Tasks: tasks}}}
+}
+
+func at(h, min int, text, status string) store.Task {
+	return store.Task{Text: text, Status: status, Timestamp: time.Date(2026, 8, 15, h, min, 0, 0, time.UTC)}
 }
 
 func TestExtractTasks(t *testing.T) {
@@ -235,12 +241,18 @@ func TestImplAddTasksIsAtomicOnInvalidLaterTask(t *testing.T) {
 	assert.Empty(t, tasks)
 }
 
-func TestImplPlanFallsBackWithoutTools(t *testing.T) {
-	var fallbackPrompt string
+// The direct planner answers first: delegating to the specialists on every
+// prompt spent five model calls on work a single pass resolves.
+func TestImplPlanUsesTheDirectPlannerFirst(t *testing.T) {
+	var directPrompt string
+	delegated := false
 	a := &impl{
-		planner: func(context.Context, string, func(string)) (string, error) { return "not json", nil },
-		plannerFallback: func(_ context.Context, prompt string) (string, error) {
-			fallbackPrompt = prompt
+		planner: func(context.Context, string, func(string)) (string, error) {
+			delegated = true
+			return `{"operations":[{"kind":"create","text":"delegated"}]}`, nil
+		},
+		plannerDirect: func(_ context.Context, prompt string) (string, error) {
+			directPrompt = prompt
 			return `{"operations":[{"kind":"create","text":"ship"}]}`, nil
 		},
 	}
@@ -248,51 +260,146 @@ func TestImplPlanFallsBackWithoutTools(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, ops, 1)
 	assert.Equal(t, store.OperationCreate, ops[0].Kind)
-	assert.Contains(t, fallbackPrompt, `"prompt":"add ship"`)
+	assert.Equal(t, "ship", ops[0].Text)
+	assert.Contains(t, directPrompt, `"prompt":"add ship"`)
+	assert.False(t, delegated, "a resolved single pass never reaches the specialists")
 }
 
-func TestImplGenerateRephrasesViaReporter(t *testing.T) {
+// A refusal or an off-contract answer is exactly where the specialists earn
+// their cost, so the coordinator still runs then.
+func TestImplPlanDelegatesWhenTheDirectPlannerCannotResolve(t *testing.T) {
+	for _, directOut := range []string{"not json", `{"operations":[],"message":"which caching task?"}`} {
+		var progress []string
+		a := &impl{
+			planner: func(_ context.Context, _ string, report func(string)) (string, error) {
+				return `{"operations":[{"kind":"create","text":"delegated"}]}`, nil
+			},
+			plannerDirect: func(context.Context, string) (string, error) { return directOut, nil },
+		}
+		ops, err := a.PlanWithProgress(context.Background(), "p", nil, time.Now(), func(m string) {
+			progress = append(progress, m)
+		})
+		require.NoError(t, err, directOut)
+		require.Len(t, ops, 1)
+		assert.Equal(t, "delegated", ops[0].Text)
+		assert.Contains(t, progress, "delegating to specialists")
+	}
+}
+
+func TestImplPlanReportsBothOutputsWhenNeitherPathParses(t *testing.T) {
+	a := &impl{
+		planner:       func(context.Context, string, func(string)) (string, error) { return "also not json", nil },
+		plannerDirect: func(context.Context, string) (string, error) { return "not json", nil },
+	}
+	_, err := a.Plan(context.Background(), "p", nil, time.Now())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "direct output")
+	assert.Contains(t, err.Error(), "delegated output")
+}
+
+// The curator's job is editorial: 28 commit subjects are not a standup, and
+// merging them is the one part of the pipeline a model is actually good at.
+func TestImplGenerateCuratesViaCurator(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
-		reporter: func(ctx context.Context, prompt string) (string, error) {
+		curator: func(_ context.Context, prompt string) (string, error) {
 			gotPrompt = prompt
-			return `{"tasks": ["Fixed login bug", "Ship the release"]}`, nil
+			return `{"entries":[{"text":"Released v0.1.0 through v0.3.0","sources":[1,2,3]},{"text":"Ship the release","sources":[4]}]}`, nil
 		},
-		genTpl:  mustTpl(genTplText),
-		daysTpl: mustTpl(daysTplText),
+		tpl: mustTpl(tplText),
 	}
-	sec := report.Section{
-		Days: []report.Day{
-			{Heading: "Yesterday", Tasks: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}}},
-			{Heading: "Today", Tasks: []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}}},
-		},
-		Yesterday: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}},
-		Today:     []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}},
-	}
+	sec := report.Section{Days: []report.Day{
+		day("Yesterday", "Done",
+			at(9, 15, "release v0.1.0", "done"),
+			at(9, 30, "release v0.2.0", "done"),
+			at(9, 45, "release v0.3.0", "done")),
+		day("Today", "Next", at(8, 5, "ship release", "todo")),
+	}}
 	gen, err := a.Generate(context.Background(), sec)
-	out := gen.Text
 	require.NoError(t, err)
-	assert.NotContains(t, gotPrompt, "rephrase", "agent instructions must not be duplicated in user input")
-	assert.Contains(t, gotPrompt, "- fix login bug")
-	assert.Contains(t, gotPrompt, "- ship release")
-	assert.Contains(t, out, "## Yesterday")
-	assert.Contains(t, out, "- [done] Fixed login bug (09:15)", "formatting is deterministic, only phrasing comes from the model")
-	assert.Contains(t, out, "- [done] Ship the release (08:05)")
-	assert.NotContains(t, out, "fix login bug", "original wording replaced")
+	assert.Empty(t, gen.Fallback)
+	assert.NotContains(t, gotPrompt, "merge related", "agent instructions must not be duplicated in user input")
+	assert.Contains(t, gotPrompt, "## Yesterday\n### Done\n1. release v0.1.0")
+	assert.Contains(t, gotPrompt, "4. ship release", "numbering runs across sections")
+	assert.Contains(t, gen.Text, "- Released v0.1.0 through v0.3.0 (09:15)",
+		"three entries became one, timed by the earliest of them")
+	assert.Contains(t, gen.Text, "- Ship the release (08:05)")
+	assert.NotContains(t, gen.Text, "release v0.2.0", "merged entries are gone from the report")
+}
+
+func TestImplGenerateRejectsCurationThatLosesOrMovesWork(t *testing.T) {
+	tests := []struct {
+		name, out, reason string
+	}{
+		{"dropped entry", `{"entries":[{"text":"a","sources":[1]}]}`, "was dropped"},
+		{"reused entry", `{"entries":[{"text":"a","sources":[1,1]}]}`, "used twice"},
+		{"invented entry", `{"entries":[{"text":"a","sources":[1]},{"text":"b","sources":[9]}]}`, "does not exist"},
+		{"crossed sections", `{"entries":[{"text":"a","sources":[1,2]}]}`, "mixed two sections"},
+		{"empty text", `{"entries":[{"text":" ","sources":[1]},{"text":"b","sources":[2]}]}`, "came back empty"},
+		{"no sources", `{"entries":[{"text":"a","sources":[]},{"text":"b","sources":[2]}]}`, "cited no input line"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := &impl{
+				curator: func(context.Context, string) (string, error) { return tt.out, nil },
+				tpl:     mustTpl(tplText),
+			}
+			sec := report.Section{Days: []report.Day{
+				day("Yesterday", "Done", at(9, 15, "fix login bug", "done")),
+				day("Today", "Done", at(8, 5, "ship release", "done")),
+			}}
+			gen, err := a.Generate(context.Background(), sec)
+			require.NoError(t, err, "a refused curation still produces a report")
+			assert.Contains(t, gen.Fallback, tt.reason)
+			assert.Contains(t, gen.Text, "- fix login bug (09:15)", "the stored texts are the fallback")
+			assert.Contains(t, gen.Text, "- ship release (08:05)")
+		})
+	}
+}
+
+// A merged entry keeps the branch only when every line it covers shared it:
+// attributing three branches' work to one of them is a fabricated fact.
+func TestCurationKeepsOnlyTheSharedBranch(t *testing.T) {
+	a := &impl{
+		curator: func(context.Context, string) (string, error) {
+			return `{"entries":[{"text":"Reworked the parser","sources":[1,2]}]}`, nil
+		},
+		tpl: mustTpl(`{{range .Days}}{{range .Groups}}{{range .Tasks}}{{.Text}}|{{.Branch}}{{end}}{{end}}{{end}}`),
+	}
+	same := day("Today", "Done", at(9, 0, "a", "done"), at(9, 5, "b", "done"))
+	same.Groups[0].Tasks[0].Branch, same.Groups[0].Tasks[1].Branch = "feat", "feat"
+	gen, err := a.Generate(context.Background(), report.Section{Days: []report.Day{same}})
+	require.NoError(t, err)
+	assert.Equal(t, "Reworked the parser|feat", gen.Text)
+
+	mixed := day("Today", "Done", at(9, 0, "a", "done"), at(9, 5, "b", "done"))
+	mixed.Groups[0].Tasks[0].Branch, mixed.Groups[0].Tasks[1].Branch = "feat", "main"
+	gen, err = a.Generate(context.Background(), report.Section{Days: []report.Day{mixed}})
+	require.NoError(t, err)
+	assert.Equal(t, "Reworked the parser|", gen.Text)
+}
+
+func TestCurationDropsTagsTheCuratorInvented(t *testing.T) {
+	a := &impl{
+		curator: func(context.Context, string) (string, error) {
+			return `{"entries":[{"text":"Fixed the cache #checkout #invented","sources":[1]}]}`, nil
+		},
+		tpl: mustTpl(`{{range .Days}}{{range .Groups}}{{range .Tasks}}{{.Text}}{{end}}{{end}}{{end}}`),
+	}
+	sec := report.Section{Days: []report.Day{day("Today", "Done", at(9, 0, "fixed cache #checkout", "done"))}}
+	gen, err := a.Generate(context.Background(), sec)
+	require.NoError(t, err)
+	assert.Equal(t, "Fixed the cache #checkout invented", gen.Text)
 }
 
 func TestImplGenerateLanguageInPrompt(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
-		reporter: func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "no json", nil },
-		lang:     "German",
-		genTpl:   mustTpl(genTplText),
-		daysTpl:  mustTpl(daysTplText),
+		curator: func(ctx context.Context, prompt string) (string, error) { gotPrompt = prompt; return "no json", nil },
+		lang:    "German",
+		tpl:     mustTpl(tplText),
 	}
-	sec := report.Section{
-		Days:  []report.Day{{Heading: "Yesterday"}, {Heading: "Today", Tasks: []store.Task{{Text: "x", Status: "todo", Timestamp: time.Now()}}}},
-		Today: []store.Task{{Text: "x", Status: "todo", Timestamp: time.Now()}},
-	}
+	sec := report.Section{Days: []report.Day{day("Today", "Next", at(9, 0, "x", "todo"))}}
 	_, err := a.Generate(context.Background(), sec)
 	require.NoError(t, err)
 	assert.Contains(t, gotPrompt, "German")
@@ -300,82 +407,58 @@ func TestImplGenerateLanguageInPrompt(t *testing.T) {
 
 func TestImplGenerateFallsBackDeterministically(t *testing.T) {
 	tests := []struct {
-		name     string
-		reporter func(ctx context.Context, prompt string) (string, error)
+		name    string
+		curator func(ctx context.Context, prompt string) (string, error)
 	}{
-		{"reporter error", func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError }},
+		{"curator error", func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError }},
 		{"not json", func(ctx context.Context, prompt string) (string, error) { return "sure thing!", nil }},
-		{"count mismatch", func(ctx context.Context, prompt string) (string, error) { return `{"tasks":["only one"]}`, nil }},
-		{"empty entry", func(ctx context.Context, prompt string) (string, error) { return `{"tasks":["fixed","  "]}`, nil }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a := &impl{reporter: tt.reporter, genTpl: mustTpl(genTplText), daysTpl: mustTpl(daysTplText)}
-			sec := report.Section{
-				Days: []report.Day{
-					{Heading: "Yesterday", Tasks: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}}},
-					{Heading: "Today", Tasks: []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}}},
-				},
-				Yesterday: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}},
-				Today:     []store.Task{{Text: "ship release", Status: "done", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}},
-			}
+			a := &impl{curator: tt.curator, tpl: mustTpl(tplText)}
+			sec := report.Section{Days: []report.Day{
+				day("Yesterday", "Done", at(9, 15, "fix login bug", "done")),
+				day("Today", "Done", at(8, 5, "ship release", "done")),
+			}}
 			gen, err := a.Generate(context.Background(), sec)
-			out := gen.Text
 			require.NoError(t, err, "fallback keeps generate working")
-			assert.Contains(t, out, "- [done] fix login bug (09:15)")
-			assert.Contains(t, out, "- [done] ship release (08:05)")
+			assert.NotEmpty(t, gen.Fallback, "a silent fallback ships a raw work log as if the model wrote it")
+			assert.Contains(t, gen.Text, "- fix login bug (09:15)")
+			assert.Contains(t, gen.Text, "- ship release (08:05)")
 		})
 	}
 }
 
-func TestImplGenerateRangeUsesDaysTemplate(t *testing.T) {
+func TestImplGenerateRendersEveryDayHeading(t *testing.T) {
 	a := &impl{
-		reporter: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
-		genTpl:   mustTpl(genTplText),
-		daysTpl:  mustTpl(daysTplText),
+		curator: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
+		tpl:     mustTpl(tplText),
 	}
 	sec := report.Section{Days: []report.Day{
-		{Heading: "Thu 2026-08-13", Tasks: []store.Task{{Text: "old", Status: "done", Timestamp: time.Date(2026, 8, 13, 9, 0, 0, 0, time.UTC)}}},
-		{Heading: "Yesterday"},
-		{Heading: "Today"},
+		day("Thu 2026-08-13", "Done", at(9, 0, "old", "done")),
+		{Heading: "Fri 2026-08-14"},
+		day("Sat 2026-08-15", "Next", at(9, 0, "new", "todo")),
 	}}
 	gen, err := a.Generate(context.Background(), sec)
-	out := gen.Text
 	require.NoError(t, err)
-	assert.Contains(t, out, "## Thu 2026-08-13")
-	assert.Contains(t, out, "- [done] old (09:00)")
-	assert.NotContains(t, out, "## Yesterday\n\n## Today\n", "two-section template not used for ranges")
+	assert.Contains(t, gen.Text, "## Thu 2026-08-13")
+	assert.Contains(t, gen.Text, "### Done")
+	assert.Contains(t, gen.Text, "### Next")
+	assert.Contains(t, gen.Text, "## Sat 2026-08-15")
 }
 
-func TestImplGenerateExplicitTwoDayWindowUsesDaysTemplate(t *testing.T) {
-	a := &impl{
-		reporter: func(ctx context.Context, prompt string) (string, error) { return "", assert.AnError },
-		genTpl:   mustTpl(genTplText),
-		daysTpl:  mustTpl(daysTplText),
-	}
-	sec := report.Section{Days: []report.Day{
-		{Heading: "Mon 2026-08-10", Tasks: []store.Task{{Text: "old", Status: "done", Timestamp: time.Date(2026, 8, 10, 9, 0, 0, 0, time.UTC)}}},
-		{Heading: "Tue 2026-08-11", Tasks: []store.Task{{Text: "new", Status: "done", Timestamp: time.Date(2026, 8, 11, 9, 0, 0, 0, time.UTC)}}},
-	}}
-	gen, err := a.Generate(context.Background(), sec)
-	out := gen.Text
+func TestExtractEntries(t *testing.T) {
+	got, err := extractEntries(`{"entries":[{"text":"a","sources":[1]},{"text":"b","sources":[2,3]}]}`)
 	require.NoError(t, err)
-	assert.Contains(t, out, "## Mon 2026-08-10", "no Yesterday/Today aliases: dated headings")
-	assert.Contains(t, out, "## Tue 2026-08-11")
-}
+	assert.Equal(t, []curatedEntry{{Text: "a", Sources: []int{1}}, {Text: "b", Sources: []int{2, 3}}}, got)
 
-func TestExtractStrings(t *testing.T) {
-	got, err := extractStrings(`{"tasks":["a","b"]}`)
+	got, err = extractEntries("sure:\n```json\n{\"entries\":[{\"text\":\"x\",\"sources\":[1]}]}\n```")
 	require.NoError(t, err)
-	assert.Equal(t, []string{"a", "b"}, got)
+	assert.Equal(t, []curatedEntry{{Text: "x", Sources: []int{1}}}, got)
 
-	got, err = extractStrings("sure:\n```json\n{\"tasks\":[\"x\"]}\n```")
-	require.NoError(t, err)
-	assert.Equal(t, []string{"x"}, got)
-
-	_, err = extractStrings(`{"tasks":[]}`)
+	_, err = extractEntries(`{"entries":[]}`)
 	assert.Error(t, err)
-	_, err = extractStrings("no json")
+	_, err = extractEntries("no json")
 	assert.Error(t, err)
 }
 
@@ -387,10 +470,10 @@ func TestImplScriptReturnsTrimmedScript(t *testing.T) {
 			return "  Yesterday I fixed the login bug. Today I ship the release. \n", nil
 		},
 	}
-	script, err := a.Script(context.Background(), "## Yesterday\n- [done] fix login bug")
+	script, err := a.Script(context.Background(), "## Yesterday\n### Done\n- fix login bug")
 	require.NoError(t, err)
 	assert.NotContains(t, gotPrompt, "speak plainly", "agent instructions must not be duplicated in user input")
-	assert.Contains(t, gotPrompt, "## Yesterday\n- [done] fix login bug", "the rendered report is the speaker input")
+	assert.Contains(t, gotPrompt, "## Yesterday\n### Done\n- fix login bug", "the rendered report is the speaker input")
 	assert.Equal(t, "Yesterday: fix login bug.", script, "invented release work falls back to the report")
 }
 
@@ -398,18 +481,19 @@ func TestImplScriptFallsBackWhenSpeakerIsUngrounded(t *testing.T) {
 	a := &impl{speaker: func(context.Context, string) (string, error) {
 		return "User Safety: safe", nil
 	}}
-	reportText := "## Today\n- [todo] Fix login redirect #backend (09:00)\n- [done] Review deployment #ops (10:00)"
+	reportText := "## Today\n### Done\n- Review deployment #ops (10:00)\n- Fixed the cache (10:30)\n- Merged the parser branch (11:00)\n### Next\n- Write API docs (09:00)"
 	script, err := a.Script(context.Background(), reportText)
 	require.NoError(t, err)
-	assert.Equal(t, "Today: Fix login redirect #backend. Also, Review deployment #ops.", script,
-		"one anchor per section: repeating it before every item reads like a template")
+	assert.Equal(t, "Today: Review deployment ops. Also, Fixed the cache. Then, Merged the parser branch. Next up: Write API docs.", script,
+		"one anchor per section, varied connectives after it, and planned work is announced as planned")
+	assert.NotContains(t, script, "#", "a listener hears markup read aloud as \"hashtag\"")
 }
 
 func TestImplScriptFallsBackOnInventedAdvice(t *testing.T) {
 	a := &impl{speaker: func(context.Context, string) (string, error) {
 		return "I fixed login and should make sure deployment works.", nil
 	}}
-	reportText := "## Today\n- [done] Fixed login (09:00)"
+	reportText := "## Today\n### Done\n- Fixed login (09:00)"
 	script, err := a.Script(context.Background(), reportText)
 	require.NoError(t, err)
 	assert.Equal(t, "Today: Fixed login.", script)
@@ -596,33 +680,18 @@ func TestLocalAddTasksSplitsParagraphs(t *testing.T) {
 }
 
 func TestLocalGenerateRendersTemplate(t *testing.T) {
-	l := &local{genTpl: mustTpl(genTplText), daysTpl: mustTpl(daysTplText)}
+	l := &local{tpl: mustTpl(tplText)}
 	sec := report.Section{
 		Days: []report.Day{
-			{Heading: "Yesterday"},
+			day("Yesterday", "Done", at(9, 15, "fix login bug", "done")),
 			{Heading: "Today"},
 		},
-		Yesterday: []store.Task{{Text: "fix login bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 15, 0, 0, time.UTC)}},
-		Today:     []store.Task{{Text: "ship release", Status: "blocked", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)}},
+		Blockers: []store.Task{at(8, 5, "ship release", "blocked")},
 	}
 	gen, err := l.Generate(context.Background(), sec)
-	out := gen.Text
 	require.NoError(t, err)
-	want := "## Yesterday\n- [done] fix login bug (09:15)\n\n## Today\n- [blocked] ship release (08:05)\n"
-	assert.Equal(t, want, out)
-}
-
-func TestLocalGenerateRangeRendersDaysTemplate(t *testing.T) {
-	l := &local{genTpl: mustTpl(genTplText), daysTpl: mustTpl(daysTplText)}
-	sec := report.Section{Days: []report.Day{
-		{Heading: "Thu 2026-08-13"},
-		{Heading: "Yesterday"},
-		{Heading: "Today", Tasks: []store.Task{{Text: "ship", Status: "todo", Timestamp: time.Date(2026, 8, 15, 8, 0, 0, 0, time.UTC)}}},
-	}}
-	gen, err := l.Generate(context.Background(), sec)
-	out := gen.Text
-	require.NoError(t, err)
-	assert.Equal(t, "## Thu 2026-08-13\n## Yesterday\n## Today\n- [todo] ship (08:00)\n", out)
+	assert.Equal(t, "## Yesterday\n### Done\n- fix login bug (09:15)\n## Today\n## Blockers\n- ship release (08:05)\n", gen.Text)
+	assert.Empty(t, gen.Fallback, "offline is not a fallback: no model was going to phrase these")
 }
 
 // An imported commit stores the whole message; a 1700-character body
@@ -639,23 +708,11 @@ func TestGenerateKeepsOnlyTheTaskSubjectLine(t *testing.T) {
 		Timestamp: time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC),
 	}
 
-	// Default window (two-section template) and the days template must both
-	// render one bullet holding the subject line only.
-	sec := report.Section{
-		Days:  []report.Day{{Heading: "Yesterday"}, {Heading: "Today", Tasks: []store.Task{multi}}},
-		Today: []store.Task{multi},
-	}
+	sec := report.Section{Days: []report.Day{{Heading: "Yesterday"}, day("Today", "Done", multi)}}
 	gen, err := ass.Generate(context.Background(), sec)
 	out := gen.Text
 	require.NoError(t, err)
-	assert.Contains(t, out, "- [done] feat: big thing (12:00)")
-	assert.NotContains(t, out, "line one of body")
-
-	sec = report.Section{Days: []report.Day{{Heading: "Today", Tasks: []store.Task{multi}}}}
-	gen, err = ass.Generate(context.Background(), sec)
-	out = gen.Text
-	require.NoError(t, err)
-	assert.Contains(t, out, "- [done] feat: big thing (12:00)")
+	assert.Contains(t, out, "- Feat: big thing (12:00)")
 	assert.NotContains(t, out, "line one of body")
 }
 func TestGenerateRendersBranchWhenRecorded(t *testing.T) {
@@ -669,18 +726,18 @@ func TestGenerateRendersBranchWhenRecorded(t *testing.T) {
 		Branch:    "main",
 		Timestamp: time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC),
 	}
-	sec := report.Section{Days: []report.Day{{Heading: "Today", Tasks: []store.Task{task}}}}
+	sec := report.Section{Days: []report.Day{day("Today", "Done", task)}}
 	gen, err := ass.Generate(context.Background(), sec)
 	out := gen.Text
 	require.NoError(t, err)
-	assert.Contains(t, out, "- [done] feat: x [main] (12:00)", "report rows attribute the branch when recorded")
+	assert.Contains(t, out, "- Feat: x [main] (12:00)", "report rows attribute the branch when recorded")
 
 	task.Branch = ""
-	sec = report.Section{Days: []report.Day{{Heading: "Today", Tasks: []store.Task{task}}}}
+	sec = report.Section{Days: []report.Day{day("Today", "Done", task)}}
 	gen, err = ass.Generate(context.Background(), sec)
 	out = gen.Text
 	require.NoError(t, err)
-	assert.Contains(t, out, "- [done] feat: x (12:00)", "no branch, no empty brackets")
+	assert.Contains(t, out, "- Feat: x (12:00)", "no branch, no empty brackets")
 }
 
 func TestNewOfflineReturnsLocal(t *testing.T) {
@@ -689,9 +746,8 @@ func TestNewOfflineReturnsLocal(t *testing.T) {
 	cfg := config.Config{
 		Offline:               true,
 		EditorInstructions:    "e",
-		ReporterInstructions:  "r",
-		GenerateInputTemplate: genTplText,
-		DaysTemplate:          daysTplText,
+		CuratorInstructions:   "c",
+		GenerateInputTemplate: tplText,
 	}
 	ass, err := New(cfg, st)
 	require.NoError(t, err)
@@ -705,9 +761,8 @@ func TestNewOfflineReturnsLocal(t *testing.T) {
 func TestNewRequiresProviderEnv(t *testing.T) {
 	cfg := config.Config{
 		EditorInstructions:    "e",
-		ReporterInstructions:  "r",
-		GenerateInputTemplate: genTplText,
-		DaysTemplate:          daysTplText,
+		CuratorInstructions:   "c",
+		GenerateInputTemplate: tplText,
 	}
 	t.Setenv("OPENAI_BASE_URL", "")
 	t.Setenv("OPENAI_MODEL", "")
@@ -877,11 +932,11 @@ func TestReportToolCallsDoesNotDedupeEmptyCallIDs(t *testing.T) {
 func TestCommittedPlannerPromptsTreatSnapshotAsUntrusted(t *testing.T) {
 	cfg := committedCfg(t)
 	for name, instructions := range map[string]string{
-		"planner":          cfg.PlannerInstructions,
-		"planner fallback": cfg.PlannerFallbackInstructions,
-		"creator":          cfg.CreatorInstructions,
-		"updater":          cfg.UpdaterInstructions,
-		"deleter":          cfg.DeleterInstructions,
+		"planner":        cfg.PlannerInstructions,
+		"planner direct": cfg.PlannerDirectInstructions,
+		"creator":        cfg.CreatorInstructions,
+		"updater":        cfg.UpdaterInstructions,
+		"deleter":        cfg.DeleterInstructions,
 	} {
 		t.Run(name, func(t *testing.T) {
 			assert.Contains(t, instructions, "sole authority")
@@ -914,25 +969,12 @@ func TestNewOfflineSkipsEndpointPreflight(t *testing.T) {
 func TestNewBadGenerateTemplate(t *testing.T) {
 	cfg := config.Config{
 		EditorInstructions:    "e",
-		ReporterInstructions:  "r",
+		CuratorInstructions:   "c",
 		GenerateInputTemplate: "{{",
-		DaysTemplate:          daysTplText,
 	}
 	_, err := New(cfg, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "template")
-}
-
-func TestNewBadDaysTemplate(t *testing.T) {
-	cfg := config.Config{
-		EditorInstructions:    "e",
-		ReporterInstructions:  "r",
-		GenerateInputTemplate: genTplText,
-		DaysTemplate:          "{{",
-	}
-	_, err := New(cfg, nil)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "days template")
 }
 
 // committedCfg loads config from the repo's real config/ dir so tests cover
@@ -947,24 +989,26 @@ func committedCfg(t *testing.T) config.Config {
 	return cfg
 }
 
-func TestCommittedTemplatesSkipEmptySections(t *testing.T) {
+func TestCommittedTemplateSkipsEmptySections(t *testing.T) {
 	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
 	require.NoError(t, err)
 	ass, err := Local(committedCfg(t), st)
 	require.NoError(t, err)
 
-	sec := report.Section{
-		Days: []report.Day{{Heading: "Yesterday"}, {Heading: "Today"}},
-		Today: []store.Task{
-			{Text: "ship release", Status: "in-progress", Timestamp: time.Date(2026, 8, 15, 8, 5, 0, 0, time.UTC)},
-		},
-	}
+	sec := report.Section{Days: []report.Day{
+		{Heading: "Thu 2026-08-13"},
+		{Heading: "Yesterday"},
+		day("Today", "In progress", at(8, 5, "ship release", "in-progress")),
+	}}
 	gen, err := ass.Generate(context.Background(), sec)
 	out := gen.Text
 	require.NoError(t, err)
 	assert.Contains(t, out, "## Today")
-	assert.Contains(t, out, "ship release")
-	assert.NotContains(t, out, "## Yesterday", "empty sections are not rendered")
+	assert.Contains(t, out, "### In progress")
+	assert.Contains(t, out, "- Ship release (08:05)", "the render normalizes the entry's register")
+	assert.NotContains(t, out, "## Yesterday", "empty days are not rendered")
+	assert.NotContains(t, out, "## Thu 2026-08-13")
+	assert.NotContains(t, out, "## Blockers", "no blockers, no Blockers section")
 }
 
 func TestAddTasksTimesOutOnSilentEndpoint(t *testing.T) {
@@ -1000,29 +1044,6 @@ func TestAddTasksTimesOutOnSilentEndpoint(t *testing.T) {
 	tasks, err := st.List()
 	require.NoError(t, err)
 	assert.Empty(t, tasks, "timeout must not leave partial writes")
-}
-
-func TestCommittedDaysTemplateSkipsEmptyDays(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "tasks.jsonl"))
-	require.NoError(t, err)
-	ass, err := Local(committedCfg(t), st)
-	require.NoError(t, err)
-
-	sec := report.Section{Days: []report.Day{
-		{Heading: "Thu 2026-08-13"},
-		{Heading: "Yesterday", Tasks: []store.Task{
-			{Text: "fix bug", Status: "done", Timestamp: time.Date(2026, 8, 14, 9, 0, 0, 0, time.UTC)},
-		}},
-		{Heading: "Today", Tasks: []store.Task{
-			{Text: "ship", Status: "todo", Timestamp: time.Date(2026, 8, 15, 8, 0, 0, 0, time.UTC)},
-		}},
-	}}
-	gen, err := ass.Generate(context.Background(), sec)
-	out := gen.Text
-	require.NoError(t, err)
-	assert.Contains(t, out, "## Yesterday")
-	assert.Contains(t, out, "## Today")
-	assert.NotContains(t, out, "## Thu 2026-08-13", "empty days are not rendered")
 }
 
 // openAIStub answers the preflight HEAD and every chat completion with the
@@ -1091,10 +1112,7 @@ func TestAddTasksNamesTheApiKeyOnRejectedCredentials(t *testing.T) {
 
 // oneTaskSection is a minimal default-window section holding one task.
 func oneTaskSection(task store.Task) report.Section {
-	return report.Section{
-		Days:  []report.Day{{Heading: "Yesterday"}, {Heading: "Today", Tasks: []store.Task{task}}},
-		Today: []store.Task{task},
-	}
+	return report.Section{Days: []report.Day{{Heading: "Yesterday"}, day("Today", "Done", task)}}
 }
 
 // The fallback fires precisely when the input is large and messy — exactly
@@ -1106,17 +1124,16 @@ func TestGenerateNamesTheVerbatimFallback(t *testing.T) {
 		name, reply, wantReason string
 		replyErr                error
 	}{
-		{name: "count mismatch", reply: `{"tasks":["a","b"]}`, wantReason: "2 entries for 1 tasks"},
+		{name: "dropped work", reply: `{"entries":[{"text":"a","sources":[]}]}`, wantReason: "cited no input line"},
 		{name: "not json", reply: "sorry, here is your report", wantReason: "no JSON entries"},
-		{name: "empty entry", reply: `{"tasks":["  "]}`, wantReason: "came back empty"},
+		{name: "empty entry", reply: `{"entries":[{"text":"  ","sources":[1]}]}`, wantReason: "came back empty"},
 		{name: "call failed", replyErr: assert.AnError, wantReason: "the model call failed"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := &impl{
-				reporter: func(context.Context, string) (string, error) { return tt.reply, tt.replyErr },
-				genTpl:   mustTpl(genTplText),
-				daysTpl:  mustTpl(daysTplText),
+				curator: func(context.Context, string) (string, error) { return tt.reply, tt.replyErr },
+				tpl:     mustTpl(tplText),
 			}
 			gen, err := a.Generate(context.Background(), sec)
 			require.NoError(t, err, "the report is still rendered")
@@ -1128,9 +1145,10 @@ func TestGenerateNamesTheVerbatimFallback(t *testing.T) {
 
 func TestGenerateReportsNoFallbackWhenTheModelAnswers(t *testing.T) {
 	a := &impl{
-		reporter: func(context.Context, string) (string, error) { return `{"tasks":["Shipped the release"]}`, nil },
-		genTpl:   mustTpl(genTplText),
-		daysTpl:  mustTpl(daysTplText),
+		curator: func(context.Context, string) (string, error) {
+			return `{"entries":[{"text":"Shipped the release","sources":[1]}]}`, nil
+		},
+		tpl: mustTpl(tplText),
 	}
 	gen, err := a.Generate(context.Background(), oneTaskSection(store.Task{Text: "ship release", Status: "done", Timestamp: time.Now()}))
 	require.NoError(t, err)
@@ -1138,17 +1156,16 @@ func TestGenerateReportsNoFallbackWhenTheModelAnswers(t *testing.T) {
 }
 
 // A commit body is stored in full but only its subject is reported, so that
-// is what the reporter is asked to rephrase — 39 imported commits used to
+// is what the curator is asked to condense — 39 imported commits used to
 // bury the JSON contract under tens of kilobytes of input.
-func TestGenerateSendsOnlySubjectLinesToTheReporter(t *testing.T) {
+func TestGenerateSendsOnlySubjectLinesToTheCurator(t *testing.T) {
 	var gotPrompt string
 	a := &impl{
-		reporter: func(_ context.Context, prompt string) (string, error) {
+		curator: func(_ context.Context, prompt string) (string, error) {
 			gotPrompt = prompt
-			return `{"tasks":["Added sync"]}`, nil
+			return `{"entries":[{"text":"Added sync","sources":[1]}]}`, nil
 		},
-		genTpl:  mustTpl(genTplText),
-		daysTpl: mustTpl(daysTplText),
+		tpl: mustTpl(tplText),
 	}
 	task := store.Task{
 		Text:      "add sync: merge tasks with a PocketBase server\n\nMerging is deterministic and model-free: tasks union by id.",
@@ -1157,19 +1174,18 @@ func TestGenerateSendsOnlySubjectLinesToTheReporter(t *testing.T) {
 	}
 	_, err := a.Generate(context.Background(), oneTaskSection(task))
 	require.NoError(t, err)
-	assert.Contains(t, gotPrompt, "- add sync: merge tasks with a PocketBase server")
+	assert.Contains(t, gotPrompt, "1. add sync: merge tasks with a PocketBase server")
 	assert.NotContains(t, gotPrompt, "union by id")
 }
 
-// #word is this app's own tag syntax (`list --tag`): a rephraser minting one
+// #word is this app's own tag syntax (`list --tag`): a curator minting one
 // makes reports display a tag the task does not carry.
 func TestGenerateDropsInventedTags(t *testing.T) {
 	a := &impl{
-		reporter: func(context.Context, string) (string, error) {
-			return `{"tasks":["Fixed login redirect bug #1 for #auth"]}`, nil
+		curator: func(context.Context, string) (string, error) {
+			return `{"entries":[{"text":"Fixed login redirect bug #1 for #auth","sources":[1]}]}`, nil
 		},
-		genTpl:  mustTpl(genTplText),
-		daysTpl: mustTpl(daysTplText),
+		tpl: mustTpl(tplText),
 	}
 	task := store.Task{Text: "fixd teh login redirct bug numbr 1 lol #auth", Status: "done", Timestamp: time.Now()}
 	gen, err := a.Generate(context.Background(), oneTaskSection(task))
@@ -1183,7 +1199,7 @@ func TestGenerateDropsInventedTags(t *testing.T) {
 // brief that moves today's work to yesterday is a factual error about the
 // user's own work, spoken aloud in a meeting.
 func TestImplScriptRejectsADayTheReportDoesNotName(t *testing.T) {
-	reportText := "## Today\n- [done] Updated the README (09:00)"
+	reportText := "## Today\n### Done\n- Updated the README (09:00)"
 	for _, spoken := range []string{
 		"Yesterday I updated the README.",
 		"On Monday I updated the README.",
@@ -1249,22 +1265,90 @@ func TestImplAddTasksDropsInventedTags(t *testing.T) {
 }
 
 // Go renders the bullets: an entry that carries its own turns into
-// "- [done] - fixed the bug" and travels on into the spoken brief.
+// "- - fixed the bug" and travels on into the spoken brief.
 func TestGenerateStripsEchoedListMarkers(t *testing.T) {
 	a := &impl{
-		reporter: func(context.Context, string) (string, error) {
-			return `{"tasks":["- Fixed the login bug"]}`, nil
+		curator: func(context.Context, string) (string, error) {
+			return `{"entries":[{"text":"- Fixed the login bug","sources":[1]}]}`, nil
 		},
-		genTpl:  mustTpl(genTplText),
-		daysTpl: mustTpl(daysTplText),
+		tpl: mustTpl(tplText),
 	}
 	gen, err := a.Generate(context.Background(), oneTaskSection(store.Task{Text: "fix login", Status: "done", Timestamp: time.Now()}))
 	require.NoError(t, err)
-	assert.Contains(t, gen.Text, "- [done] Fixed the login bug")
-	assert.NotContains(t, gen.Text, "] - ")
+	assert.Contains(t, gen.Text, "- Fixed the login bug")
+	assert.NotContains(t, gen.Text, "- - ")
 }
 
 func TestSpokenFallbackEndsEachSentenceOnce(t *testing.T) {
-	script := spokenFallback("## Today\n- [done] Fixed the bug number two. (09:00)\n- [todo] Ship it (10:00)")
-	assert.Equal(t, "Today: Fixed the bug number two. Also, Ship it.", script)
+	script := spokenFallback("## Today\n### Done\n- Fixed the bug number two. (09:00)\n- Shipped it (10:00)")
+	assert.Equal(t, "Today: Fixed the bug number two. Also, Shipped it.", script)
+}
+
+// A day's own heading anchors its finished work, but planned work is
+// announced as planned: a listener heard five finished items where the report
+// had four done and one todo.
+func TestSpokenFallbackAnchorsEachGroup(t *testing.T) {
+	script := spokenFallback("## Yesterday\n### Done\n- Fixed the bug (09:00)\n### Next\n- Write API docs (10:00)\n## Blockers\n- Waiting on devops (11:00)")
+	assert.Equal(t, "Yesterday: Fixed the bug. Next up: Write API docs. Blockers: Waiting on devops.", script)
+}
+
+// A brief that joins two entries into one sentence is what a person says;
+// the strict one-sentence-per-bullet rule rejected every such brief and the
+// deterministic fallback — a template — was what users actually heard.
+// Covering fewer sentences is fine, inventing more is not.
+func TestScriptAcceptsABriefThatCombinesEntries(t *testing.T) {
+	reportText := "## Today\n### Done\n- Fixed the login redirect (09:00)\n- Reviewed the billing PR (10:00)\n### Next\n- Write API docs (11:00)"
+	combined := "I fixed the login redirect and reviewed the billing PR. Next I'll write API docs."
+	a := &impl{speaker: func(context.Context, string) (string, error) { return combined, nil }}
+	script, err := a.Script(context.Background(), reportText)
+	require.NoError(t, err)
+	assert.Equal(t, combined, script, "two sentences for three entries is a person talking")
+}
+
+func TestScriptStillRejectsMoreSentencesThanEntries(t *testing.T) {
+	reportText := "## Today\n### Done\n- Fixed the login redirect (09:00)"
+	padded := "I fixed the login redirect. It took most of the morning. The team was pleased."
+	a := &impl{speaker: func(context.Context, string) (string, error) { return padded, nil }}
+	script, err := a.Script(context.Background(), reportText)
+	require.NoError(t, err)
+	assert.Equal(t, "Today: Fixed the login redirect.", script, "extra sentences are invented detail")
+}
+
+// An operation that parses but cannot be applied is an invalid plan, not a
+// store error: "batch operation 1: empty task text" tells the user nothing
+// they can act on, and the specialists resolve exactly these cases.
+func TestExtractOperationsRejectsUnapplicableOperations(t *testing.T) {
+	now := time.Now()
+	for name, plan := range map[string]string{
+		"edit without text":   `{"operations":[{"kind":"edit","id":"abc","text":""}]}`,
+		"edit without id":     `{"operations":[{"kind":"edit","text":"x"}]}`,
+		"create without text": `{"operations":[{"kind":"create","text":"  "}]}`,
+		"status without id":   `{"operations":[{"kind":"status","status":"done"}]}`,
+		"invalid status":      `{"operations":[{"kind":"status","id":"abc","status":"finished"}]}`,
+		"delete without id":   `{"operations":[{"kind":"delete"}]}`,
+		"unknown kind":        `{"operations":[{"kind":"archive","id":"abc"}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := extractOperations(plan, now)
+			assert.ErrorIs(t, err, errInvalidOperationPlan)
+		})
+	}
+}
+
+// The direct planner's sloppy plan must reach the specialists rather than the
+// store.
+func TestImplPlanDelegatesWhenTheDirectPlanCannotBeApplied(t *testing.T) {
+	a := &impl{
+		planner: func(context.Context, string, func(string)) (string, error) {
+			return `{"operations":[{"kind":"status","id":"abc","status":"blocked"}]}`, nil
+		},
+		plannerDirect: func(context.Context, string) (string, error) {
+			return `{"operations":[{"kind":"edit","id":"abc","text":""}]}`, nil
+		},
+	}
+	ops, err := a.Plan(context.Background(), "mark the login one as blocked", nil, time.Now())
+	require.NoError(t, err)
+	require.Len(t, ops, 1)
+	assert.Equal(t, store.OperationStatus, ops[0].Kind)
+	assert.Equal(t, "blocked", ops[0].Status)
 }

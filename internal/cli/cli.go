@@ -515,8 +515,24 @@ func userFacing(err error) error {
 	return errors.New(message)
 }
 
+// findTask resolves an id argument, answering an ambiguous prefix with the
+// rows it matched: printing them turns a retry into a copy-paste.
+func findTask(cmd *cobra.Command, d Deps, prefix string) (store.Task, error) {
+	task, err := d.Store.FindByPrefix(prefix)
+	var ambiguous *store.AmbiguousIDError
+	if !errors.As(err, &ambiguous) {
+		return task, err
+	}
+	p := newPainter(cmd.ErrOrStderr())
+	rows := make([]string, len(ambiguous.Matches))
+	for i, m := range ambiguous.Matches {
+		rows[i] = "  " + taskRow(p, m)
+	}
+	return store.Task{}, fmt.Errorf("%w:\n%s", err, strings.Join(rows, "\n"))
+}
+
 func runDone(cmd *cobra.Command, d Deps, args []string) error {
-	task, err := d.Store.FindByPrefix(args[0])
+	task, err := findTask(cmd, d, args[0])
 	if err != nil {
 		return err
 	}
@@ -528,7 +544,7 @@ func runDone(cmd *cobra.Command, d Deps, args []string) error {
 }
 
 func runEdit(cmd *cobra.Command, d Deps, args []string) error {
-	task, err := d.Store.FindByPrefix(args[0])
+	task, err := findTask(cmd, d, args[0])
 	if err != nil {
 		return err
 	}
@@ -550,7 +566,7 @@ func runEdit(cmd *cobra.Command, d Deps, args []string) error {
 }
 
 func runRm(cmd *cobra.Command, d Deps, args []string) error {
-	task, err := d.Store.FindByPrefix(args[0])
+	task, err := findTask(cmd, d, args[0])
 	if err != nil {
 		return err
 	}
@@ -601,7 +617,7 @@ func plural(n int, word string) string {
 }
 
 func runStatus(cmd *cobra.Command, d Deps, args []string) error {
-	task, err := d.Store.FindByPrefix(args[0])
+	task, err := findTask(cmd, d, args[0])
 	if err != nil {
 		return err
 	}
@@ -637,24 +653,44 @@ func flat(text string) string {
 // echoTask prints the mutated row so silent mutations never happen. The text
 // is bounded like a list row: importing 30 commits printed 30 walls of text.
 func echoTask(cmd *cobra.Command, t store.Task) error {
+	return writeTask(cmd, t, truncate(flat(t.Text), rowTextBudget))
+}
+
+// echoStoredTask confirms one deliberate capture, in full: the echo exists to
+// show what was stored, so it is the one row truncation must not touch.
+func echoStoredTask(cmd *cobra.Command, t store.Task) error {
+	return writeTask(cmd, t, flat(t.Text))
+}
+
+func writeTask(cmd *cobra.Command, t store.Task, text string) error {
 	p := newPainter(cmd.OutOrStdout())
-	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), truncate(flat(t.Text), rowTextBudget))
+	_, err := fmt.Fprintf(cmd.OutOrStdout(), "- [%s] %s\n", p.status(t.Status), text)
 	return err
 }
 
-// colorReport paints the [status] tokens of a rendered report; verbatim when
+// groupStatus maps a report's group headings back to the status they render,
+// so the palette stays the one the store validates.
+var groupStatus = map[string]string{
+	"Done": "done", "In progress": "in-progress", "Next": "todo", "Blockers": "blocked",
+}
+
+// colorReport paints the status headings of a rendered report; verbatim when
 // colors are off (piped output, NO_COLOR).
 func colorReport(s string, p painter) string {
 	if !p.on {
 		return s
 	}
-	r := strings.NewReplacer(
-		"[todo]", "["+p.status("todo")+"]",
-		"[in-progress]", "["+p.status("in-progress")+"]",
-		"[blocked]", "["+p.status("blocked")+"]",
-		"[done]", "["+p.status("done")+"]",
-	)
-	return r.Replace(s)
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		label := strings.TrimLeft(line, "# ")
+		if len(label) == len(line) {
+			continue
+		}
+		if status, ok := groupStatus[label]; ok {
+			lines[i] = line[:len(line)-len(label)] + p.wrap(statusColor(status), label)
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func idArg(cmd *cobra.Command, args []string) error {
@@ -784,10 +820,20 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 	a := d.Raw
 	if !flagBool(cmd, "raw") {
 		assist, err := d.Assistant()
-		if err != nil {
+		var unconfigured *agent.ProviderUnconfiguredError
+		switch {
+		case errors.As(err, &unconfigured):
+			// Exiting 1 here dropped the note the user just typed — the one
+			// thing `add` exists to prevent — on the first command anyone
+			// runs after installing.
+			if _, werr := fmt.Fprintf(cmd.ErrOrStderr(), "note: captured as typed — no model endpoint configured\n      %s\n      run `%s doctor` for the full setup check\n", unconfigured, cmd.Root().Name()); werr != nil {
+				return werr
+			}
+		case err != nil:
 			return err
+		default:
+			a = assist
 		}
-		a = assist
 	}
 	var tasks []store.Task
 	var addErr error
@@ -811,7 +857,7 @@ func runAdd(cmd *cobra.Command, d Deps, args []string) error {
 			}
 		}
 		seen[t.Text] = struct{}{}
-		if err := echoTask(cmd, t); err != nil {
+		if err := echoStoredTask(cmd, t); err != nil {
 			return err
 		}
 	}
@@ -905,8 +951,9 @@ func planOperations(cmd *cobra.Command, d Deps, assist agent.Assistant, prompt s
 }
 
 // promptCalls is how many model calls one -p run is allowed to spend: the
-// coordinator plus its three specialists, with a call to spare.
-const promptCalls = 5
+// direct planner, then the coordinator plus its three specialists when the
+// direct pass cannot resolve the request, with a call to spare.
+const promptCalls = 6
 
 // promptBudget bounds a whole -p run. model_call_timeout bounds one call and
 // the coordinator makes several, so without this a weak model could keep the
@@ -1304,11 +1351,21 @@ func runList(cmd *cobra.Command, d Deps) error {
 	}
 	p := newPainter(cmd.OutOrStdout())
 	for _, t := range tasks {
-		if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s  %s  %s  %s\n", p.quiet(shortID(t.ID)), p.status(t.Status), p.quiet(t.Timestamp.Format("15:04")), rowText(t)); err != nil {
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), taskRow(p, t)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// statusWidth pads the status column to the longest status, so a piped or
+// pasted listing lines up instead of stepping in and out by four characters.
+const statusWidth = len("in-progress")
+
+// taskRow renders one listing row: id, status, time, text.
+func taskRow(p painter, t store.Task) string {
+	pad := strings.Repeat(" ", statusWidth-len(t.Status))
+	return fmt.Sprintf("%s  %s%s  %s  %s", p.quiet(shortID(t.ID)), p.status(t.Status), pad, p.quiet(t.Timestamp.Format("15:04")), rowText(t))
 }
 
 // rowTextBudget bounds a list row's text. `commits` stores a commit's whole
@@ -1326,12 +1383,19 @@ func rowText(t store.Task) string {
 	return text + " [" + t.Branch + "]"
 }
 
+// truncate shortens a row's text at a word boundary. Cutting mid-token
+// ("...in the checkout fl…") loses the word that was about to say what the
+// task is; the store keeps the full text either way.
 func truncate(s string, budget int) string {
 	runes := []rune(s)
 	if len(runes) <= budget {
 		return s
 	}
-	return strings.TrimRight(string(runes[:budget]), " ") + "…"
+	clipped := string(runes[:budget])
+	if i := strings.LastIndex(clipped, " "); i > 0 {
+		clipped = clipped[:i]
+	}
+	return strings.TrimRight(clipped, " ") + "…"
 }
 
 // listTasks resolves the list window: one --date day, trailing --days, or
@@ -1563,11 +1627,7 @@ func renderReport(cmd *cobra.Command, d Deps, tasks []store.Task, now time.Time,
 		if err != nil {
 			return "", err
 		}
-		total := len(sec.Blockers)
-		for _, day := range sec.Days {
-			total += len(day.Tasks)
-		}
-		if total == 0 {
+		if sec.Empty() {
 			continue
 		}
 		var out agent.Generated
@@ -1625,7 +1685,7 @@ func authorHeading(author string) string {
 func demoteHeadings(out string) string {
 	lines := strings.Split(out, "\n")
 	for i, line := range lines {
-		if strings.HasPrefix(line, "## ") {
+		if strings.HasPrefix(line, "##") {
 			lines[i] = "#" + line
 		}
 	}

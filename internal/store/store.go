@@ -504,8 +504,19 @@ func (s *Store) FindByPrefix(p string) (Task, error) {
 	case 0:
 		return Task{}, fmt.Errorf("store: no task with id %q", p)
 	default:
-		return Task{}, fmt.Errorf("store: ambiguous id %q (%d matches)", p, len(matches))
+		return Task{}, &AmbiguousIDError{Prefix: p, Matches: matches}
 	}
+}
+
+// AmbiguousIDError carries the tasks a prefix matched. The rows are what the
+// user needs to retry, but rendering them is the CLI's job, not the store's.
+type AmbiguousIDError struct {
+	Prefix  string
+	Matches []Task
+}
+
+func (e *AmbiguousIDError) Error() string {
+	return fmt.Sprintf("store: ambiguous id %q (%d matches)", e.Prefix, len(e.Matches))
 }
 
 // ValidStatus reports whether s is one of the four task statuses. Exported

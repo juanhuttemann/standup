@@ -14,10 +14,10 @@
 AI-assisted standups from rough notes, tasks, and Git history.
 
 Write what you worked on in your own words. `standup` turns it into clean task
-entries, lets you manage them with one natural-language request, and rephrases
-the result into a daily update with a consistent structure. Task state,
+entries, lets you manage them with one natural-language request, and cuts the
+result down to the few lines you actually say in the meeting. Task state,
 statuses, report layout, time windows, and writes stay deterministic — the
-wording is the model's, everything else is the binary's. Work on more than
+wording and what to merge are the model's, everything else is the binary's. Work on more than
 one machine? [Sync](#sync-across-machines) keeps them on one task list.
 
 ![demo](demo.gif)
@@ -69,10 +69,11 @@ standup add "fixed the login redirect and reviewed the release"
 standup generate
 ```
 
-The assistant cleans and splits the note into tasks, then rephrases their text
-for the standup. The binary—not the model—decides what belongs in Yesterday,
-Today, and Blockers, carries unfinished work forward, and validates every
-change before writing it.
+The assistant cleans and splits the note into tasks; at report time it merges
+related entries into the handful of lines a standup is made of. The
+binary—not the model—decides what belongs in Yesterday, Today, and Blockers,
+splits each day into Done, In progress and Next, carries unfinished work
+forward, and validates every change before writing it.
 
 Manage several tasks in one request with `-p`:
 
@@ -80,10 +81,12 @@ Manage several tasks in one request with `-p`:
 standup -p "mark the login work done, block the release review, and add API docs for today"
 ```
 
-The coordinator delegates creates, edits, status changes, and deletions to
-specialists, validates their complete operation plan, and applies the batch
-atomically. If a target is missing or ambiguous, nothing is written. Add
-`--verbose` to see the specialist tool calls.
+One planning pass resolves most requests in a single model call. When it
+cannot — a fuzzy target like "the caching one", a request it refuses — a
+coordinator delegates creates, edits, status changes, and deletions to
+specialists. Either way the complete operation plan is validated in Go and
+applied atomically; if a target is missing or ambiguous, nothing is written.
+Add `--verbose` to see the specialist tool calls.
 
 Already have the work in Git? Import it as completed tasks before generating:
 
@@ -183,7 +186,7 @@ standup version                     # print the version with context
   plan, and applies it in one write; missing or ambiguous targets change
   nothing. A plan that deletes anything is previewed and confirmed first —
   pass `--yes` to approve it unattended.
-- A whole `-p` run is bounded by five times `model_call_timeout`.
+- A whole `-p` run is bounded by six times `model_call_timeout`.
 - Overlapping commands are safe: writers take a lock file beside the store,
   so a `commits` and an `add` running at once cannot lose each other's tasks.
 - Online commands preflight endpoint connectivity for two seconds before the
@@ -193,10 +196,13 @@ standup version                     # print the version with context
   for slow free-tier models.
 - Task IDs accept any unambiguous prefix; `list` displays the first 8 characters.
 - Unfinished tasks from yesterday carry over into Today.
-- Blocked tasks appear under `## Blockers` until resolved.
+- Blocked tasks appear under `## Blockers` until resolved; every other day
+  section is split into `### Done`, `### In progress` and `### Next`.
 - Tags are `#word` tokens in task text.
-- Report bullets show a task's first line; `list` rows are truncated to keep
-  the columns readable. The store always keeps the full text.
+- Report bullets show a task's first line; `list` rows are truncated at a word
+  boundary to keep the columns readable. The store always keeps the full text.
+- `add` with no model endpoint configured still stores the note as typed and
+  says what is missing, rather than dropping what you just wrote.
 - `meeting_time` bounds today's section at the meeting; once it has passed,
   the section runs to now.
 
@@ -330,9 +336,9 @@ preserved preview.
 
 ## Report language
 
-Set `language:` in `config.yaml` (or `STANDUP_LANGUAGE`) — the model
-rephrases task entries (and the `speak` brief) in that language. Empty keeps
-the input language.
+Set `language:` in `config.yaml` (or `STANDUP_LANGUAGE`) — the model writes
+the report entries (and the `speak` brief) in that language. Empty keeps the
+input language.
 
 ## Timezone
 
@@ -342,17 +348,25 @@ follow it. Empty uses the machine's local zone.
 
 ## Deterministic reports
 
-The report layout (sections, `[status]`, times) is always rendered by the
-binary; a model only rephrases the task texts. Consistency is a promise about
-structure, not wording: the same tasks always produce the same sections, order
-and timestamps, while the phrasing varies between runs.
+The report layout (sections, status groups, order, times) is always rendered
+by the binary. The model's job is editorial: within one section it merges
+related entries into a single line — a run of releases, several commits on one
+feature — and writes them in one register. It cannot drop an entry, move one
+between sections, or change a status: every input line must be covered exactly
+once and every merged line must stay inside its own section, or the whole
+curation is refused. A merged line's time is the earliest of the lines it
+covers, and its branch survives only when they all shared it.
+
+Consistency is a promise about structure, not wording: the same tasks always
+produce the same sections, order and timestamps, while the wording and the
+grouping vary between runs.
 
 If the model is unreachable or answers off-contract, `generate` falls back to
-the verbatim texts — same layout, zero network dependency for the format — and
-prints a one-line note on stderr naming the reason, so a verbatim report is
-never mistaken for a written one. Missing provider env, however, is a
-configuration error and fails fast with a hint — set `offline: true` for the
-credential-free render.
+the stored texts, one bullet each — same layout, zero network dependency for
+the format — and prints a one-line note on stderr naming the reason, so a raw
+work log is never mistaken for a written report. Offline mode renders the same
+way, deliberately: `offline: true` is the credential-free path, and it does no
+editing.
 
 ## Offline mode
 

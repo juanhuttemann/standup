@@ -16,8 +16,8 @@ const agentYAML = `
 editor_instructions: |
   Edit things.
 
-reporter_instructions: |
-  Report things.
+curator_instructions: |
+  Curate things.
 
 speaker_instructions: |
   Speak things.
@@ -25,7 +25,7 @@ speaker_instructions: |
 planner_instructions: |
   Plan things.
 
-planner_fallback_instructions: |
+planner_direct_instructions: |
   Plan things directly.
 
 creator_instructions: |
@@ -38,10 +38,6 @@ deleter_instructions: |
   Delete things.
 
 generate_input_template: |
-  {{range .Yesterday}}- {{.Text}}
-  {{range .Today}}- {{.Text}}
-
-generate_input_template_days: |
   {{range .Days}}## {{.Heading}}
   {{end}}
 `
@@ -106,9 +102,9 @@ func TestLoadYAMLAndPlaceholders(t *testing.T) {
 	assert.Equal(t, "10:15", cfg.MeetingTime)
 	assert.Equal(t, filepath.Join(home, "tasks.jsonl"), cfg.DataFile)
 	assert.Equal(t, "Edit things.", cfg.EditorInstructions)
-	assert.Equal(t, "Report things.", cfg.ReporterInstructions)
+	assert.Equal(t, "Curate things.", cfg.CuratorInstructions)
 	assert.Equal(t, "Speak things.", cfg.SpeakerInstructions)
-	assert.Contains(t, cfg.GenerateInputTemplate, "{{range .Yesterday}}")
+	assert.Contains(t, cfg.GenerateInputTemplate, "{{range .Days}}")
 }
 
 func TestLoadSMTPSettings(t *testing.T) {
@@ -268,10 +264,8 @@ func TestLoadLegacyAgentConfigUsesEmbeddedPlannerPrompts(t *testing.T) {
 	t.Setenv("STANDUP_CONFIG_DIR", dir)
 	legacy := `
 editor_instructions: Edit things.
-reporter_instructions: Report things.
 speaker_instructions: Speak things.
-generate_input_template: '{{range .Today}}{{.Text}}{{end}}'
-generate_input_template_days: '{{range .Days}}{{.Heading}}{{end}}'
+generate_input_template: '{{range .Days}}{{.Heading}}{{end}}'
 `
 	write(t, filepath.Join(dir, "agent.yaml"), legacy)
 
@@ -284,22 +278,33 @@ generate_input_template_days: '{{range .Days}}{{.Heading}}{{end}}'
 	assert.Equal(t, "Edit things.", cfg.EditorInstructions, "legacy custom prompts remain active")
 }
 
-func TestLoadRejectsPartialPlannerConfig(t *testing.T) {
+// Every absent agent.yaml key falls back to its embedded default, so adding
+// an agent never breaks an install whose file predates it.
+func TestLoadFillsAbsentPromptsFromEmbeddedDefaults(t *testing.T) {
 	dir := isolateDirs(t)
 	t.Setenv("STANDUP_CONFIG_DIR", dir)
 	partial := `
 editor_instructions: Edit things.
-reporter_instructions: Report things.
-speaker_instructions: Speak things.
 planner_instructions: Plan things.
-generate_input_template: x
-generate_input_template_days: x
 `
 	write(t, filepath.Join(dir, "agent.yaml"), partial)
 
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "creator_instructions")
+	cfg, err := Load()
+	require.NoError(t, err)
+	assert.Equal(t, "Edit things.", cfg.EditorInstructions, "a configured prompt stays configured")
+	assert.Equal(t, "Plan things.", cfg.PlannerInstructions)
+	for name, got := range map[string]string{
+		"curator":        cfg.CuratorInstructions,
+		"speaker":        cfg.SpeakerInstructions,
+		"creator":        cfg.CreatorInstructions,
+		"updater":        cfg.UpdaterInstructions,
+		"deleter":        cfg.DeleterInstructions,
+		"planner_direct": cfg.PlannerDirectInstructions,
+		"doctor":         cfg.DoctorInstructions,
+		"template":       cfg.GenerateInputTemplate,
+	} {
+		assert.NotEmpty(t, got, "%s falls back to the embedded default", name)
+	}
 }
 
 func TestEmbeddedFallbackWhenNoConfigAnywhere(t *testing.T) {
@@ -311,7 +316,7 @@ func TestEmbeddedFallbackWhenNoConfigAnywhere(t *testing.T) {
 	assert.Contains(t, cfg.DataFile, ".standup")
 	assert.Equal(t, defaults.ConfigYAML != "", true, "config.yaml is embedded")
 	assert.Contains(t, cfg.EditorInstructions, "standup", "embedded agent.yaml supplies prompts")
-	assert.Contains(t, cfg.DaysTemplate, "{{range .Days}}")
+	assert.Contains(t, cfg.GenerateInputTemplate, "{{range .Days}}")
 }
 
 func TestEmbeddedFallbackPerFile(t *testing.T) {
@@ -448,44 +453,6 @@ func TestLanguageKey(t *testing.T) {
 	assert.Equal(t, "fr", cfg.Language, "STANDUP_LANGUAGE overrides the yaml")
 
 	cleanStandupEnv(t)
-}
-
-func TestMissingPromptKey(t *testing.T) {
-	isolateDirs(t)
-	dir := t.TempDir()
-	write(t, filepath.Join(dir, "config.yaml"), "")
-	write(t, filepath.Join(dir, "agent.yaml"), "editor_instructions: |\n  Edit things.\n")
-	t.Setenv("STANDUP_CONFIG_DIR", dir)
-
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "reporter_instructions")
-}
-
-func TestMissingSpeakerKey(t *testing.T) {
-	isolateDirs(t)
-	base := "editor_instructions: |\n  Edit things.\nreporter_instructions: |\n  Report things.\ngenerate_input_template: |\n  {{range .Yesterday}}- {{.Text}}\ngenerate_input_template_days: |\n  {{range .Days}}## {{.Heading}}\n  {{end}}\n"
-	dir := t.TempDir()
-	write(t, filepath.Join(dir, "config.yaml"), "")
-	write(t, filepath.Join(dir, "agent.yaml"), base)
-	t.Setenv("STANDUP_CONFIG_DIR", dir)
-
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "speaker_instructions")
-}
-
-func TestMissingTemplateKey(t *testing.T) {
-	isolateDirs(t)
-	base := "editor_instructions: |\n  Edit things.\nreporter_instructions: |\n  Report things.\ngenerate_input_template: |\n  {{range .Yesterday}}- {{.Text}}\n"
-	dir := t.TempDir()
-	write(t, filepath.Join(dir, "config.yaml"), "")
-	write(t, filepath.Join(dir, "agent.yaml"), base)
-	t.Setenv("STANDUP_CONFIG_DIR", dir)
-
-	_, err := Load()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "generate_input_template_days")
 }
 
 func TestOfflineEnvOverridesYAML(t *testing.T) {

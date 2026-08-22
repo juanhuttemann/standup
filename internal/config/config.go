@@ -18,37 +18,36 @@ import (
 )
 
 type Config struct {
-	MeetingTime                 string
-	DataFile                    string
-	Offline                     bool
-	Provider                    string
-	Language                    string
-	Timezone                    string
-	SMTPHost                    string
-	SMTPPort                    int
-	SMTPUser                    string
-	SMTPPassword                string
-	MailFrom                    string
-	ReposInclude                []string
-	ReposExclude                []string
-	SyncURL                     string
-	SyncCollection              string
-	SyncEmail                   string
-	SyncPassword                string
-	ObsidianVault               string
-	ObsidianNote                string
-	DoctorInstructions          string
-	EditorInstructions          string
-	ReporterInstructions        string
-	SpeakerInstructions         string
-	PlannerInstructions         string
-	PlannerFallbackInstructions string
-	CreatorInstructions         string
-	UpdaterInstructions         string
-	DeleterInstructions         string
-	GenerateInputTemplate       string
-	DaysTemplate                string
-	ModelCallTimeout            time.Duration
+	MeetingTime               string
+	DataFile                  string
+	Offline                   bool
+	Provider                  string
+	Language                  string
+	Timezone                  string
+	SMTPHost                  string
+	SMTPPort                  int
+	SMTPUser                  string
+	SMTPPassword              string
+	MailFrom                  string
+	ReposInclude              []string
+	ReposExclude              []string
+	SyncURL                   string
+	SyncCollection            string
+	SyncEmail                 string
+	SyncPassword              string
+	ObsidianVault             string
+	ObsidianNote              string
+	DoctorInstructions        string
+	EditorInstructions        string
+	CuratorInstructions       string
+	SpeakerInstructions       string
+	PlannerInstructions       string
+	PlannerDirectInstructions string
+	CreatorInstructions       string
+	UpdaterInstructions       string
+	DeleterInstructions       string
+	GenerateInputTemplate     string
+	ModelCallTimeout          time.Duration
 }
 
 // Dirs returns the config directory chain: $STANDUP_CONFIG_DIR if set,
@@ -453,10 +452,15 @@ func applicationConfig(v *viper.Viper) (Config, error) {
 	return cfg, nil
 }
 
+// loadAgentConfig binds every agent.yaml key, falling back per key to the
+// embedded default. A partial agent.yaml is therefore valid: adding an agent
+// must not break an install whose file predates it, and the embedded yaml
+// stays the single home of every prompt.
 func loadAgentConfig(cfg *Config, a *viper.Viper) error {
-	plannerKeys, embeddedAgent, plannerConfigured, err := plannerPromptDefaults(a)
-	if err != nil {
-		return err
+	embedded := viper.New()
+	embedded.SetConfigType("yaml")
+	if err := embedded.ReadConfig(strings.NewReader(defaults.AgentYAML)); err != nil {
+		return fmt.Errorf("read embedded agent.yaml: %w", err)
 	}
 	for _, in := range []struct {
 		key string
@@ -464,24 +468,18 @@ func loadAgentConfig(cfg *Config, a *viper.Viper) error {
 	}{
 		{"doctor_instructions", &cfg.DoctorInstructions},
 		{"editor_instructions", &cfg.EditorInstructions},
-		{"reporter_instructions", &cfg.ReporterInstructions},
+		{"curator_instructions", &cfg.CuratorInstructions},
 		{"generate_input_template", &cfg.GenerateInputTemplate},
-		{"generate_input_template_days", &cfg.DaysTemplate},
 		{"speaker_instructions", &cfg.SpeakerInstructions},
 		{"planner_instructions", &cfg.PlannerInstructions},
 		{"creator_instructions", &cfg.CreatorInstructions},
 		{"updater_instructions", &cfg.UpdaterInstructions},
 		{"deleter_instructions", &cfg.DeleterInstructions},
-		{"planner_fallback_instructions", &cfg.PlannerFallbackInstructions},
+		{"planner_direct_instructions", &cfg.PlannerDirectInstructions},
 	} {
 		s := strings.TrimRight(a.GetString(in.key), " \t\r\n")
-		// Keys added after a user wrote their agent.yaml fall back to the
-		// embedded prompt: a new agent must not break an existing install.
-		if s == "" && (in.key == "planner_fallback_instructions" || in.key == "doctor_instructions") {
-			s = strings.TrimRight(embeddedAgent.GetString(in.key), " \t\r\n")
-		}
-		if s == "" && plannerKeys[in.key] && !plannerConfigured {
-			s = strings.TrimRight(embeddedAgent.GetString(in.key), " \t\r\n")
+		if s == "" {
+			s = strings.TrimRight(embedded.GetString(in.key), " \t\r\n")
 		}
 		if s == "" {
 			return fmt.Errorf("agent.yaml: missing required key %s", in.key)
@@ -489,23 +487,6 @@ func loadAgentConfig(cfg *Config, a *viper.Viper) error {
 		*in.dst = s
 	}
 	return nil
-}
-
-func plannerPromptDefaults(configured *viper.Viper) (map[string]bool, *viper.Viper, bool, error) {
-	keys := map[string]bool{
-		"planner_instructions": true, "creator_instructions": true,
-		"updater_instructions": true, "deleter_instructions": true,
-	}
-	present := false
-	for key := range keys {
-		present = present || strings.TrimSpace(configured.GetString(key)) != ""
-	}
-	embedded := viper.New()
-	embedded.SetConfigType("yaml")
-	if err := embedded.ReadConfig(strings.NewReader(defaults.AgentYAML)); err != nil {
-		return nil, nil, false, fmt.Errorf("read embedded agent.yaml: %w", err)
-	}
-	return keys, embedded, present, nil
 }
 
 // readFile returns the first name found in the dir chain, else the embedded
