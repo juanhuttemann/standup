@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -190,7 +191,15 @@ func TestInstallReplacesValidatedBinaryAndPreservesMode(t *testing.T) {
 	require.NoError(t, os.WriteFile(current, []byte("old"), 0o751))
 	leftover, err := Install(current, []byte("new"), func(string) error { return nil })
 	require.NoError(t, err)
-	assert.Empty(t, leftover, "no platform but Windows leaves a backup behind")
+	if runtime.GOOS == "windows" {
+		// Only Windows leaves one: a running executable is locked, so the
+		// updating process cannot delete its own backup. The leftover is the
+		// exact backup this run made, named with the pid-nanosecond suffix.
+		assert.True(t, strings.HasPrefix(filepath.Base(leftover), filepath.Base(current)+".old-"),
+			"leftover %q is this run's backup", leftover)
+	} else {
+		assert.Empty(t, leftover, "no platform but Windows leaves a backup behind")
+	}
 	b, err := os.ReadFile(current)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("new"), b)
@@ -200,6 +209,60 @@ func TestInstallReplacesValidatedBinaryAndPreservesMode(t *testing.T) {
 		// Windows has no Unix permission bits; every file reads as 0666.
 		assert.Equal(t, os.FileMode(0o751), info.Mode().Perm())
 	}
+}
+
+// The stale-backup sweep runs on Run's up-to-date path, so a user already on
+// the latest version still clears an earlier leftover. It runs on every
+// platform: anything matching <exe>.old-* there came from a past Windows
+// update (e.g. a Wine prefix moved across OSes) — Install never sweeps Unix,
+// so user rollback copies are never at risk.
+func TestSweepBackupsRemovesStaleLeftovers(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "standup")
+	require.NoError(t, os.WriteFile(current, []byte("new"), 0o755))
+	stale := current + ".old-1"
+	require.NoError(t, os.WriteFile(stale, []byte("stale"), 0o644))
+
+	sweepBackups(current)
+	_, err := os.Stat(stale)
+	assert.ErrorIs(t, err, os.ErrNotExist, "an earlier update's leftover is swept")
+	_, err = os.Stat(current)
+	require.NoError(t, err, "the executable itself is never swept")
+}
+
+// A manual rollback copy beside the binary matches <exe>.old-* too, but only
+// Windows backups are swept; deleting it on Linux/macOS loses the user's file.
+func TestInstallKeepsUserRollbackCopiesOnUnix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("only Windows sweeps .old-* files")
+	}
+	dir := t.TempDir()
+	current := filepath.Join(dir, "standup")
+	require.NoError(t, os.WriteFile(current, []byte("old"), 0o755))
+	manual := current + ".old-manual"
+	require.NoError(t, os.WriteFile(manual, []byte("keep me"), 0o644))
+
+	_, err := Install(current, []byte("new"), func(string) error { return nil })
+	require.NoError(t, err)
+	b, err := os.ReadFile(manual)
+	require.NoError(t, err, "a user's own rollback copy is not the updater's to delete")
+	assert.Equal(t, []byte("keep me"), b)
+}
+
+// The sweep builds no glob pattern, so [, * and ? in the install path are
+// ordinary bytes, not metacharacters waiting on ErrBadPattern.
+func TestSweepBackupsHandlesGlobMetacharactersInPath(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "standup[beta]*")
+	require.NoError(t, os.WriteFile(current, []byte("old"), 0o755))
+	stale := current + ".old-1"
+	require.NoError(t, os.WriteFile(stale, []byte("stale"), 0o644))
+
+	sweepBackups(current)
+	_, err := os.Stat(stale)
+	assert.ErrorIs(t, err, os.ErrNotExist)
+	_, err = os.Stat(current)
+	require.NoError(t, err, "the executable itself is never swept")
 }
 
 func tarGz(t *testing.T, files map[string][]byte) []byte {

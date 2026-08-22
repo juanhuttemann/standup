@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,7 +20,8 @@ func TestReplaceExecutableReplacesOrdinaryFile(t *testing.T) {
 	require.NoError(t, os.WriteFile(current, []byte("old"), 0o755))
 	require.NoError(t, os.WriteFile(candidate, []byte("new"), 0o755))
 
-	require.NoError(t, replaceExecutable(current, candidate))
+	_, err := replaceExecutable(current, candidate)
+	require.NoError(t, err)
 	contents, err := os.ReadFile(current)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("new"), contents)
@@ -45,7 +47,9 @@ func TestReplaceExecutableWindows(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops))
+	leftover, err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
+	require.NoError(t, err)
+	assert.Empty(t, leftover, "a backup that was deleted is not leftover")
 	assert.Equal(t, [][2]string{
 		{`C:\bin\standup.exe`, `C:\bin\standup.exe.old-42`},
 		{`C:\bin\standup.exe.new`, `C:\bin\standup.exe`},
@@ -70,7 +74,7 @@ func TestReplaceExecutableWindowsRollsBack(t *testing.T) {
 		},
 	}
 
-	err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
+	_, err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
 	require.ErrorIs(t, err, replaceErr)
 	assert.Equal(t, [][2]string{
 		{`C:\bin\standup.exe`, `C:\bin\standup.exe.old-42`},
@@ -95,7 +99,7 @@ func TestReplaceExecutableWindowsReportsRollbackFailure(t *testing.T) {
 		},
 	}
 
-	err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
+	_, err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
 	require.ErrorIs(t, err, replaceErr)
 	assert.ErrorIs(t, err, rollbackErr)
 }
@@ -112,7 +116,9 @@ func TestReplaceExecutableWindowsSchedulesLockedBackupDeletion(t *testing.T) {
 		},
 	}
 
-	require.NoError(t, replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops))
+	leftover, err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
+	require.NoError(t, err)
+	assert.Equal(t, `C:\bin\standup.exe.old-42`, leftover)
 	assert.Equal(t, `C:\bin\standup.exe.old-42`, scheduled)
 }
 
@@ -128,7 +134,60 @@ func TestReplaceExecutableWindowsKeepsGoingWhenTheBackupCannotBeDeleted(t *testi
 		scheduleDelete: func(string) error { return errors.New("Access is denied") },
 	}
 
-	require.NoError(t,
-		replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops),
-		"the replacement succeeded; only the cleanup did not")
+	leftover, err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
+	require.NoError(t, err, "the replacement succeeded; only the cleanup did not")
+	assert.Equal(t, `C:\bin\standup.exe.old-42`, leftover,
+		"the exact leftover is reported, not the first glob match")
+}
+
+// A recycled pid means <exe>.old-<pid> already exists, and renaming onto a
+// locked file fails with "Access is denied". The retry with a nanosecond
+// suffix keeps that from aborting the update.
+func TestReplaceExecutableWindowsRetriesOnPidReuse(t *testing.T) {
+	removeErr := errors.New("in use")
+	var renames [][2]string
+	var scheduled []string
+	ops := windowsReplaceOps{
+		rename: func(oldPath, newPath string) error {
+			renames = append(renames, [2]string{oldPath, newPath})
+			if oldPath == `C:\bin\standup.exe` && newPath == `C:\bin\standup.exe.old-42` {
+				return errors.New("Access is denied")
+			}
+			return nil
+		},
+		remove: func(string) error { return removeErr },
+		scheduleDelete: func(path string) error {
+			scheduled = append(scheduled, path)
+			return nil
+		},
+	}
+
+	leftover, err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
+	require.NoError(t, err)
+	require.Len(t, renames, 3, "first backup attempt fails, retry uses a fresh suffix")
+	assert.Equal(t, [2]string{`C:\bin\standup.exe`, `C:\bin\standup.exe.old-42`}, renames[0])
+	assert.Equal(t, `C:\bin\standup.exe`, renames[1][0])
+	assert.NotEqual(t, `C:\bin\standup.exe.old-42`, renames[1][1], "the retry picks a new name")
+	assert.True(t, strings.HasPrefix(renames[1][1], `C:\bin\standup.exe.old-42-`),
+		"the retry suffix extends the pid, got %s", renames[1][1])
+	assert.Equal(t, renames[1][1], leftover)
+	assert.Equal(t, []string{leftover}, scheduled)
+}
+
+// The sweep removes earlier backups and keeps this run's own, which the
+// running process has locked.
+func TestSweepBackupsOnWindows(t *testing.T) {
+	dir := t.TempDir()
+	current := filepath.Join(dir, "standup.exe")
+	require.NoError(t, os.WriteFile(current, []byte("new"), 0o755))
+	stale := current + ".old-1"
+	require.NoError(t, os.WriteFile(stale, []byte("stale"), 0o644))
+	own := current + ".old-" + backupSuffix()
+	require.NoError(t, os.WriteFile(own, []byte("own"), 0o644))
+
+	sweepBackups(current)
+	_, err := os.Stat(stale)
+	assert.ErrorIs(t, err, os.ErrNotExist, "an earlier run's backup is gone")
+	_, err = os.Stat(own)
+	require.NoError(t, err, "this run's locked backup is kept")
 }

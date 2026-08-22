@@ -34,7 +34,10 @@ func TestPublishReplacesManagedBlockAndPreservesRest(t *testing.T) {
 	assert.Equal(t, "# Daily\n\nBefore\n<!-- standup:start -->\nnew\n<!-- standup:end -->\nAfter\n", string(contents))
 	info, err := os.Stat(path)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		// Windows has no Unix permission bits; every file reads as 0666.
+		assert.Equal(t, os.FileMode(0o640), info.Mode().Perm())
+	}
 }
 
 func TestPublishAppendsBlockWhenMarkersAreAbsent(t *testing.T) {

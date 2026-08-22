@@ -117,20 +117,23 @@ func Run(ctx context.Context, currentVersion string, checkOnly bool) (Result, er
 		return Result{}, err
 	}
 	result := Result{Current: normalizeDisplay(currentVersion), Latest: tag, State: state}
+	current, err := resolvedExecutable()
+	if err != nil {
+		return Result{}, err
+	}
+	// The sweep runs even when no update is due, so a user already on the
+	// latest version still clears an earlier leftover instead of waiting for
+	// the next release. --check stays read-only: it promises not to change
+	// anything, files included.
+	if !checkOnly {
+		sweepBackups(current)
+	}
 	if state != UpgradeAvailable || checkOnly {
 		return result, nil
 	}
 	binary, err := c.Download(ctx, tag, Platform{OS: runtime.GOOS, Arch: runtime.GOARCH})
 	if err != nil {
 		return Result{}, err
-	}
-	current, err := os.Executable()
-	if err != nil {
-		return Result{}, fmt.Errorf("locate executable: %w", err)
-	}
-	current, err = filepath.EvalSymlinks(current)
-	if err != nil {
-		return Result{}, fmt.Errorf("resolve executable: %w", err)
 	}
 	leftover, err := Install(current, binary, verifyVersion(tag))
 	if err != nil {
@@ -143,6 +146,18 @@ func Run(ctx context.Context, currentVersion string, checkOnly bool) (Result, er
 
 func normalizeDisplay(v string) string {
 	return "v" + strings.TrimPrefix(v, "v")
+}
+
+func resolvedExecutable() (string, error) {
+	current, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("locate executable: %w", err)
+	}
+	current, err = filepath.EvalSymlinks(current)
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+	return current, nil
 }
 
 func (c Client) Latest(ctx context.Context) (tag string, err error) {
@@ -298,9 +313,14 @@ func extractArchive(r io.Reader, asset string, limit int64) (binary []byte, err 
 
 // Install replaces the running executable and returns any backup left behind.
 // Only Windows makes one: it locks a running executable, so the updating
-// process cannot delete its own backup. The glob finds nothing anywhere else.
+// process cannot delete its own backup. Everywhere else returns "".
 func Install(current string, binary []byte, verify func(string) error) (leftover string, err error) {
-	sweepBackups(current)
+	// The sweep stays Windows-only: here the only <exe>.old-* files a Unix
+	// user can have are their own (Run's up-to-date sweep is what clears old
+	// Windows leftovers, and nothing else runs there).
+	if runtime.GOOS == "windows" {
+		sweepBackups(current)
+	}
 	info, err := os.Stat(current)
 	if err != nil {
 		return "", fmt.Errorf("inspect executable: %w", err)
@@ -337,36 +357,11 @@ func Install(current string, binary []byte, verify func(string) error) (leftover
 	if err := verify(candidate); err != nil {
 		return "", fmt.Errorf("verify downloaded binary: %w", err)
 	}
-	if err := replaceExecutable(current, candidate); err != nil {
+	leftover, err = replaceExecutable(current, candidate)
+	if err != nil {
 		return "", err
 	}
-	return firstBackup(current), syncDir(filepath.Dir(current))
-}
-
-// backupGlob matches the backups replaceExecutable leaves on Windows. Naming
-// them by pid is what lets a later run tell its own backup from a live one.
-func backupGlob(current string) []string {
-	matches, err := filepath.Glob(current + ".old-*")
-	if err != nil {
-		return nil
-	}
-	return matches
-}
-
-// sweepBackups deletes what earlier updates could not. The process that made
-// a backup is the one process that cannot delete it; by the next run it is
-// gone. Anything still locked is simply tried again next time.
-func sweepBackups(current string) {
-	for _, path := range backupGlob(current) {
-		_ = os.Remove(path)
-	}
-}
-
-func firstBackup(current string) string {
-	if matches := backupGlob(current); len(matches) > 0 {
-		return matches[0]
-	}
-	return ""
+	return leftover, syncDir(filepath.Dir(current))
 }
 
 func verifyVersion(want string) func(string) error {

@@ -55,15 +55,22 @@ jobs:
         with:
           go-version: '1.26.6'
           cache: true
+      # -race needs cgo; set it explicitly so a runner image without gcc
+      # fails this job loudly instead of turning every tag build red via
+      # release's needs: [test, test-windows, lint].
       - name: Vet
         run: go vet ./...
+        env:
+          CGO_ENABLED: '1'
       # Scoped to the packages with build-tagged Windows code and their
       # callers. The rest of the suite has pre-existing portability gaps in
       # the harness itself — Unix permission bits, XDG_CONFIG_HOME, .sh fake
       # editors — none of which are product bugs, and widening this job is a
       # separate piece of work.
       - name: Test
-        run: go test -race ./internal/update/... ./internal/catalog/... ./internal/store/... ./internal/report/... ./internal/agent/... ./internal/sync/...
+        run: go test -race ./internal/update/... ./internal/obsidian/... ./internal/catalog/... ./internal/store/... ./internal/report/... ./internal/agent/... ./internal/sync/...
+        env:
+          CGO_ENABLED: '1'
 
   lint:
     name: Lint

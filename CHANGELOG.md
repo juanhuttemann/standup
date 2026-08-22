@@ -5,6 +5,27 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `update` no longer deletes files matching `<exe>.old-*` on Linux and macOS.
+  The updater only creates such backups on Windows, so every match elsewhere
+  was the user's own — a manual rollback copy beside the binary was gone after
+  any update run. The sweep is gone from `Install` there, and the leftover
+  report now names the exact backup the run just made instead of the first
+  glob match, which could be an older run's file or nothing at all.
+- The backup sweep builds no glob pattern, so `[` or `*` in the install path
+  no longer break it with a swallowed `ErrBadPattern`.
+- A recycled pid no longer aborts a Windows update: renaming onto a locked
+  `<exe>.old-<pid>` left by an earlier run retries once with a fresh
+  nanosecond suffix instead of failing with "Access is denied".
+- The sweep now runs on every `update` invocation, not only after an
+  upgrade — a user already on the latest version clears an earlier leftover
+  instead of carrying it until the next release, which is what the command's
+  output always said. `--check` stays read-only.
+- The Windows CI job also covers `internal/obsidian` (its Windows file
+  replacement went untested there) and sets `CGO_ENABLED` explicitly so
+  `-race` keeps working if a runner image ships without gcc.
+
 ## [0.18.1] - 2026-08-22
 
 ### Fixed
