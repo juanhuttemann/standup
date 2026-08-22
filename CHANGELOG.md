@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-21
+
 ### Added
 
 - Day sections are split into `### Done`, `### In progress` and `### Next`.
