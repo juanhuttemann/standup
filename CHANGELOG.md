@@ -29,6 +29,15 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
   overrides the file it just wrote, which otherwise ends with a login that
   verified fine being ignored by the very next command.
 
+### Fixed
+
+- `login` trims a request path pasted in place of the base URL and says what
+  it used, rather than asking the model list for `/v1/models/models` and then
+  saving a base URL that only fails on the next command. It normalizes instead
+  of rejecting on purpose: promptui keeps a rejected entry in the line buffer,
+  so the corrected URL is typed onto the end of the bad one and the
+  concatenation is what would get saved.
+
 ### Changed
 
 - `config set provider` rejects anything but `openai` and `anthropic`. It used

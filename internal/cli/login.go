@@ -18,12 +18,16 @@ import (
 // first-class choice rather than a fallback.
 const customEndpointItem = "custom OpenAI-compatible endpoint (Ollama, LM Studio, self-hosted)"
 
+// baseURLLabel names the root rather than a request path: pasting the models
+// or completions URL is the mistake this prompt exists to avoid.
+const baseURLLabel = "base URL (endpoint root, usually ending in /v1)"
+
 // loginUI is the terminal front end. It is an interface because promptui
 // needs a real TTY: the branching around placeholder endpoints, absent model
 // lists and quitting mid-flow is only testable behind a seam.
 type loginUI interface {
 	Select(label string, items []string) (int, error)
-	Input(label, def string, validate func(string) error) (string, error)
+	Input(label string, validate func(string) error) (string, error)
 	Secret(label string, validate func(string) error) (string, error)
 }
 
@@ -56,8 +60,11 @@ func (promptUI) Select(label string, items []string) (int, error) {
 	return i, err
 }
 
-func (promptUI) Input(label, def string, validate func(string) error) (string, error) {
-	return (&promptui.Prompt{Label: label, Default: def, AllowEdit: true, Validate: validate}).Run()
+// No Default and no AllowEdit: promptui keeps a rejected entry in the line
+// buffer, so the answer to "that is an API path, use X" was appended to the
+// bad value rather than replacing it, and the concatenation was saved.
+func (promptUI) Input(label string, validate func(string) error) (string, error) {
+	return (&promptui.Prompt{Label: label, Validate: validate}).Run()
 }
 
 func (promptUI) Secret(label string, validate func(string) error) (string, error) {
@@ -80,8 +87,8 @@ func loginSelect(label string, items []string) (int, error) {
 	return i, err
 }
 
-func loginInput(label, def string, validate func(string) error) (string, error) {
-	value, err := ui.Input(label, def, validate)
+func loginInput(label string, validate func(string) error) (string, error) {
+	value, err := ui.Input(label, validate)
 	if aborted(err) {
 		return "", errLoginAborted
 	}
@@ -152,11 +159,11 @@ func loginChoose(cmd *cobra.Command, rep *reporter, providers []catalog.Provider
 	if i == len(providers) {
 		return loginCustom(cmd, rep)
 	}
-	return loginCatalogProvider(cmd, providers[i])
+	return loginCatalogProvider(cmd, rep, providers[i])
 }
 
 func loginCustom(cmd *cobra.Command, rep *reporter) (config.ProviderSelection, error) {
-	base, err := loginInput("base URL", "", config.ValidBaseURL)
+	base, err := loginBaseURL(rep)
 	if err != nil {
 		return config.ProviderSelection{}, err
 	}
@@ -187,12 +194,27 @@ func loginEndpointModels(cmd *cobra.Command, rep *reporter, base, key string) []
 	return models
 }
 
-func loginCatalogProvider(cmd *cobra.Command, p catalog.Provider) (config.ProviderSelection, error) {
+// loginBaseURL trims a pasted request path rather than rejecting it, and says
+// what it used: promptui keeps a rejected entry in the line buffer, so the
+// correction is typed onto the end of the bad URL and that is what gets saved.
+func loginBaseURL(rep *reporter) (string, error) {
+	typed, err := loginInput(baseURLLabel, config.ValidBaseURL)
+	if err != nil {
+		return "", err
+	}
+	base, trimmed := config.NormalizeBaseURL(typed)
+	if trimmed {
+		rep.printf("note %s is a request path; using %s\n", typed, base)
+	}
+	return base, nil
+}
+
+func loginCatalogProvider(cmd *cobra.Command, rep *reporter, p catalog.Provider) (config.ProviderSelection, error) {
 	base := p.BaseURL
 	if base == "" {
 		// catwalk carries a $VAR placeholder for providers whose SDK has a
 		// built-in endpoint; standup always needs a real base URL.
-		typed, err := loginInput("base URL", "", config.ValidBaseURL)
+		typed, err := loginBaseURL(rep)
 		if err != nil {
 			return config.ProviderSelection{}, err
 		}
@@ -225,7 +247,7 @@ func loginKey(adapter string) (string, error) {
 
 func loginModel(models []catalog.Model) (string, error) {
 	if len(models) == 0 {
-		return loginInput("model id", "", nonEmptyModel)
+		return loginInput("model id", nonEmptyModel)
 	}
 	items := make([]string, len(models))
 	for i, m := range models {

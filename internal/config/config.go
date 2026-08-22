@@ -201,6 +201,30 @@ func ValidBaseURL(raw string) error {
 	return nil
 }
 
+// NormalizeBaseURL trims a request path someone pasted in place of the base
+// URL and reports whether it trimmed. Rejecting it instead would be worse:
+// promptui keeps a rejected entry in the line buffer, so the corrected URL is
+// typed onto the end of the bad one, and the concatenation is what gets saved.
+func NormalizeBaseURL(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw, false
+	}
+	path := strings.TrimSuffix(u.Path, "/")
+	for _, suffix := range apiPaths {
+		if strings.HasSuffix(path, suffix) {
+			u.Path = strings.TrimSuffix(path, suffix)
+			return u.String(), true
+		}
+	}
+	return raw, false
+}
+
+// apiPaths are the request paths a client appends to the base URL. Pasting
+// one of them is the obvious mistake: the model listing 404s, and the saved
+// base URL then only fails on the next command.
+var apiPaths = []string{"/chat/completions", "/completions", "/embeddings", "/responses", "/models"}
+
 // Shadowed reports the settings a selection cannot actually take effect for:
 // a variable already exported in the shell, or loaded from a .env nearer the
 // cwd, wins over the file SaveProvider writes, because godotenv never

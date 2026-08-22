@@ -56,7 +56,7 @@ func (s *scriptedUI) Select(_ string, items []string) (int, error) {
 	return 0, errors.New("scriptedUI: no item matching " + answer)
 }
 
-func (s *scriptedUI) Input(_, _ string, validate func(string) error) (string, error) {
+func (s *scriptedUI) Input(_ string, validate func(string) error) (string, error) {
 	return s.validated("input", validate)
 }
 
@@ -308,4 +308,19 @@ func TestLoginWarnsWhenTheEnvironmentOverridesWhatItWrote(t *testing.T) {
 	require.NoError(t, root.Execute())
 	assert.Contains(t, buf.String(), "note OPENAI_BASE_URL is already set in your environment")
 	assert.Contains(t, buf.String(), "later commands will ignore this login")
+}
+
+func TestLoginTrimsAPastedRequestPathFromTheBaseURL(t *testing.T) {
+	script := &scriptedUI{answers: []string{customEndpointItem, "https://api.example.test/v1/models", "k", "served"}, abortAt: -1}
+	root, buf, dir := loginHarness(t, script, compatible())
+	swap(t, &endpointModels, func(_ context.Context, base, _ string) ([]catalog.Model, error) {
+		assert.Equal(t, "https://api.example.test/v1", base, "the endpoint is asked at the root")
+		return []catalog.Model{{ID: "served", Name: "served"}}, nil
+	})
+
+	root.SetArgs([]string{"login"})
+	require.NoError(t, root.Execute())
+	assert.Empty(t, script.rejected, "a pasted request path is trimmed, never re-asked")
+	assert.Contains(t, buf.String(), "note https://api.example.test/v1/models is a request path; using https://api.example.test/v1")
+	assert.Contains(t, env(t, dir), "OPENAI_BASE_URL=https://api.example.test/v1\n")
 }

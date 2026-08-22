@@ -723,11 +723,32 @@ func TestSetStillRefusesSecretsAfterSetSecretExists(t *testing.T) {
 }
 
 func TestValidBaseURL(t *testing.T) {
-	for _, ok := range []string{"http://localhost:11434/v1", "https://api.example.test/v1"} {
+	for _, ok := range []string{"http://localhost:11434/v1", "https://api.example.test/v1", "https://api.example.test", "https://api.example.test/anthropic"} {
 		assert.NoError(t, ValidBaseURL(ok), ok)
 	}
 	for _, bad := range []string{"", "localhost:11434", "ftp://example.test", "https://", "not a url"} {
 		assert.Error(t, ValidBaseURL(bad), bad)
+	}
+}
+
+// Pasting the full models or completions URL is the obvious mistake, and it
+// costs a 404 on the model list and a base URL that only fails on the next
+// command.
+func TestNormalizeBaseURLTrimsAPastedRequestPath(t *testing.T) {
+	for _, raw := range []string{
+		"https://api.example.test/v1/models",
+		"https://api.example.test/v1/chat/completions",
+		"https://api.example.test/v1/responses/",
+		"https://api.example.test/v1/models/",
+	} {
+		got, trimmed := NormalizeBaseURL(raw)
+		assert.True(t, trimmed, raw)
+		assert.Equal(t, "https://api.example.test/v1", got, raw)
+	}
+	for _, raw := range []string{"https://api.example.test/v1", "https://api.example.test", "https://api.example.test/anthropic"} {
+		got, trimmed := NormalizeBaseURL(raw)
+		assert.False(t, trimmed, raw)
+		assert.Equal(t, raw, got, raw)
 	}
 }
 
