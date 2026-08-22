@@ -50,13 +50,15 @@ func replaceExecutableWindows(current, candidate, suffix string, ops windowsRepl
 		return replaceErr
 	}
 
+	// A backup that cannot be deleted is not a failed update: the new binary
+	// is already in place. Windows keeps a running executable locked, so the
+	// process performing the update is precisely the one that cannot remove
+	// its own backup, and the reboot-time fallback needs administrator rights
+	// an ordinary install does not have. Both failing is the normal case, and
+	// erroring there told users an update that had worked had failed. The
+	// file is named .old-<pid>; the next run sweeps it.
 	if err := ops.remove(backup); err != nil {
-		if scheduleErr := ops.scheduleDelete(backup); scheduleErr != nil {
-			return errors.Join(
-				fmt.Errorf("remove executable backup: %w", err),
-				scheduleErr,
-			)
-		}
+		_ = ops.scheduleDelete(backup) // best effort; needs elevation
 	}
 
 	return nil

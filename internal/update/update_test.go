@@ -171,7 +171,7 @@ func TestInstallValidatesBeforeReplacing(t *testing.T) {
 	dir := t.TempDir()
 	current := filepath.Join(dir, "standup")
 	require.NoError(t, os.WriteFile(current, []byte("old"), 0o755))
-	err := Install(current, []byte("new"), func(path string) error {
+	_, err := Install(current, []byte("new"), func(path string) error {
 		b, readErr := os.ReadFile(path)
 		require.NoError(t, readErr)
 		assert.Equal(t, []byte("new"), b)
@@ -187,7 +187,9 @@ func TestInstallReplacesValidatedBinaryAndPreservesMode(t *testing.T) {
 	dir := t.TempDir()
 	current := filepath.Join(dir, "standup")
 	require.NoError(t, os.WriteFile(current, []byte("old"), 0o751))
-	require.NoError(t, Install(current, []byte("new"), func(string) error { return nil }))
+	leftover, err := Install(current, []byte("new"), func(string) error { return nil })
+	require.NoError(t, err)
+	assert.Empty(t, leftover, "no platform but Windows leaves a backup behind")
 	b, err := os.ReadFile(current)
 	require.NoError(t, err)
 	assert.Equal(t, []byte("new"), b)

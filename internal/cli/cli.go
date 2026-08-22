@@ -378,7 +378,15 @@ func runUpdate(cmd *cobra.Command) error {
 	}
 	switch {
 	case result.Updated:
-		_, err = fmt.Fprintf(cmd.OutOrStdout(), "updated %s -> %s\n", result.Current, result.Latest)
+		if _, err = fmt.Fprintf(cmd.OutOrStdout(), "updated %s -> %s\n", result.Current, result.Latest); err != nil {
+			return err
+		}
+		if result.LeftoverBackup != "" {
+			// Windows locks the running executable, so the update cannot
+			// delete its own backup. Saying so beats failing an update that
+			// worked, and the next run removes the file.
+			_, err = fmt.Fprintf(cmd.OutOrStdout(), "note the previous version is still open and was left at %s; the next update removes it\n", result.LeftoverBackup)
+		}
 	case result.State == standupupdate.UpgradeAvailable:
 		_, err = fmt.Fprintf(cmd.OutOrStdout(), "update available: %s (current: %s)\n", result.Latest, result.Current)
 	case result.State == standupupdate.NewerInstalled:

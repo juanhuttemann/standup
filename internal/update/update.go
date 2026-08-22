@@ -45,6 +45,9 @@ type Result struct {
 	Latest  string
 	State   State
 	Updated bool
+	// LeftoverBackup is a backup of the previous executable that could not be
+	// deleted yet. The update succeeded; the next run sweeps the file.
+	LeftoverBackup string
 }
 
 type Platform struct {
@@ -129,10 +132,12 @@ func Run(ctx context.Context, currentVersion string, checkOnly bool) (Result, er
 	if err != nil {
 		return Result{}, fmt.Errorf("resolve executable: %w", err)
 	}
-	if err := Install(current, binary, verifyVersion(tag)); err != nil {
+	leftover, err := Install(current, binary, verifyVersion(tag))
+	if err != nil {
 		return Result{}, err
 	}
 	result.Updated = true
+	result.LeftoverBackup = leftover
 	return result, nil
 }
 
@@ -291,13 +296,17 @@ func extractArchive(r io.Reader, asset string, limit int64) (binary []byte, err 
 	return binary, nil
 }
 
-func Install(current string, binary []byte, verify func(string) error) (err error) {
+// Install replaces the running executable and returns any backup left behind.
+// Only Windows makes one: it locks a running executable, so the updating
+// process cannot delete its own backup. The glob finds nothing anywhere else.
+func Install(current string, binary []byte, verify func(string) error) (leftover string, err error) {
+	sweepBackups(current)
 	info, err := os.Stat(current)
 	if err != nil {
-		return fmt.Errorf("inspect executable: %w", err)
+		return "", fmt.Errorf("inspect executable: %w", err)
 	}
 	if !info.Mode().IsRegular() {
-		return fmt.Errorf("executable is not a regular file: %s", current)
+		return "", fmt.Errorf("executable is not a regular file: %s", current)
 	}
 	pattern := ".standup-update-*"
 	if runtime.GOOS == "windows" {
@@ -305,7 +314,7 @@ func Install(current string, binary []byte, verify func(string) error) (err erro
 	}
 	f, err := os.CreateTemp(filepath.Dir(current), pattern)
 	if err != nil {
-		return fmt.Errorf("create update beside executable: %w", err)
+		return "", fmt.Errorf("create update beside executable: %w", err)
 	}
 	candidate := f.Name()
 	defer func() {
@@ -314,24 +323,50 @@ func Install(current string, binary []byte, verify func(string) error) (err erro
 		}
 	}()
 	if err := f.Chmod(info.Mode().Perm()); err != nil {
-		return errors.Join(err, f.Close())
+		return "", errors.Join(err, f.Close())
 	}
 	if _, err := f.Write(binary); err != nil {
-		return errors.Join(err, f.Close())
+		return "", errors.Join(err, f.Close())
 	}
 	if err := f.Sync(); err != nil {
-		return errors.Join(err, f.Close())
+		return "", errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
-		return err
+		return "", err
 	}
 	if err := verify(candidate); err != nil {
-		return fmt.Errorf("verify downloaded binary: %w", err)
+		return "", fmt.Errorf("verify downloaded binary: %w", err)
 	}
 	if err := replaceExecutable(current, candidate); err != nil {
-		return err
+		return "", err
 	}
-	return syncDir(filepath.Dir(current))
+	return firstBackup(current), syncDir(filepath.Dir(current))
+}
+
+// backupGlob matches the backups replaceExecutable leaves on Windows. Naming
+// them by pid is what lets a later run tell its own backup from a live one.
+func backupGlob(current string) []string {
+	matches, err := filepath.Glob(current + ".old-*")
+	if err != nil {
+		return nil
+	}
+	return matches
+}
+
+// sweepBackups deletes what earlier updates could not. The process that made
+// a backup is the one process that cannot delete it; by the next run it is
+// gone. Anything still locked is simply tried again next time.
+func sweepBackups(current string) {
+	for _, path := range backupGlob(current) {
+		_ = os.Remove(path)
+	}
+}
+
+func firstBackup(current string) string {
+	if matches := backupGlob(current); len(matches) > 0 {
+		return matches[0]
+	}
+	return ""
 }
 
 func verifyVersion(want string) func(string) error {

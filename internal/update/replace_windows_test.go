@@ -116,16 +116,19 @@ func TestReplaceExecutableWindowsSchedulesLockedBackupDeletion(t *testing.T) {
 	assert.Equal(t, `C:\bin\standup.exe.old-42`, scheduled)
 }
 
-func TestReplaceExecutableWindowsReportsCleanupFailure(t *testing.T) {
-	removeErr := errors.New("in use")
-	scheduleErr := errors.New("schedule failed")
+// Windows locks a running executable, so the backup usually cannot be
+// deleted by the process that made it, and MOVEFILE_DELAY_UNTIL_REBOOT needs
+// administrator rights an ordinary install does not have. Both failing is the
+// normal case: the new binary is already in place, and reporting a failed
+// update over one stale file told the user to distrust an update that worked.
+func TestReplaceExecutableWindowsKeepsGoingWhenTheBackupCannotBeDeleted(t *testing.T) {
 	ops := windowsReplaceOps{
 		rename:         func(string, string) error { return nil },
-		remove:         func(string) error { return removeErr },
-		scheduleDelete: func(string) error { return scheduleErr },
+		remove:         func(string) error { return errors.New("in use") },
+		scheduleDelete: func(string) error { return errors.New("Access is denied") },
 	}
 
-	err := replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops)
-	require.ErrorIs(t, err, removeErr)
-	assert.ErrorIs(t, err, scheduleErr)
+	require.NoError(t,
+		replaceExecutableWindows(`C:\bin\standup.exe`, `C:\bin\standup.exe.new`, "42", ops),
+		"the replacement succeeded; only the cleanup did not")
 }

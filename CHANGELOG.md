@@ -5,6 +5,19 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Fixed
+
+- `update` no longer reports a failure on Windows after an update that
+  succeeded. Windows keeps a running executable locked, so the process doing
+  the update is the one process that cannot delete its own backup, and the
+  reboot-time fallback needs administrator rights an ordinary install does not
+  have — both failing is the normal case, not an error. The new binary is
+  already in place by then; `update` now says the old one was left behind and
+  sweeps it on the next run.
+- Windows code is tested on Windows in CI. The update backup logic is guarded
+  by a build tag, so its tests never ran on the Linux-only job and one of them
+  asserted the bug above as intended behavior.
+
 ## [0.18.0] - 2026-08-22
 
 ### Added

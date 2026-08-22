@@ -41,6 +41,25 @@ jobs:
             STANDUP_DATA_FILE="$RUNNER_TEMP/tasks.jsonl" \
             ./standup list | grep "no tasks"
 
+  # Windows-only code (the update backup dance) is guarded by build tags, so
+  # its tests never ran on the Linux job — and shipped a bug that failed an
+  # update which had already succeeded. Windows is a released platform; its
+  # code needs a machine that can run it.
+  test-windows:
+    name: Vet & Test (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26.6'
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -65,7 +84,7 @@ jobs:
 
   release:
     name: Draft Release
-    needs: [test, lint]
+    needs: [test, test-windows, lint]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15

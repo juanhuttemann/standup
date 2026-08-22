@@ -2999,3 +2999,26 @@ func TestAddWithoutAProviderStillCaptures(t *testing.T) {
 	assert.Contains(t, buf.String(), "OPENAI_BASE_URL", "the note names what is missing")
 	assert.Contains(t, buf.String(), "doctor", "and where to fix it")
 }
+
+// Windows keeps a running executable locked, so an update cannot delete its
+// own backup. That used to fail the command with "Access is denied" after the
+// new binary was already in place, telling users to distrust an update that
+// had worked.
+func TestUpdateReportsALeftoverBackupWithoutFailing(t *testing.T) {
+	old := selfUpdate
+	selfUpdate = func(context.Context, string, bool) (standupupdate.Result, error) {
+		return standupupdate.Result{
+			Current: "v0.17.0", Latest: "v0.18.0", Updated: true,
+			LeftoverBackup: `C:\Users\j64\AppData\Local\standup\standup.exe.old-4340`,
+		}, nil
+	}
+	t.Cleanup(func() { selfUpdate = old })
+
+	_, root, buf := newHarness(t, &fakeAssistant{})
+	root.Version = "0.17.0"
+	root.SetArgs([]string{"update"})
+	require.NoError(t, root.Execute(), "a backup that cannot be deleted is not a failed update")
+	assert.Contains(t, buf.String(), "updated v0.17.0 -> v0.18.0")
+	assert.Contains(t, buf.String(), "note the previous version is still open")
+	assert.Contains(t, buf.String(), `standup.exe.old-4340`)
+}
