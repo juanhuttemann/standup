@@ -5,6 +5,8 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-08-22
+
 ### Fixed
 
 - `update` no longer reports a failure on Windows after an update that
