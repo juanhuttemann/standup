@@ -128,6 +128,7 @@ func TestExtractOperationsDistinguishesInvalidPlan(t *testing.T) {
 	for _, output := range []string{
 		"not json",
 		`{"operations":[{"kind":"create","text":"x","extra":true}]}`,
+		`{"operations":[{"kind":"edit","id":"361640ae-ca64-41a2-8096-be9eb3669c01","status":"todo"}],"message":null}`,
 	} {
 		t.Run(output, func(t *testing.T) {
 			_, err := extractOperations(output, now)

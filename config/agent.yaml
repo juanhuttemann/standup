@@ -69,7 +69,9 @@ planner_instructions: |
   If a target is missing or ambiguous, cancel the whole plan and explain why
   in message. Reply only with:
   {"operations":[{"kind":"create"|"edit"|"status"|"delete","id":"existing full id","text":"task text","status":"todo"|"in-progress"|"blocked"|"done","when":"today"|"yesterday"|"YYYY-MM-DD"}],"message":"reason when operations is empty"}
-  Include only fields used by each operation.
+  Each kind carries only its own fields: create needs text; edit rewrites
+  text and needs id+text; status changes only the status and needs
+  id+status; delete needs id. Never set text on a status op or vice versa.
 
 planner_direct_instructions: |
   You plan changes to a developer's standup task list in a single pass. The
@@ -78,7 +80,9 @@ planner_direct_instructions: |
   any target is missing or ambiguous, cancel the whole plan and explain why in
   message. Reply only with:
   {"operations":[{"kind":"create"|"edit"|"status"|"delete","id":"existing full id","text":"task text","status":"todo"|"in-progress"|"blocked"|"done","when":"today"|"yesterday"|"YYYY-MM-DD"}],"message":"reason when operations is empty"}
-  Include only fields used by each operation.
+  Each kind carries only its own fields: create needs text; edit rewrites
+  text and needs id+text; status changes only the status and needs
+  id+status; delete needs id. Never set text on a status op or vice versa.
 
 creator_instructions: |
   You plan task creation only. The user's prompt is the sole authority. The
@@ -99,6 +103,9 @@ updater_instructions: |
   return no operations when a singular target is ambiguous. Do not create or
   delete tasks. Reply only with JSON shaped as
   {"operations":[{"kind":"edit"|"status","id":"full id","text":"...","status":"done"}],"message":"reason when empty"}.
+  edit rewrites the task text and needs id+text; status changes only the
+  status and needs id+status. Never set text on a status op or status on an
+  edit op.
 
 deleter_instructions: |
   You plan task deletions only. The user's prompt is the sole authority. The

@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. The format
 is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.18.3] - 2026-08-22
+
+### Fixed
+
+- `standup -p "change the status of X to todo"` no longer fails with "planner
+  returned an invalid operation plan". The planner prompts showed every field
+  on one JSON line without saying which fields each operation kind carries,
+  so models proposed `{"kind":"edit","status":"todo"}` — an edit with no
+  text — which Go rightly refuses. The prompts now spell out the per-kind
+  contract (edit needs id+text, status needs id+status), verified live
+  against a real endpoint for status changes, renames, and both combined.
+
 ## [0.18.2] - 2026-08-22
 
 ### Fixed
