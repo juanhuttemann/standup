@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -195,7 +196,10 @@ func TestInstallReplacesValidatedBinaryAndPreservesMode(t *testing.T) {
 	assert.Equal(t, []byte("new"), b)
 	info, err := os.Stat(current)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o751), info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		// Windows has no Unix permission bits; every file reads as 0666.
+		assert.Equal(t, os.FileMode(0o751), info.Mode().Perm())
+	}
 }
 
 func tarGz(t *testing.T, files map[string][]byte) []byte {

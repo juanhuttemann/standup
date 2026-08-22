@@ -57,8 +57,13 @@ jobs:
           cache: true
       - name: Vet
         run: go vet ./...
+      # Scoped to the packages with build-tagged Windows code and their
+      # callers. The rest of the suite has pre-existing portability gaps in
+      # the harness itself — Unix permission bits, XDG_CONFIG_HOME, .sh fake
+      # editors — none of which are product bugs, and widening this job is a
+      # separate piece of work.
       - name: Test
-        run: go test -race ./...
+        run: go test -race ./internal/update/... ./internal/catalog/... ./internal/store/... ./internal/report/... ./internal/agent/... ./internal/sync/...
 
   lint:
     name: Lint

@@ -16,7 +16,10 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
   sweeps it on the next run.
 - Windows code is tested on Windows in CI. The update backup logic is guarded
   by a build tag, so its tests never ran on the Linux-only job and one of them
-  asserted the bug above as intended behavior.
+  asserted the bug above as intended behavior. The job covers the packages
+  with platform-specific code; the rest of the suite has pre-existing
+  portability gaps in the harness (permission bits, `XDG_CONFIG_HOME`, `.sh`
+  fake editors) that are not product bugs.
 
 ## [0.18.0] - 2026-08-22
 

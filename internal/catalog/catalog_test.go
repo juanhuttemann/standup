@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"charm.land/catwalk/pkg/catwalk"
@@ -81,7 +82,10 @@ func TestLoadFetchesMapsAndCaches(t *testing.T) {
 
 	info, err := os.Stat(filepath.Join(dir, cacheFile))
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	if runtime.GOOS != "windows" {
+		// Windows has no Unix permission bits; every file reads as 0666.
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	assert.Len(t, entries, 1, "the atomic write leaves no temporary file behind")
