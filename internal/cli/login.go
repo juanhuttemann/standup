@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/manifoldco/promptui"
@@ -260,6 +261,21 @@ func loginModel(models []catalog.Model) (string, error) {
 	return models[i].ID, nil
 }
 
+// joinWords renders "A", "A and B", "A, B and C".
+func joinWords(words []string) string {
+	if len(words) < 2 {
+		return strings.Join(words, "")
+	}
+	return strings.Join(words[:len(words)-1], ", ") + " and " + words[len(words)-1]
+}
+
+func verb(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
+}
+
 func modelItem(m catalog.Model) string {
 	if m.Name == "" || m.Name == m.ID {
 		return m.ID
@@ -284,10 +300,16 @@ func loginApply(cmd *cobra.Command, d Deps, rep *reporter, sel config.ProviderSe
 	if err != nil {
 		return err
 	}
-	rep.printf("ok   provider %s\n", sel.Provider)
-	rep.printf("ok   saved %s\n", path)
-	for _, key := range shadowed {
-		rep.printf("note %s is already set in your environment and wins over %s; unset it or later commands will ignore this login\n", key, path)
+	// Name both homes: the provider key goes to config.yaml and the endpoint
+	// to .env, and a user who cannot find what login wrote cannot fix it.
+	rep.printf("ok   provider %s in %s\n", sel.Provider, filepath.Join(filepath.Dir(path), "config.yaml"))
+	rep.printf("ok   endpoint and model in %s\n", path)
+	if len(shadowed) > 0 {
+		// One problem, one note: a line per variable repeated the same
+		// sentence three times and buried the one thing to do.
+		rep.printf("note %s %s set in your environment and %s over %s\n", joinWords(shadowed),
+			verb(len(shadowed), "is", "are"), verb(len(shadowed), "wins", "win"), path)
+		rep.printf("     run: unset %s\n", strings.Join(shadowed, " "))
 	}
 
 	cfg := d.Config

@@ -6,7 +6,7 @@ offline: false
 # Maximum duration of one model request (for example 30s or 2m).
 model_call_timeout: "60s"
 # text provider: openai or anthropic (empty keeps the OpenAI-compatible default).
-provider: ""
+provider: "openai"
 # report language for the model's rephrasing (empty: keep the input language).
 language: ""
 # IANA timezone for report windows and the meeting cutoff (empty: local).
@@ -20,15 +20,15 @@ mail_from: ""
 # `commits` repo globs (matched against each path as passed, submodules
 # included): empty include = everything not excluded.
 repos:
-  include: []
-  exclude: []
+    include: []
+    exclude: []
 # One-way Markdown publication into an Obsidian vault (`generate --obsidian`).
 obsidian:
-  vault: ""
-  note: "Standups/{date}.md"
+    vault: ""
+    note: "Standups/{date}.md"
 # PocketBase sync for `standup sync` (empty url: sync disabled).
 # PB_URL / PB_COLLECTION env override these; credentials are PB_EMAIL /
 # PB_PASSWORD env, never this file.
 sync:
-  url: ""
-  collection: "standup_tasks"
+    url: ""
+    collection: "standup_tasks"

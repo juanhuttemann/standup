@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -150,6 +151,8 @@ func TestLoginSavesAndVerifiesACatalogProvider(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 
+	assert.Contains(t, buf.String(), "ok   provider openai in "+filepath.Join(dir, "config.yaml"))
+	assert.Contains(t, buf.String(), "ok   endpoint and model in "+filepath.Join(dir, ".env"))
 	assert.Contains(t, buf.String(), "ok   model answers")
 	assert.NotContains(t, buf.String(), "sk-secret-value", "a pasted key is never echoed")
 	assert.Equal(t, []string{"select", "secret", "select"}, script.calls, "a catalogued endpoint is not asked for")
@@ -306,8 +309,31 @@ func TestLoginWarnsWhenTheEnvironmentOverridesWhatItWrote(t *testing.T) {
 
 	root.SetArgs([]string{"login"})
 	require.NoError(t, root.Execute())
-	assert.Contains(t, buf.String(), "note OPENAI_BASE_URL is already set in your environment")
-	assert.Contains(t, buf.String(), "later commands will ignore this login")
+	assert.Contains(t, buf.String(), "note OPENAI_BASE_URL is set in your environment and wins over")
+	assert.Contains(t, buf.String(), "run: unset OPENAI_BASE_URL")
+}
+
+// Three shadowed variables are one problem, not three: a line each buried the
+// one thing to do under repetition of the same sentence.
+func TestLoginWarnsOnceForEveryShadowedSetting(t *testing.T) {
+	script := &scriptedUI{answers: []string{"Compatible", "k", "Big (big)"}, abortAt: -1}
+	root, buf, _ := loginHarness(t, script, compatible())
+	t.Setenv("OPENAI_BASE_URL", "http://elsewhere.example.test/v1")
+	t.Setenv("OPENAI_MODEL", "other")
+	t.Setenv("OPENAI_API_KEY", "other")
+
+	root.SetArgs([]string{"login"})
+	require.NoError(t, root.Execute())
+	out := buf.String()
+	assert.Equal(t, 1, strings.Count(out, "note "), "one note, not one per variable")
+	assert.Contains(t, out, "OPENAI_BASE_URL, OPENAI_MODEL and OPENAI_API_KEY are set in your environment")
+	assert.Contains(t, out, "run: unset OPENAI_BASE_URL OPENAI_MODEL OPENAI_API_KEY")
+}
+
+func TestJoinWords(t *testing.T) {
+	assert.Equal(t, "A", joinWords([]string{"A"}))
+	assert.Equal(t, "A and B", joinWords([]string{"A", "B"}))
+	assert.Equal(t, "A, B and C", joinWords([]string{"A", "B", "C"}))
 }
 
 func TestLoginTrimsAPastedRequestPathFromTheBaseURL(t *testing.T) {

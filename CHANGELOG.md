@@ -25,9 +25,13 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
   the HTTP status implicates. An unentitled model or a rate limit says nothing
   about the key you just pasted, and making you paste it again would be the
   worst possible answer.
-- `login` warns when a provider variable already exported in your environment
-  overrides the file it just wrote, which otherwise ends with a login that
-  verified fine being ignored by the very next command.
+- `login` warns when provider variables already exported in your environment
+  override the file it just wrote, which otherwise ends with a login that
+  verified fine being ignored by the very next command. It is one note naming
+  every shadowed variable, followed by the `unset` line to run — three
+  variables are one problem, and a line each buried the thing to do under
+  repetition. The summary names both homes it wrote to, because a user who
+  cannot find what `login` saved cannot correct it.
 
 ### Fixed
 
