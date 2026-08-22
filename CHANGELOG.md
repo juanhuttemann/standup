@@ -5,6 +5,38 @@ is based on Keep a Changelog, and this project adheres to Semantic Versioning.
 
 ## [Unreleased]
 
+### Added
+
+- `standup login` sets a provider up interactively: pick one from a searchable
+  list, paste the API key masked, pick a model — then the command saves the
+  settings and proves them with the same real model call `doctor` ends on,
+  before it exits. It replaces knowing a wire protocol, an endpoint and an
+  exact model id before the tool would run at all, and it is the only writer
+  that persists an API key: `config set` still refuses one because it echoes
+  what it wrote, which is a rule about echoing, not about writing.
+- The provider list is fetched at run time and cached in the active config
+  directory, so no endpoint or model id is committed. A failed fetch falls
+  back to that cache and says so; with neither, `login` says that too and
+  still works, because the last entry in the list is a custom
+  OpenAI-compatible endpoint — Ollama, LM Studio, or anything self-hosted.
+  Those are in no catalog, so `login` asks the endpoint itself what it serves
+  and only falls back to typing a model id when it will not answer.
+- A login whose verification fails keeps what you typed and names the setting
+  the HTTP status implicates. An unentitled model or a rate limit says nothing
+  about the key you just pasted, and making you paste it again would be the
+  worst possible answer.
+- `login` warns when a provider variable already exported in your environment
+  overrides the file it just wrote, which otherwise ends with a login that
+  verified fine being ignored by the very next command.
+
+### Changed
+
+- `config set provider` rejects anything but `openai` and `anthropic`. It used
+  to accept any string and only fail at the next model call, pointing at the
+  endpoint rather than at the setting that was wrong.
+- Writing a provider setting now also tightens the `.env` to `0600`. A file
+  created by hand at `0644` kept those bits, and it is where API keys live.
+
 ## [0.17.0] - 2026-08-21
 
 ### Added

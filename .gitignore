@@ -1,4 +1,6 @@
 .env
+# fetched model catalog cache: endpoints and model ids are never committed
+providers.json
 /standup
 dist/
 *.jsonl

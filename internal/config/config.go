@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -74,10 +76,10 @@ func UserDir() (string, error) {
 	return filepath.Join(base, "standup"), nil
 }
 
-// writeDir returns the directory containing the active config.yaml. An
+// WriteDir returns the directory containing the active config.yaml. An
 // explicit config dir wins; otherwise ./config wins when it has the file,
 // matching Load. With no file yet, commands create the per-user config.
-func writeDir() (string, error) {
+func WriteDir() (string, error) {
 	if dir := os.Getenv("STANDUP_CONFIG_DIR"); dir != "" {
 		return dir, nil
 	}
@@ -93,7 +95,7 @@ func writeDir() (string, error) {
 
 // EnsureConfig creates the editable config.yaml from the embedded defaults.
 func EnsureConfig() (string, error) {
-	dir, err := writeDir()
+	dir, err := WriteDir()
 	if err != nil {
 		return "", err
 	}
@@ -182,6 +184,89 @@ func ProviderEnv(provider string) ([]string, error) {
 	}
 }
 
+// ValidBaseURL rejects endpoints no client could call. It is the validator
+// behind login's base-URL prompt: an unparseable host otherwise surfaces
+// minutes later as a failed model call that names the wrong setting.
+func ValidBaseURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("base URL must be a URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("base URL must start with http:// or https://")
+	}
+	if u.Host == "" {
+		return errors.New("base URL must include a host")
+	}
+	return nil
+}
+
+// Shadowed reports the settings a selection cannot actually take effect for:
+// a variable already exported in the shell, or loaded from a .env nearer the
+// cwd, wins over the file SaveProvider writes, because godotenv never
+// overrides an already-set variable. Without this a login that verified fine
+// is silently ignored by the very next command.
+func Shadowed(sel ProviderSelection) []string {
+	var shadowed []string
+	for _, pair := range providerPairs(sel) {
+		if existing := os.Getenv(pair[0]); existing != "" && existing != pair[1] {
+			shadowed = append(shadowed, pair[0])
+		}
+	}
+	return shadowed
+}
+
+// ProviderSelection is a complete provider setup as picked interactively.
+type ProviderSelection struct {
+	Provider string
+	BaseURL  string
+	Model    string
+	APIKey   string
+}
+
+// SaveProvider persists a selection to the home each setting has and exports
+// the same values into the current process. It is the one writer allowed to
+// persist an API key: Set refuses secrets because `config set` echoes what it
+// wrote, and the rule is that a key is never echoed, not that it is never
+// written — this is the very .env that refusal points at. The export is not a
+// convenience:
+// agent.New and agent.Check read provider settings from the environment, and
+// godotenv never overrides an already-set variable, so verifying a fresh
+// login against the environment the process started with would prove nothing.
+// It returns the .env path, never the key.
+func SaveProvider(sel ProviderSelection) (string, error) {
+	required, err := ProviderEnv(sel.Provider)
+	if err != nil {
+		return "", err
+	}
+	if err := ValidBaseURL(sel.BaseURL); err != nil {
+		return "", err
+	}
+	if sel.Model == "" {
+		return "", errors.New("a model is required")
+	}
+	prefix := envPrefix(sel.Provider)
+	if sel.APIKey == "" && slices.Contains(required, prefix+"_API_KEY") {
+		return "", fmt.Errorf("%s_API_KEY is required by the %s provider", prefix, sel.Provider)
+	}
+	pairs := providerPairs(sel)
+	// .env first: a failed write here leaves the install exactly as it was,
+	// where the reverse order would leave a provider with no settings.
+	path, err := setEnvMany(pairs)
+	if err != nil {
+		return "", err
+	}
+	if _, err := Set("provider", sel.Provider); err != nil {
+		return "", err
+	}
+	for _, pair := range pairs {
+		if err := os.Setenv(pair[0], pair[1]); err != nil {
+			return "", err
+		}
+	}
+	return path, nil
+}
+
 // settingTags is the writable application config surface and each key's YAML
 // type.
 var settingTags = map[string]string{
@@ -227,6 +312,10 @@ func validSetting(key, tag, value string) (string, error) {
 	case "meeting_time":
 		if _, err := time.Parse("15:04", value); err != nil {
 			return "", fmt.Errorf("meeting_time must be a 24-hour HH:MM time (got %q)", value)
+		}
+	case "provider":
+		if _, err := ProviderEnv(value); err != nil {
+			return "", err
 		}
 	}
 	return value, nil
@@ -290,11 +379,37 @@ func setMappingValue(parent *yaml.Node, key, tag, value string) {
 		&yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value})
 }
 
-func setEnv(key, value string) (string, error) {
-	if value == "" || strings.ContainsAny(value, "\r\n") {
-		return "", fmt.Errorf("%s must be a non-empty single-line value", key)
+// setEnv writes one .env pair. setEnvMany is the general form: a login must
+// not be able to leave a base URL written with its model missing.
+func envPrefix(provider string) string {
+	if provider == "anthropic" {
+		return "ANTHROPIC"
 	}
-	dir, err := writeDir()
+	return "OPENAI"
+}
+
+// providerPairs is the single mapping from a selection to .env keys, so
+// Shadowed can never disagree with what SaveProvider writes.
+func providerPairs(sel ProviderSelection) [][2]string {
+	prefix := envPrefix(sel.Provider)
+	pairs := [][2]string{{prefix + "_BASE_URL", sel.BaseURL}, {prefix + "_MODEL", sel.Model}}
+	if sel.APIKey != "" {
+		pairs = append(pairs, [2]string{prefix + "_API_KEY", sel.APIKey})
+	}
+	return pairs
+}
+
+func setEnv(key, value string) (string, error) {
+	return setEnvMany([][2]string{{key, value}})
+}
+
+func setEnvMany(pairs [][2]string) (string, error) {
+	for _, pair := range pairs {
+		if pair[1] == "" || strings.ContainsAny(pair[1], "\r\n") {
+			return "", fmt.Errorf("%s must be a non-empty single-line value", pair[0])
+		}
+	}
+	dir, err := WriteDir()
 	if err != nil {
 		return "", err
 	}
@@ -306,11 +421,27 @@ func setEnv(key, value string) (string, error) {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	line := key + "=" + value
 	lines := strings.Split(string(b), "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
+	for _, pair := range pairs {
+		lines = setEnvLine(lines, pair[0], pair[1])
+	}
+	out := strings.Join(lines, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
+		return "", err
+	}
+	// WriteFile does not re-chmod an existing file, so a .env created by hand
+	// at 0644 would keep those bits — and login writes API keys into it.
+	if err := os.Chmod(path, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func setEnvLine(lines []string, key, value string) []string {
+	line := key + "=" + value
 	found := false
 	for i := range lines {
 		if strings.HasPrefix(lines[i], key+"=") {
@@ -320,11 +451,7 @@ func setEnv(key, value string) (string, error) {
 	if !found {
 		lines = append(lines, line)
 	}
-	out := strings.Join(lines, "\n") + "\n"
-	if err := os.WriteFile(path, []byte(out), 0o600); err != nil {
-		return "", err
-	}
-	return path, nil
+	return lines
 }
 
 // Init writes the embedded default config files into the active config
@@ -332,7 +459,7 @@ func setEnv(key, value string) (string, error) {
 // path. It resolves the directory exactly like `config set` and `config
 // edit`: files written anywhere else would never be read back.
 func Init() (string, error) {
-	dir, err := writeDir()
+	dir, err := WriteDir()
 	if err != nil {
 		return "", err
 	}

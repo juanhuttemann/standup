@@ -713,3 +713,151 @@ func TestSetRejectsValuesThatBreakEveryCommand(t *testing.T) {
 		assert.NoError(t, err, "valid values still apply")
 	}
 }
+
+func TestSetStillRefusesSecretsAfterSetSecretExists(t *testing.T) {
+	isolateDirs(t)
+	for _, key := range []string{"OPENAI_API_KEY", "ANTHROPIC_API_KEY"} {
+		_, err := Set(key, "secret")
+		require.Error(t, err, "config set echoes values, so it must never accept secrets")
+	}
+}
+
+func TestValidBaseURL(t *testing.T) {
+	for _, ok := range []string{"http://localhost:11434/v1", "https://api.example.test/v1"} {
+		assert.NoError(t, ValidBaseURL(ok), ok)
+	}
+	for _, bad := range []string{"", "localhost:11434", "ftp://example.test", "https://", "not a url"} {
+		assert.Error(t, ValidBaseURL(bad), bad)
+	}
+}
+
+func TestSaveProviderWritesBothHomesAndExports(t *testing.T) {
+	xdg := isolateDirs(t)
+	dir := filepath.Join(xdg, "standup")
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY"} {
+		t.Setenv(key, "")
+	}
+
+	path, err := SaveProvider(ProviderSelection{
+		Provider: "openai",
+		BaseURL:  "https://api.example.test/v1",
+		Model:    "test-model",
+		APIKey:   "sk-test",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dir, ".env"), path)
+
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "OPENAI_BASE_URL=https://api.example.test/v1\nOPENAI_MODEL=test-model\nOPENAI_API_KEY=sk-test\n", string(b))
+
+	yml, err := os.ReadFile(filepath.Join(dir, "config.yaml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(yml), `provider: "openai"`)
+
+	// agent.Check reads settings from the environment, never from Config.
+	assert.Equal(t, "https://api.example.test/v1", os.Getenv("OPENAI_BASE_URL"))
+	assert.Equal(t, "test-model", os.Getenv("OPENAI_MODEL"))
+	assert.Equal(t, "sk-test", os.Getenv("OPENAI_API_KEY"))
+}
+
+func TestSaveProviderOmitsAnEmptyOpenAIKey(t *testing.T) {
+	xdg := isolateDirs(t)
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL"} {
+		t.Setenv(key, "")
+	}
+
+	path, err := SaveProvider(ProviderSelection{Provider: "openai", BaseURL: "http://localhost:11434/v1", Model: "local-model"})
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(xdg, "standup", ".env"), path)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "OPENAI_API_KEY", "local endpoints need no key")
+	assert.Contains(t, string(b), "OPENAI_MODEL=local-model")
+}
+
+func TestSaveProviderWritesAnthropicKeys(t *testing.T) {
+	xdg := isolateDirs(t)
+	for _, key := range []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "ANTHROPIC_API_KEY"} {
+		t.Setenv(key, "")
+	}
+
+	path, err := SaveProvider(ProviderSelection{
+		Provider: "anthropic",
+		BaseURL:  "https://api.example.test",
+		Model:    "test-model",
+		APIKey:   "sk-ant",
+	})
+	require.NoError(t, err)
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "ANTHROPIC_API_KEY=sk-ant")
+	yml, err := os.ReadFile(filepath.Join(xdg, "standup", "config.yaml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(yml), `provider: "anthropic"`)
+}
+
+func TestSaveProviderRejectsIncompleteSelections(t *testing.T) {
+	cases := map[string]ProviderSelection{
+		"unknown provider": {Provider: "gemini", BaseURL: "https://api.example.test", Model: "m"},
+		"no base URL":      {Provider: "openai", Model: "m"},
+		"no model":         {Provider: "openai", BaseURL: "https://api.example.test"},
+		"anthropic no key": {Provider: "anthropic", BaseURL: "https://api.example.test", Model: "m"},
+	}
+	for name, sel := range cases {
+		t.Run(name, func(t *testing.T) {
+			xdg := isolateDirs(t)
+			_, err := SaveProvider(sel)
+			require.Error(t, err)
+			_, statErr := os.Stat(filepath.Join(xdg, "standup", ".env"))
+			assert.True(t, os.IsNotExist(statErr), "a rejected selection writes nothing")
+		})
+	}
+}
+
+func TestSetRejectsAnUnsupportedProvider(t *testing.T) {
+	isolateDirs(t)
+	_, err := Set("provider", "gemini")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openai or anthropic")
+	_, err = Set("provider", "anthropic")
+	require.NoError(t, err)
+}
+
+func TestSaveProviderTightensAnExistingEnvFile(t *testing.T) {
+	xdg := isolateDirs(t)
+	dir := filepath.Join(xdg, "standup")
+	write(t, filepath.Join(dir, ".env"), "# hand written\nKEEP=me\n")
+	require.NoError(t, os.Chmod(filepath.Join(dir, ".env"), 0o644))
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY"} {
+		t.Setenv(key, "")
+	}
+
+	path, err := SaveProvider(ProviderSelection{Provider: "openai", BaseURL: "https://api.example.test/v1", Model: "m", APIKey: "sk-test"})
+	require.NoError(t, err)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "a hand-written .env must not stay world-readable once it holds a key")
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "# hand written\nKEEP=me\n", "unrelated content survives")
+}
+
+func TestShadowedNamesEnvironmentValuesThatWinOverTheFile(t *testing.T) {
+	isolateDirs(t)
+	sel := ProviderSelection{Provider: "openai", BaseURL: "https://api.example.test/v1", Model: "m", APIKey: "sk"}
+
+	for _, key := range []string{"OPENAI_BASE_URL", "OPENAI_MODEL", "OPENAI_API_KEY"} {
+		t.Setenv(key, "")
+	}
+	assert.Empty(t, Shadowed(sel), "an unset environment shadows nothing")
+
+	t.Setenv("OPENAI_BASE_URL", "http://elsewhere.example.test/v1")
+	assert.Equal(t, []string{"OPENAI_BASE_URL"}, Shadowed(sel))
+
+	t.Setenv("OPENAI_BASE_URL", sel.BaseURL)
+	assert.Empty(t, Shadowed(sel), "the same value is not a conflict")
+
+	t.Setenv("OPENAI_MODEL", "other-model")
+	assert.Equal(t, []string{"OPENAI_MODEL"}, Shadowed(sel))
+}

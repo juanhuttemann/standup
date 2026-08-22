@@ -1,8 +1,9 @@
 module standup
 
-go 1.26.5
+go 1.26.6
 
 require (
+	charm.land/catwalk v0.52.6
 	github.com/anthropics/anthropic-sdk-go v1.62.0
 	github.com/gofrs/flock v0.13.0
 	github.com/google/uuid v1.6.0
@@ -23,6 +24,7 @@ require (
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
+	github.com/charmbracelet/x/etag v0.2.0 // indirect
 	github.com/chzyer/readline v0.0.0-20180603132655-2972be24d48e // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect

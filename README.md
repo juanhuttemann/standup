@@ -40,7 +40,21 @@ Both fetch the latest release binaries; see [releases](https://github.com/juanhu
 
 ## Quick start
 
-Point `standup` at an OpenAI-compatible endpoint and its served model:
+Run `login` and pick a provider:
+
+```sh
+standup login
+```
+
+Pick one from the list, paste your API key, pick a model. The key is masked
+and never echoed, the settings land in the active config directory, and the
+command finishes with the same real model call as `doctor`. The last entry in
+the list is a custom OpenAI-compatible endpoint: choose it for Ollama, LM
+Studio or anything self-hosted, type the base URL, and `standup` asks the
+endpoint which models it serves. `login` needs a terminal.
+
+To set things up by hand or from a script instead, point `standup` at an
+OpenAI-compatible endpoint and its served model:
 
 ```sh
 standup config set OPENAI_BASE_URL http://localhost:8080/v1
@@ -61,6 +75,9 @@ standup doctor
 
 `doctor` finishes with a real one-word model call, so a dead key or a model
 name that does not exist is reported now instead of on your next command.
+
+Note that a provider variable exported in your shell wins over any config
+file, so unset it if you want `login` or `config set` to take effect.
 
 Then capture work naturally and generate the report:
 
@@ -163,6 +180,7 @@ standup speak                       # print a spoken brief (no speech synthesis)
 standup speak -o standup.wav        # synthesize via a chat-completions audio-output model
 standup sync                        # merge tasks with your PocketBase server (see Sync)
 
+standup login                       # pick a provider and model, paste a key (needs a terminal)
 standup doctor                      # check the setup: data file, git identity, live model call
 standup init                        # write default config files for editing
 standup config set KEY VALUE        # set an app or provider value
@@ -310,6 +328,8 @@ Application settings are stored in the active `config.yaml`; provider settings
 use that directory's `.env`, never YAML. The active directory is
 `$STANDUP_CONFIG_DIR`, otherwise an existing `./config`, otherwise the user
 config directory (`~/.config/standup`, or `%APPDATA%\standup` on Windows).
+That directory also holds `providers.json`, the cached provider list `login`
+shows; it is refetched whenever it can be and safe to delete.
 
 You can also run `standup init` to write `config.yaml` and `agent.yaml` without
 replacing existing files, in that same active directory. Resolution order per

@@ -102,6 +102,23 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   application settings (`meeting_time`, `data_file`, `offline`, `provider`, `language`)
   in `config/config.yaml`; provider facts (`OPENAI_*`, `ANTHROPIC_*`) in local
   `.env`/env only.
+- `login` is the only writer that persists a provider API key. `config set`
+  still refuses one because it echoes what it wrote — the rule is that a key is
+  never echoed, not that it is never written, and the active `.env` at 0600 is
+  the very file that refusal points at. `login` reads it masked and prints only
+  the path. Writing any provider setting tightens that `.env` to 0600, because
+  `os.WriteFile` does not re-chmod a file someone created by hand at 0644.
+- The provider list is fetched at run time and cached in the active config dir
+  (`providers.json`, gitignored). Endpoints and model ids are deployment facts
+  and stay out of the repo, cache included. With neither network nor cache,
+  `login` says so and still offers its custom-endpoint entry, because a
+  self-hosted endpoint is in no catalog anyway.
+- `login` writes the files *and* exports the same values into the process:
+  `agent.New`/`agent.Check` read provider settings from the environment, and
+  godotenv never overrides an already-set variable, so verifying against the
+  environment the process started with would prove nothing. For the same
+  reason it names any variable already exported that will win over the file —
+  a login that verified fine was otherwise ignored by the very next command.
 - `config set` writes application keys to the user `config.yaml` and the
   supported provider keys to its `.env`; `config edit` opens that YAML. Both
   commands target the active config dir (`$STANDUP_CONFIG_DIR`, otherwise an
@@ -139,6 +156,10 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
   last one is a real model call. Failed model calls name the setting the HTTP
   status implicates (`*_API_KEY` for 401/403, `*_MODEL` for 400/404), never the
   base URL by default.
+- `login` proves the way `doctor` does — one real model call through
+  `agent.Check` — and keeps what the user typed when it fails, naming the
+  setting the status implicates. An unentitled model or a rate limit says
+  nothing about the key, and rolling back would mean pasting it again.
 - User-facing errors carry no internal package prefixes; `lazy`/`runRoot` strip
   them at the CLI boundary.
 
@@ -146,6 +167,11 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - Write the failing test first (testify). Tests use `t.TempDir()` and fake `Assistant` impls.
 - Pure packages (`store`, `report`, `config`) are tested without any network.
 - `internal/agent` exposes an `Assistant` interface so CLI tests never hit a server.
+- Interactive flows go through a UI seam (`loginUI`), never promptui directly:
+  promptui needs a TTY, and the branching is where the bugs are. A double must
+  model promptui, which re-asks a rejected answer rather than returning the
+  validation error — the first double got that wrong and tested a path the
+  real binary cannot take.
 - `make verify` (fmt, vet, cyclo, ineffassign, golangci, deadcode, test,
   ignored-go — the last fails if any `.go` file is gitignored, e.g. by an
   unanchored pattern) must pass before any commit and before calling any work
@@ -192,7 +218,10 @@ Working rules for anyone (human or agent) touching this repo. AGENTS.md is NOT a
 - `internal/store` — Task model + JSONL persistence, injectable clock (`Now` field).
 - `internal/report` — standup split/ordering, day ranges, carry-over, lookback time math.
 - `internal/git` — commit collection (shells out to git, filtered to the repo's user).
-- `internal/config` — viper loading, env overrides.
+- `internal/config` — viper loading, env overrides. Stays network-free.
+- `internal/catalog` — provider-catalog fetch and disk cache, plus the
+  OpenAI-compatible `/models` listing; provider setting names and validation
+  stay in `internal/config`.
 - `scripts/` — release-binary installers (`install.sh`, `install.ps1`); the
   release pipeline itself is `.goreleaser.yml` + the CI `release` job, flow in
   `RELEASING.md`.

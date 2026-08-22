@@ -255,7 +255,17 @@ func New(load func() (Deps, error)) *cobra.Command {
 		SilenceUsage: true,
 	}
 
-	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, skillCmd, updateCmd, versionCmd, syncCmd)
+	loginCmd := &cobra.Command{
+		Use:   "login",
+		Short: "set up a provider and model interactively (needs a terminal)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return lazy(cmd, load, runLogin)
+		},
+		SilenceUsage: true,
+	}
+
+	root.AddCommand(addCmd, listCmd, genCmd, speakCmd, commitsCmd, doneCmd, editCmd, rmCmd, statusCmd, initCmd, configCmd, doctorCmd, loginCmd, skillCmd, updateCmd, versionCmd, syncCmd)
 	return root
 }
 
@@ -1927,15 +1937,24 @@ func writeClipboard(name string, args []string, text string) error {
 	return nil
 }
 
-func runDoctor(cmd *cobra.Command, d Deps) error {
-	out := cmd.OutOrStdout()
-	healthy := true
-	var werr error
-	report := func(format string, a ...any) {
-		if _, err := fmt.Fprintf(out, format, a...); err != nil && werr == nil {
-			werr = err
-		}
+// reporter writes the fixed-prefix status lines doctor and login share and
+// latches the first write failure, so a closed stdout is reported once
+// instead of at every line.
+type reporter struct {
+	out io.Writer
+	err error
+}
+
+func (r *reporter) printf(format string, a ...any) {
+	if _, err := fmt.Fprintf(r.out, format, a...); err != nil && r.err == nil {
+		r.err = err
 	}
+}
+
+func runDoctor(cmd *cobra.Command, d Deps) error {
+	healthy := true
+	rep := &reporter{out: cmd.OutOrStdout()}
+	report := rep.printf
 	check := func(name string, err error) {
 		if err != nil {
 			healthy = false
@@ -1955,8 +1974,8 @@ func runDoctor(cmd *cobra.Command, d Deps) error {
 	} else {
 		doctorProvider(cmd, d.Config, report, check)
 	}
-	if werr != nil {
-		return werr
+	if rep.err != nil {
+		return rep.err
 	}
 	return errOr(healthy)
 }
